@@ -37,3 +37,4 @@ jsonl2plattli = "plattli.jsonl2plattli:main"
 
 [tool.setuptools_scm]
 version_file = "plattli/_version.py"
+relative_to = "pyproject.toml"
