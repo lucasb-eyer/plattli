@@ -14,7 +14,7 @@ and a `config.json` with info about the run.
 pip install plattli
 ```
 
-Requires Python 3.11+.
+Requires Python 3.11+ (tested on 3.11-3.14).
 
 ## CLI
 

@@ -2,6 +2,7 @@
 - Be concise, be blunt, be explicit.
 - Keep it simple; if it gets complicated, confirm assumptions.
 - Prefer primary sources when looking things up; cite version/date when relevant.
+- Run tests after any change.
 
 # General code preferences
 - Inline single-use values and functions.

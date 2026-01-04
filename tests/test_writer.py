@@ -251,5 +251,5 @@ class TestPlattliWriter(unittest.TestCase):
         self.assertIsNone(_find_arange_params(np.array([0, 1, 3], dtype=np.uint32)))
 
 
-if __name__ == "__main__":
+if __name__ == "__main__":  # pragma: no cover
     unittest.main()

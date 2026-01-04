@@ -1,5 +1,6 @@
 """Plattli writer and tools."""
 
+from .bulk_writer import PlattliBulkWriter
 from .writer import PlattliWriter
 
 try:
@@ -7,4 +8,4 @@ try:
 except Exception:  # pragma: no cover
     __version__ = "0+unknown"
 
-__all__ = ("PlattliWriter",)
+__all__ = ("PlattliBulkWriter", "PlattliWriter")

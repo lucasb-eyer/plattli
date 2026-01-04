@@ -7,7 +7,7 @@ from argparse import ArgumentParser
 from multiprocessing import Pool, cpu_count
 from pathlib import Path
 
-from .writer import PlattliWriter
+from .bulk_writer import PlattliBulkWriter
 
 DEFAULT_SKIP_PATTERN = r"[pg]norm.*"
 
@@ -30,7 +30,7 @@ def convert_run(run_dir, dest, skip_cols=None):
 
     ncols = 0
     nrows = 0
-    w = PlattliWriter(dest, config=json.loads(config_path.read_text(encoding="utf-8")))
+    w = PlattliBulkWriter(dest, config=json.loads(config_path.read_text(encoding="utf-8")))
     with metrics_path.open("r", encoding="utf-8") as fh:
         for line in fh:
             row = delcols(json.loads(line))
