@@ -1,0 +1,36 @@
+[build-system]
+requires = ["flit_core>=3.9"]
+build-backend = "flit_core.buildapi"
+
+[project]
+name = "plattli"
+version = "0.1.0"
+description = "Plattli metric writer and tools"
+readme = "README.md"
+authors = [{name = "Lucas Beyer", email = "lucasb.eyer.be@gmail.com"}]
+license = {file = "LICENSE"}
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=1.20",
+]
+keywords = ["metrics", "logging", "writer", "streaming"]
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Topic :: Software Development :: Libraries",
+]
+
+[project.urls]
+Homepage = "https://github.com/lucasb-eyer/plattli"
+Repository = "https://github.com/lucasb-eyer/plattli"
+Issues = "https://github.com/lucasb-eyer/plattli/issues"
+Changelog = "https://github.com/lucasb-eyer/plattli/blob/main/CHANGELOG.md"
+
+[project.scripts]
+jsonl2plattli = "plattli.jsonl2plattli:main"
