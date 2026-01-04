@@ -1,15 +1,15 @@
 [build-system]
-requires = ["flit_core>=3.9"]
-build-backend = "flit_core.buildapi"
+requires = ["flit_scm>=1.7"]
+build-backend = "flit_scm:buildapi"
 
 [project]
 name = "plattli"
-version = "0.1.0"
 description = "Plattli metric writer and tools"
 readme = "README.md"
 authors = [{name = "Lucas Beyer", email = "lucasb.eyer.be@gmail.com"}]
 license = {file = "LICENSE"}
 requires-python = ">=3.11"
+dynamic = ["version"]
 dependencies = [
     "numpy>=1.20",
 ]
@@ -34,3 +34,6 @@ Changelog = "https://github.com/lucasb-eyer/plattli/blob/main/CHANGELOG.md"
 
 [project.scripts]
 jsonl2plattli = "plattli.jsonl2plattli:main"
+
+[tool.setuptools_scm]
+version_file = "plattli/_version.py"
