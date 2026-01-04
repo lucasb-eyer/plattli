@@ -4,7 +4,7 @@ build-backend = "flit_scm:buildapi"
 
 [project]
 name = "plattli"
-description = "Plattli metric writer and tools"
+description = "Plättli is an opinionated dataformat for logging a series of metrics"
 readme = "README.md"
 authors = [{name = "Lucas Beyer", email = "lucasb.eyer.be@gmail.com"}]
 license = {file = "LICENSE"}
@@ -21,6 +21,7 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Intended Audience :: Developers",
     "Operating System :: OS Independent",
     "Topic :: Software Development :: Libraries",
