@@ -7,9 +7,16 @@ from pathlib import Path
 import numpy as np
 
 from plattli import PlattliWriter
+from plattli.writer import _find_arange_params
 
 
 class TestPlattliWriter(unittest.TestCase):
+    def test_negative_step(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with self.assertRaises(AssertionError):
+                PlattliWriter(root, step=-1)
+
     def test_basic_write(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -156,7 +163,7 @@ class TestPlattliWriter(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "run"
             w = PlattliWriter(root, write_threads=0)
-            w.write(loss=1, delta=-1)
+            w.write(loss=1, delta=-1, note="ok")
             w.end_step()
             w.write(loss=2, delta=-2)
             w.end_step()
@@ -170,10 +177,12 @@ class TestPlattliWriter(unittest.TestCase):
                 manifest = json.loads(zf.read("plattli.json"))
                 self.assertEqual(manifest["loss"]["dtype"], "u8")
                 self.assertEqual(manifest["delta"]["dtype"], "i8")
+                self.assertEqual(manifest["note"]["dtype"], "json")
                 self.assertIn("loss.u8", zf.namelist())
                 self.assertNotIn("loss.i64", zf.namelist())
                 self.assertIn("delta.i8", zf.namelist())
                 self.assertNotIn("delta.i64", zf.namelist())
+                self.assertIn("note.json", zf.namelist())
                 self.assertEqual(manifest["run_rows"], 2)
 
     def test_config(self):
@@ -210,6 +219,36 @@ class TestPlattliWriter(unittest.TestCase):
             self.assertEqual(loss_idx.tolist(), [0, 1])
             self.assertTrue(np.allclose(loss_vals, [1.0, 2.0]))
             self.assertEqual(manifest["loss"]["indices"], "indices")
+
+    def test_reject_non_scalar_values(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            w = PlattliWriter(root, write_threads=0)
+            w.write(loss=1.0)
+            w.end_step()
+            with self.assertRaises(ValueError):
+                w.write(loss=[1, 2])
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            w = PlattliWriter(root, write_threads=0)
+            with self.assertRaises(ValueError):
+                w.write(loss=np.array([1, 2]))
+
+    def test_unsupported_array_dtype_falls_back_to_json(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            w = PlattliWriter(root, write_threads=0)
+            w.write(note=np.array("x", dtype="U"))
+            w.end_step()
+            w.finish(optimize=False, zip=False)
+
+            note_vals = json.loads((root / "note.json").read_text(encoding="utf-8"))
+            self.assertEqual(note_vals, ["x"])
+
+    def test_find_arange_params_none(self):
+        self.assertIsNone(_find_arange_params(np.array([0], dtype=np.uint32)))
+        self.assertIsNone(_find_arange_params(np.array([0, 1, 3], dtype=np.uint32)))
 
 
 if __name__ == "__main__":

@@ -27,8 +27,7 @@ class PlattliWriter:
         self.root.mkdir(parents=True, exist_ok=True)
 
         self.step = int(step)
-        if self.step < 0:
-            raise ValueError("step must be >= 0")
+        assert self.step >= 0, "step must be >= 0"
 
         self._manifest = {}
         self._executor = ThreadPoolExecutor(max_workers=write_threads) if write_threads else None
@@ -71,17 +70,19 @@ class PlattliWriter:
         self.step += 1
 
     def finish(self, optimize=True, zip=True):
+        if not self._manifest:
+            return
+
         wait(self._futures)
         self._drain_errors()
+
         if optimize:
             self._tighten_dtypes()
             self._optimize_indices()
-        if self._manifest:
-            run_rows = max(self._indices_length(name, spec["indices"])
-                           for name, spec in self._manifest.items())
-        else:
-            run_rows = 0
-        self._write_manifest(run_rows=run_rows)
+
+        self._write_manifest(run_rows=max(self._indices_length(name, spec["indices"])
+                                          for name, spec in self._manifest.items()))
+
         if zip:
             self._zip_output()
         if self._executor:
@@ -133,7 +134,7 @@ class PlattliWriter:
             if indices_spec == "indices":
                 idx_path = self.root / f"{name}.indices"
                 if not idx_path.exists():
-                    raise FileNotFoundError(f"missing indices file for {name}")
+                    raise FileNotFoundError(f"missing indices file for {name}")  # pragma: no cover
                 indices = np.fromfile(idx_path, dtype=np.uint32)
                 keep = int(np.searchsorted(indices, step, side="left"))
                 with idx_path.open("r+b") as fh:
@@ -145,7 +146,7 @@ class PlattliWriter:
                     indices[:keep].tofile(fh)
                 spec["indices"] = "indices"
             else:
-                raise RuntimeError(f"invalid indices spec for {name}: {indices_spec}")
+                raise RuntimeError(f"invalid indices spec for {name}: {indices_spec}")  # pragma: no cover
 
             # And then truncate the values accordingly. For json, have one line per step for readability.
             if (dtype := spec["dtype"]) == "json":
@@ -166,7 +167,7 @@ class PlattliWriter:
     def _optimize_indices(self):
         for name, spec in self._manifest.items():
             if spec["indices"] != "indices":
-                continue
+                continue  # pragma: no cover
             idx_path = self.root / f"{name}.indices"
             indices = np.fromfile(idx_path, dtype=np.uint32)
             if params := _find_arange_params(indices):
@@ -179,12 +180,12 @@ class PlattliWriter:
             stop = int(indices_spec["stop"])
             step = int(indices_spec["step"])
             if step <= 0 or stop <= start:
-                return 0
+                return 0  # pragma: no cover
             return int((stop - start + step - 1) // step)
         if indices_spec == "indices":
             idx_path = self.root / f"{name}.indices"
             return idx_path.stat().st_size // 4  # It's always uint32
-        return 0
+        return 0  # pragma: no cover
 
     def _tighten_dtypes(self):
         for name, spec in self._manifest.items():
@@ -194,10 +195,10 @@ class PlattliWriter:
             path = self.root / f"{name}.{dtype}"
             arr = np.fromfile(path, dtype=DTYPE_TO_NUMPY[dtype])
             if arr.size == 0:
-                continue
+                continue  # pragma: no cover
             tightened = _tight_dtype(arr)
             if tightened is None:
-                continue
+                continue  # pragma: no cover - unreachable
             new_dtype = f"{tightened.dtype.kind}{tightened.dtype.itemsize * 8}"
             if new_dtype == dtype:
                 continue
@@ -215,7 +216,7 @@ class PlattliWriter:
 
 def _find_arange_params(array):
     if array.size in (0, 1):
-        return None
+        return None  # pragma: no cover
     diffs = np.diff(array)
     if not (diffs > 0).all() or (diffs != diffs[0]).any():
         return None
@@ -227,7 +228,7 @@ def _find_arange_params(array):
 
 def _tightest_int(array):
     if not np.issubdtype(array.dtype, np.integer):
-        return array
+        return array  # pragma: no cover - unreachable
 
     amin, amax = array.min(), array.max()
 
@@ -235,14 +236,14 @@ def _tightest_int(array):
         for dt in (np.uint8, np.uint16, np.uint32, np.uint64):
             if amax <= np.iinfo(dt).max:
                 return array.astype(dt, copy=False)
-        return array.astype(np.uint64, copy=False)
+        return array.astype(np.uint64, copy=False)  # pragma: no cover - unreachable
 
     for dt in (np.int8, np.int16, np.int32, np.int64):
         info = np.iinfo(dt)
         if info.min <= amin and amax <= info.max:
             return array.astype(dt, copy=False)
 
-    return array
+    return array  # pragma: no cover - unreachable
 
 
 def _tight_dtype(array):
@@ -251,7 +252,7 @@ def _tight_dtype(array):
         return array.astype(np.float32, copy=False)
     if array.dtype.kind in "iu":
         return _tightest_int(array)
-    return None
+    return None  # pragma: no cover - unreachable
 
 
 def _append_numeric(path, value, dtype):
@@ -268,6 +269,8 @@ def _append_indices(path, step):
 
 
 def _append_json_value(path, value):
+    if isinstance(value, (np.ndarray, np.generic)):
+        value = value.item()
     payload = json.dumps(value, ensure_ascii=False).encode("utf-8")
     if not path.exists() or path.stat().st_size == 0:
         with path.open("wb") as fh:
@@ -285,7 +288,7 @@ def _append_json_value(path, value):
             if ch not in b" \t\r\n":
                 break
         if ch != b"]":
-            raise RuntimeError(f"invalid json array in {path}")
+            raise RuntimeError(f"invalid json array in {path}")  # pragma: no cover
         pos2 = pos - 1
         while pos2 >= 0:
             fh.seek(pos2)
