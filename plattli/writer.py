@@ -313,10 +313,7 @@ def _resolve_dtype(value):
     if isinstance(value, (np.ndarray, np.generic)):
         if value.shape != ():
             raise ValueError("only scalar array-like values are supported")
-        kind = value.dtype.kind
-        if kind == "b":
-            return "json"
-        if kind in "fiu":
+        if (kind := value.dtype.kind) in "fiu":
             dtype = f"{kind}{value.dtype.itemsize * 8}"
             return dtype if dtype in DTYPE_TO_NUMPY else "json"
         return "json"

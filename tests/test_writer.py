@@ -109,9 +109,9 @@ class TestPlattliWriter(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             w = PlattliWriter(root, write_threads=0)
-            w.write(loss=1.0)
+            w.write(loss=1.0, note="a")
             w.end_step()
-            w.write(loss=2.0)
+            w.write(loss=2.0, note="b")
             w.end_step()
             w.write(loss=3.0)
             w.end_step()
@@ -120,8 +120,12 @@ class TestPlattliWriter(unittest.TestCase):
             w = PlattliWriter(root, step=1, write_threads=0)
             loss_vals = np.fromfile(root / "loss.f32", dtype=np.float32)
             loss_idx = np.fromfile(root / "loss.indices", dtype=np.uint32)
+            note_vals = json.loads((root / "note.json").read_text(encoding="utf-8"))
+            note_idx = np.fromfile(root / "note.indices", dtype=np.uint32)
             self.assertTrue(np.allclose(loss_vals, [1.0]))
             self.assertEqual(loss_idx.tolist(), [0])
+            self.assertEqual(note_vals, ["a"])
+            self.assertEqual(note_idx.tolist(), [0])
 
             w.write(loss=9.0)
             w.end_step()
@@ -152,9 +156,9 @@ class TestPlattliWriter(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "run"
             w = PlattliWriter(root, write_threads=0)
-            w.write(loss=1)
+            w.write(loss=1, delta=-1)
             w.end_step()
-            w.write(loss=2)
+            w.write(loss=2, delta=-2)
             w.end_step()
             w.finish(optimize=True, zip=True)
 
@@ -165,8 +169,11 @@ class TestPlattliWriter(unittest.TestCase):
                 self.assertIn("plattli.json", zf.namelist())
                 manifest = json.loads(zf.read("plattli.json"))
                 self.assertEqual(manifest["loss"]["dtype"], "u8")
+                self.assertEqual(manifest["delta"]["dtype"], "i8")
                 self.assertIn("loss.u8", zf.namelist())
                 self.assertNotIn("loss.i64", zf.namelist())
+                self.assertIn("delta.i8", zf.namelist())
+                self.assertNotIn("delta.i64", zf.namelist())
                 self.assertEqual(manifest["run_rows"], 2)
 
     def test_config(self):
