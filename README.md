@@ -14,7 +14,7 @@ and a `config.json` with info about the run.
 pip install plattli
 ```
 
-Requires Python 3.11+.
+Requires Python 3.11+ (tested on 3.11-3.14).
 
 ## CLI
 
@@ -23,6 +23,9 @@ A tool to convert jsonl (a common adhoc format) to plattli is provided, see
 ```bash
 jsonl2plattli --help
 ```
+
+By default it writes in-place as `<run_dir>/metrics.plattli`.
+With `--outdir`, it writes `<run_name>.plattli` into the output tree.
 
 ## API
 
@@ -50,7 +53,8 @@ w.write(loss=1.1)
 # You can also write json, btw.
 w.write(prediction={"qid": "42096", "answer": "Yes"})
 
-# When finishing cleanly, we can hindsight-optimize the data for faster consumption
+# When finishing cleanly, we can hindsight-optimize the data for faster consumption.
+# This writes /experiments/123456/metrics.plattli and removes /experiments/123456/plattli.
 w.finish()
 ```
 
@@ -59,11 +63,13 @@ Note: this library is meant to be called from a single thread.
 but calling `end_step` from a different thread would lead to silently inconsistent data.
 
 ### PlattliWriter(outdir, step=0, write_threads=16, config=None)
-- Prepares the writer to write to outdir, creating the dir and writing the config there.
-- If `plattli.json` already exists, all metric files are truncated to `step` so you
+- Prepares the writer to write under `outdir/plattli`, creating the dir and writing the config there.
+- If `outdir/plattli/plattli.json` already exists, all metric files are truncated to `step` so you
   can resume a run and overwrite later data safely.
 - `write_threads=0` disables background writes.
-- `config` is a dict written to `config.json` (empty dict by default).
+- `config` is a dict written to `config.json` (empty dict by default), or a string
+  path (resolved relative to `outdir`) to symlink `config.json` to.
+- If `config=None` and `outdir/config.json` exists, it is symlinked automatically.
 
 ### write(**metrics)
 - Appends each metric at the current step.
@@ -91,19 +97,21 @@ but calling `end_step` from a different thread would lead to silently inconsiste
   - Tightens numeric dtypes (floats -> `f32`, ints -> smallest fitting int/uint).
   - Converts monotonically spaced indices into `{start, stop, step}` and removes the `.indices` file.
   - Writes `run_rows` (max rows across metrics) into the manifest.
-- If `zip=True`, zips the run folder to `<outdir>.zip` (stored, not compressed).
-- When zipping, the original run folder is removed after the zip is written.
+- If `zip=True`, zips the run folder to `<outdir>/metrics.plattli` (stored, not compressed).
+- When zipping, `outdir/plattli` is removed after the zip is written.
 
 ## Data format
 
-Each run directory or zip contains:
+Each run directory contains a `plattli/` folder, while the `.plattli` archive contains the same files at the top level:
 
 ```
 run_dir/
-  config.json
-  plattli.json
-  <metric>.indices
-  <metric>.<dtype>   # or <metric>.json
+  plattli/
+    config.json
+    plattli.json
+    <metric>.indices
+    <metric>.<dtype>   # or <metric>.json
+  metrics.plattli
 ```
 
 ### Manifest (`plattli.json`)
