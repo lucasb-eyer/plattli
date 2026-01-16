@@ -17,7 +17,7 @@ class _ColumnBuffer:
 
 
 class PlattliBulkWriter:
-    def __init__(self, outdir, step=0, config=None):
+    def __init__(self, outdir, step=0, config="config.json"):
         self.run_root = Path(outdir)
         if self.run_root.name == "plattli":
             raise ValueError("outdir should be a run directory, not the plattli folder")
@@ -77,27 +77,21 @@ class PlattliBulkWriter:
         path = self.root / "config.json"
         config = self._config
         if config is None:
-            run_config = self.run_root / "config.json"
-            if run_config.exists():
-                if not run_config.is_file():
-                    raise FileNotFoundError(f"config target is not a file: {run_config}")
-                config = str(run_config.resolve())
+            config = {}
+        if isinstance(config, str):
+            target = (self.run_root / config).expanduser()
+            if target.exists():
+                if not target.is_file():
+                    raise FileNotFoundError(f"config target is not a file: {target}")
+                if zip:
+                    write_bytes("config.json", target.read_bytes())
+                else:
+                    if path.exists() or path.is_symlink():
+                        path.unlink()
+                    path.symlink_to(target.resolve())
+                config = None
             else:
                 config = {}
-        if isinstance(config, str):
-            target = Path(config).expanduser()
-            check_target = target if target.is_absolute() else self.run_root / target
-            if not check_target.exists():
-                raise FileNotFoundError(f"config target missing: {check_target}")
-            if not check_target.is_file():
-                raise FileNotFoundError(f"config target is not a file: {check_target}")
-            if zip:
-                write_bytes("config.json", check_target.read_bytes())
-            else:
-                if path.exists() or path.is_symlink():
-                    path.unlink()
-                path.symlink_to(check_target.resolve())
-            config = None
         if config is not None:
             if not zip and path.is_symlink():
                 path.unlink()

@@ -108,7 +108,7 @@ class TestPlattliBulkWriter(unittest.TestCase):
             plattli_root = run_root / "plattli"
             run_root.mkdir(parents=True, exist_ok=True)
             (run_root / "config.json").write_text(json.dumps({"seed": 3}), encoding="utf-8")
-            w = PlattliBulkWriter(run_root, config=None)
+            w = PlattliBulkWriter(run_root)
             w.write(loss=1.0)
             w.end_step()
             w.finish(zip=False)

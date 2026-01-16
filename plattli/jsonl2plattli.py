@@ -26,7 +26,7 @@ def convert_run(run_dir, dest, use_named_zip, skip_cols=None):
     ncols = 0
     nrows = 0
     if dest == run_dir:
-        config = None
+        config = "config.json"
     else:
         config_path = run_dir / "config.json"
         if config_path.exists():

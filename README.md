@@ -62,14 +62,14 @@ Note: this library is meant to be called from a single thread.
 `write` uses threads internally to be non-blocking as it's meant to be used on the critical path,
 but calling `end_step` from a different thread would lead to silently inconsistent data.
 
-### PlattliWriter(outdir, step=0, write_threads=16, config=None)
+### PlattliWriter(outdir, step=0, write_threads=16, config="config.json")
 - Prepares the writer to write under `outdir/plattli`, creating the dir and writing the config there.
 - If `outdir/plattli/plattli.json` already exists, all metric files are truncated to `step` so you
   can resume a run and overwrite later data safely.
 - `write_threads=0` disables background writes.
-- `config` is a dict written to `config.json` (empty dict by default), or a string
-  path (resolved relative to `outdir`) to symlink `config.json` to.
-- If `config=None` and `outdir/config.json` exists, it is symlinked automatically.
+- `config` is a dict written to `config.json`, or a string path (resolved relative to `outdir`)
+  to symlink `config.json` to (default: `"config.json"`).
+- If the target path does not exist, an empty config is written; pass `None` to force an empty config.
 
 ### write(**metrics)
 - Appends each metric at the current step.

@@ -20,16 +20,16 @@ DTYPE_TO_NUMPY = {
     "u64": np.uint64,
 }
 
+
 def _zip_path_for_root(root):
     return Path(root) / "metrics.plattli"
 
 
 class PlattliWriter:
-    def __init__(self, outdir, step=0, write_threads=16, config=None):
+    def __init__(self, outdir, step=0, write_threads=16, config="config.json"):
         self.run_root = Path(outdir)
         if self.run_root.name == "plattli":
             raise ValueError("outdir should be a run directory, not the plattli folder")
-        self.run_root.mkdir(parents=True, exist_ok=True)
         self.root = self.run_root / "plattli"
         self.root.mkdir(parents=True, exist_ok=True)
 
@@ -102,24 +102,19 @@ class PlattliWriter:
         if config is None:
             if path.exists() or path.is_symlink():
                 return
-            run_config = self.run_root / "config.json"
-            if run_config.exists():
-                if not run_config.is_file():
-                    raise FileNotFoundError(f"config target is not a file: {run_config}")
-                path.symlink_to(run_config.resolve())
-                return
             config = {}
         if isinstance(config, str):
-            target = Path(config).expanduser()
-            check_target = target if target.is_absolute() else self.run_root / target
-            if not check_target.exists():
-                raise FileNotFoundError(f"config target missing: {check_target}")
-            if not check_target.is_file():
-                raise FileNotFoundError(f"config target is not a file: {check_target}")
+            target = (self.run_root / config).expanduser()
+            if target.exists():
+                if not target.is_file():
+                    raise FileNotFoundError(f"config target is not a file: {target}")
+                if path.exists() or path.is_symlink():
+                    path.unlink()
+                path.symlink_to(target.resolve())
+                return
             if path.exists() or path.is_symlink():
-                path.unlink()
-            path.symlink_to(check_target.resolve())
-            return
+                return
+            config = {}
         if path.is_symlink():
             path.unlink()
         path.write_text(json.dumps(config, ensure_ascii=False), encoding="utf-8")
@@ -238,8 +233,8 @@ class PlattliWriter:
                 if not path.is_file():
                     continue
                 rel = path.relative_to(self.root)
-                if rel == Path("config.json") and path.is_symlink():
-                    zf.writestr("config.json", path.read_bytes())
+                if path.is_symlink():
+                    zf.writestr(rel.as_posix(), path.read_bytes())
                     continue
                 zf.write(path, rel)
         rmtree(self.root)

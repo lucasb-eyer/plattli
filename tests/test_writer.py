@@ -215,7 +215,7 @@ class TestPlattliWriter(unittest.TestCase):
             plattli_root = run_root / "plattli"
             run_root.mkdir(parents=True, exist_ok=True)
             (run_root / "config.json").write_text(json.dumps({"seed": 3}), encoding="utf-8")
-            w = PlattliWriter(run_root, write_threads=0, config=None)
+            w = PlattliWriter(run_root, write_threads=0)
             self.assertTrue((plattli_root / "config.json").is_symlink())
             w.write(loss=1.0)
             w.finish(optimize=False, zip=False)
