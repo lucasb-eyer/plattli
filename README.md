@@ -100,6 +100,22 @@ but calling `end_step` from a different thread would lead to silently inconsiste
 - If `zip=True`, zips the run folder to `<outdir>/metrics.plattli` (stored, not compressed).
 - When zipping, `outdir/plattli` is removed after the zip is written.
 
+### Reader(path)
+```python
+from plattli import Reader
+
+with Reader("/experiments/123456") as r:
+    print(r.metrics())
+    print(r.rows(), r.when_exported())
+    steps, values = r.metric("loss")
+    step, value = r.metric("loss", idx=-1)
+```
+
+- Prefers `metrics.plattli` if present, otherwise reads the `plattli/` directory.
+- Keeps zip files open until `close()` (use a `with` block or call `close()` manually).
+- Methods: `metrics()`, `config()`, `rows()`, `when_exported()`,
+  `metric(name, idx=None)`, `metric_indices(name)`, `metric_values(name)`.
+
 ## Data format
 
 Each run directory contains a `plattli/` folder, while the `.plattli` archive contains the same files at the top level:
