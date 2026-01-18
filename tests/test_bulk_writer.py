@@ -10,6 +10,10 @@ from plattli import PlattliBulkWriter
 from plattli.writer import _zip_path_for_root
 
 
+def _read_jsonl(path):
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+
 class TestPlattliBulkWriter(unittest.TestCase):
     def test_negative_step(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -29,8 +33,8 @@ class TestPlattliBulkWriter(unittest.TestCase):
             w.finish(zip=False)
 
             loss_vals = np.fromfile(plattli_root / "loss.f32", dtype=np.float32)
-            note_vals = json.loads((plattli_root / "note.json").read_text(encoding="utf-8"))
-            meta_vals = json.loads((plattli_root / "meta.json").read_text(encoding="utf-8"))
+            note_vals = _read_jsonl(plattli_root / "note.jsonl")
+            meta_vals = _read_jsonl(plattli_root / "meta.jsonl")
             note_idx = np.fromfile(plattli_root / "note.indices", dtype=np.uint32)
             manifest = json.loads((plattli_root / "plattli.json").read_text(encoding="utf-8"))
 
@@ -41,7 +45,7 @@ class TestPlattliBulkWriter(unittest.TestCase):
             self.assertEqual(note_idx.tolist(), [0])
             self.assertEqual(manifest["loss"]["dtype"], "f32")
             self.assertEqual(manifest["loss"]["indices"], {"start": 0, "stop": 2, "step": 1})
-            self.assertEqual(manifest["note"]["dtype"], "json")
+            self.assertEqual(manifest["note"]["dtype"], "jsonl")
             self.assertEqual(manifest["run_rows"], 2)
 
     def test_duplicate_metric_same_step(self):
@@ -80,12 +84,13 @@ class TestPlattliBulkWriter(unittest.TestCase):
                 manifest = json.loads(zf.read("plattli.json"))
                 self.assertEqual(manifest["loss"]["dtype"], "u8")
                 self.assertEqual(manifest["delta"]["dtype"], "i8")
-                self.assertEqual(manifest["note"]["dtype"], "json")
+                self.assertEqual(manifest["note"]["dtype"], "jsonl")
                 self.assertEqual(manifest["loss"]["indices"], {"start": 0, "stop": 2, "step": 1})
                 self.assertEqual(manifest["run_rows"], 2)
                 self.assertIn("loss.u8", zf.namelist())
                 self.assertNotIn("loss.indices", zf.namelist())
                 self.assertIn("note.indices", zf.namelist())
+                self.assertIn("note.jsonl", zf.namelist())
 
     def test_config_symlink_zip(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -5,7 +5,7 @@ from pathlib import Path
 
 import numpy as np
 
-from .writer import DTYPE_TO_NUMPY, _find_arange_params, _resolve_dtype, _tight_dtype, _zip_path_for_root
+from .writer import DTYPE_TO_NUMPY, JSONL_DTYPE, _find_arange_params, _resolve_dtype, _tight_dtype, _zip_path_for_root
 
 
 class _ColumnBuffer:
@@ -36,6 +36,8 @@ class PlattliBulkWriter:
     def write(self, **metrics):
         assert 0 <= self.step <= 0xFFFFFFFF, f"step out of uint32 range: {self.step}"
         for name, value in metrics.items():
+            if name == "step":
+                raise ValueError("metric name 'step' is reserved")
             if name in self._step_metrics:
                 raise RuntimeError(f"metric already written in step {self.step}: {name}")
             bucket = self._columns.get(name)
@@ -118,10 +120,13 @@ class PlattliBulkWriter:
                     write_bytes(f"{name}.{dtype_tag}", tightened.tobytes())
                     continue
 
-            if (dtype := _resolve_dtype(column.v[0])) == "json":
-                manifest[name] = {"indices": indices_spec, "dtype": "json"}
-                values = [_jsonify(v) for v in column.v]
-                write_bytes(f"{name}.json", json.dumps(values, ensure_ascii=False).encode("utf-8"))
+            if (dtype := _resolve_dtype(column.v[0])) == JSONL_DTYPE:
+                manifest[name] = {"indices": indices_spec, "dtype": JSONL_DTYPE}
+                lines = "\n".join(json.dumps(v.item() if isinstance(v, (np.ndarray, np.generic)) else v,
+                                             ensure_ascii=False) for v in column.v)
+                if lines:
+                    lines += "\n"
+                write_bytes(f"{name}.jsonl", lines.encode("utf-8"))
                 continue
 
             arr = np.asarray(column.v, dtype=DTYPE_TO_NUMPY[dtype])
@@ -133,9 +138,3 @@ class PlattliBulkWriter:
         write_bytes("plattli.json", json.dumps(manifest, ensure_ascii=False).encode("utf-8"))
         close()
         self.write = self.end_step = self.set_config = None
-
-
-def _jsonify(value):
-    if isinstance(value, (np.ndarray, np.generic)):
-        return value.item()
-    return value

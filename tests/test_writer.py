@@ -6,22 +6,26 @@ from pathlib import Path
 
 import numpy as np
 
-from plattli import PlattliWriter
+from plattli import CompactingWriter, DirectWriter
 from plattli.writer import _find_arange_params, _zip_path_for_root
 
 
-class TestPlattliWriter(unittest.TestCase):
+def _read_jsonl(path):
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+
+class TestDirectWriter(unittest.TestCase):
     def test_negative_step(self):
         with tempfile.TemporaryDirectory() as tmp:
             run_root = Path(tmp)
             with self.assertRaises(AssertionError):
-                PlattliWriter(run_root, step=-1)
+                DirectWriter(run_root, step=-1)
 
     def test_basic_write(self):
         with tempfile.TemporaryDirectory() as tmp:
             run_root = Path(tmp)
             plattli_root = run_root / "plattli"
-            w = PlattliWriter(run_root)
+            w = DirectWriter(run_root)
             w.write(loss=1.2)
             w.write(note="ok")
             w.end_step()
@@ -31,7 +35,7 @@ class TestPlattliWriter(unittest.TestCase):
 
             loss_vals = np.fromfile(plattli_root / "loss.f32", dtype=np.float32)
             loss_idx = np.fromfile(plattli_root / "loss.indices", dtype=np.uint32)
-            note_vals = json.loads((plattli_root / "note.json").read_text(encoding="utf-8"))
+            note_vals = _read_jsonl(plattli_root / "note.jsonl")
             note_idx = np.fromfile(plattli_root / "note.indices", dtype=np.uint32)
             manifest = json.loads((plattli_root / "plattli.json").read_text(encoding="utf-8"))
 
@@ -42,7 +46,7 @@ class TestPlattliWriter(unittest.TestCase):
             self.assertEqual(manifest["loss"]["dtype"], "f32")
             self.assertEqual(manifest["loss"]["indices"], "indices")
             self.assertNotIn("rows", manifest["loss"])
-            self.assertEqual(manifest["note"]["dtype"], "json")
+            self.assertEqual(manifest["note"]["dtype"], "jsonl")
             self.assertNotIn("rows", manifest["note"])
             self.assertIn("when_exported", manifest)
 
@@ -50,7 +54,7 @@ class TestPlattliWriter(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             run_root = Path(tmp)
             plattli_root = run_root / "plattli"
-            w = PlattliWriter(run_root, write_threads=0)
+            w = DirectWriter(run_root, write_threads=0)
             w.write(loss=np.float64(1.5))
             w.finish(optimize=False, zip=False)
 
@@ -62,7 +66,7 @@ class TestPlattliWriter(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             run_root = Path(tmp)
             plattli_root = run_root / "plattli"
-            w = PlattliWriter(run_root, write_threads=0)
+            w = DirectWriter(run_root, write_threads=0)
             w.write(loss=np.float32(1.0))
             w.end_step()
             w.write(loss=np.float64(1.5))
@@ -76,7 +80,7 @@ class TestPlattliWriter(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             run_root = Path(tmp)
             plattli_root = run_root / "plattli"
-            w = PlattliWriter(run_root, write_threads=0)
+            w = DirectWriter(run_root, write_threads=0)
             w.write(loss=1.0)
             with self.assertRaises(RuntimeError):
                 w.write(loss=2.0)
@@ -93,26 +97,23 @@ class TestPlattliWriter(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             run_root = Path(tmp)
             plattli_root = run_root / "plattli"
-            w = PlattliWriter(run_root, write_threads=0)
+            w = DirectWriter(run_root, write_threads=0)
             w.write(flag=True)
             w.end_step()
             w.write(flag=False)
             w.finish(optimize=False, zip=False)
 
-            flag_vals = json.loads((plattli_root / "flag.json").read_text(encoding="utf-8"))
+            flag_vals = _read_jsonl(plattli_root / "flag.jsonl")
             self.assertEqual(flag_vals, [True, False])
 
     def test_background_error_note(self):
         with tempfile.TemporaryDirectory() as tmp:
             run_root = Path(tmp)
-            w = PlattliWriter(run_root, write_threads=1)
+            w = DirectWriter(run_root, write_threads=1)
             try:
                 w.step = 0x1_0000_0000
-                w.write(loss=1.0)
-                with self.assertRaises(ValueError) as ctx:
-                    w.end_step()
-                notes = getattr(ctx.exception, "__notes__", [])
-                self.assertTrue(any("Background write failed" in note for note in notes))
+                with self.assertRaises(ValueError):
+                    w.write(loss=1.0)
             finally:
                 if w._executor:
                     w._executor.shutdown(wait=True)
@@ -121,7 +122,7 @@ class TestPlattliWriter(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             run_root = Path(tmp)
             plattli_root = run_root / "plattli"
-            w = PlattliWriter(run_root, write_threads=0)
+            w = DirectWriter(run_root, write_threads=0)
             w.write(loss=1.0, note="a")
             w.end_step()
             w.write(loss=2.0, note="b")
@@ -130,10 +131,10 @@ class TestPlattliWriter(unittest.TestCase):
             w.end_step()
             w.finish(optimize=False, zip=False)
 
-            w = PlattliWriter(run_root, step=1, write_threads=0)
+            w = DirectWriter(run_root, step=1, write_threads=0)
             loss_vals = np.fromfile(plattli_root / "loss.f32", dtype=np.float32)
             loss_idx = np.fromfile(plattli_root / "loss.indices", dtype=np.uint32)
-            note_vals = json.loads((plattli_root / "note.json").read_text(encoding="utf-8"))
+            note_vals = _read_jsonl(plattli_root / "note.jsonl")
             note_idx = np.fromfile(plattli_root / "note.indices", dtype=np.uint32)
             self.assertTrue(np.allclose(loss_vals, [1.0]))
             self.assertEqual(loss_idx.tolist(), [0])
@@ -148,11 +149,34 @@ class TestPlattliWriter(unittest.TestCase):
             self.assertTrue(np.allclose(loss_vals, [1.0, 9.0]))
             self.assertEqual(loss_idx.tolist(), [0, 1])
 
+    def test_hot_resume_after_crash(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_root = Path(tmp) / "run"
+            plattli_root = run_root / "plattli"
+            w = CompactingWriter(run_root, hotsize=5)
+            w.write(loss=1.0)
+            w.end_step()
+            w.write(loss=2.0)
+            w.end_step()
+            self.assertTrue((plattli_root / "hot.jsonl").exists())
+            w = None
+
+            w = CompactingWriter(run_root, step=2, hotsize=5)
+            w.write(loss=3.0)
+            w.end_step()
+            w.finish(optimize=False, zip=False)
+
+            loss_vals = np.fromfile(plattli_root / "loss.f32", dtype=np.float32)
+            loss_idx = np.fromfile(plattli_root / "loss.indices", dtype=np.uint32)
+            self.assertTrue(np.allclose(loss_vals, [1.0, 2.0, 3.0]))
+            self.assertEqual(loss_idx.tolist(), [0, 1, 2])
+            self.assertFalse((plattli_root / "hot.jsonl").exists())
+
     def test_optimize_indices(self):
         with tempfile.TemporaryDirectory() as tmp:
             run_root = Path(tmp) / "run"
             plattli_root = run_root / "plattli"
-            w = PlattliWriter(run_root, write_threads=0)
+            w = DirectWriter(run_root, write_threads=0)
             w.write(loss=1.0)
             w.end_step()
             w.write(loss=2.0)
@@ -170,7 +194,7 @@ class TestPlattliWriter(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             run_root = Path(tmp) / "run"
             plattli_root = run_root / "plattli"
-            w = PlattliWriter(run_root, write_threads=0)
+            w = DirectWriter(run_root, write_threads=0)
             w.write(loss=1, delta=-1, note="ok")
             w.end_step()
             w.write(loss=2, delta=-2)
@@ -186,12 +210,12 @@ class TestPlattliWriter(unittest.TestCase):
                 manifest = json.loads(zf.read("plattli.json"))
                 self.assertEqual(manifest["loss"]["dtype"], "u8")
                 self.assertEqual(manifest["delta"]["dtype"], "i8")
-                self.assertEqual(manifest["note"]["dtype"], "json")
+                self.assertEqual(manifest["note"]["dtype"], "jsonl")
                 self.assertIn("loss.u8", zf.namelist())
                 self.assertNotIn("loss.i64", zf.namelist())
                 self.assertIn("delta.i8", zf.namelist())
                 self.assertNotIn("delta.i64", zf.namelist())
-                self.assertIn("note.json", zf.namelist())
+                self.assertIn("note.jsonl", zf.namelist())
                 self.assertEqual(manifest["run_rows"], 2)
 
     def test_config_symlink_and_zip(self):
@@ -200,7 +224,7 @@ class TestPlattliWriter(unittest.TestCase):
             plattli_root = run_root / "plattli"
             target = Path(tmp) / "config_source.json"
             target.write_text(json.dumps({"seed": 7}), encoding="utf-8")
-            w = PlattliWriter(run_root, write_threads=0, config=str(target))
+            w = DirectWriter(run_root, write_threads=0, config=str(target))
             self.assertTrue((plattli_root / "config.json").is_symlink())
             w.write(loss=1.0)
             w.finish(optimize=False, zip=True)
@@ -215,7 +239,7 @@ class TestPlattliWriter(unittest.TestCase):
             plattli_root = run_root / "plattli"
             run_root.mkdir(parents=True, exist_ok=True)
             (run_root / "config.json").write_text(json.dumps({"seed": 3}), encoding="utf-8")
-            w = PlattliWriter(run_root, write_threads=0)
+            w = DirectWriter(run_root, write_threads=0)
             self.assertTrue((plattli_root / "config.json").is_symlink())
             w.write(loss=1.0)
             w.finish(optimize=False, zip=False)
@@ -226,7 +250,7 @@ class TestPlattliWriter(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             run_root = Path(tmp) / "run"
             plattli_root = run_root / "plattli"
-            w = PlattliWriter(run_root, config={"seed": 7})
+            w = DirectWriter(run_root, config={"seed": 7})
             w.write(loss=1.0)
             w.end_step()
             w.set_config({"seed": 9, "note": "ok"})
@@ -239,7 +263,7 @@ class TestPlattliWriter(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             run_root = Path(tmp) / "run"
             plattli_root = run_root / "plattli"
-            w = PlattliWriter(run_root, write_threads=0)
+            w = DirectWriter(run_root, write_threads=0)
             w.write(loss=1.0)
             w.end_step()
             w.write(loss=2.0)
@@ -250,7 +274,7 @@ class TestPlattliWriter(unittest.TestCase):
 
             self.assertFalse((plattli_root / "loss.indices").exists())
 
-            w = PlattliWriter(run_root, step=2, write_threads=0)
+            w = DirectWriter(run_root, step=2, write_threads=0)
             loss_idx = np.fromfile(plattli_root / "loss.indices", dtype=np.uint32)
             loss_vals = np.fromfile(plattli_root / "loss.f32", dtype=np.float32)
             manifest = json.loads((plattli_root / "plattli.json").read_text(encoding="utf-8"))
@@ -262,7 +286,7 @@ class TestPlattliWriter(unittest.TestCase):
     def test_reject_non_scalar_values(self):
         with tempfile.TemporaryDirectory() as tmp:
             run_root = Path(tmp)
-            w = PlattliWriter(run_root, write_threads=0)
+            w = DirectWriter(run_root, write_threads=0)
             w.write(loss=1.0)
             w.end_step()
             with self.assertRaises(ValueError):
@@ -270,7 +294,7 @@ class TestPlattliWriter(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             run_root = Path(tmp)
-            w = PlattliWriter(run_root, write_threads=0)
+            w = DirectWriter(run_root, write_threads=0)
             with self.assertRaises(ValueError):
                 w.write(loss=np.array([1, 2]))
 
@@ -278,12 +302,12 @@ class TestPlattliWriter(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             run_root = Path(tmp)
             plattli_root = run_root / "plattli"
-            w = PlattliWriter(run_root, write_threads=0)
+            w = DirectWriter(run_root, write_threads=0)
             w.write(note=np.array("x", dtype="U"))
             w.end_step()
             w.finish(optimize=False, zip=False)
 
-            note_vals = json.loads((plattli_root / "note.json").read_text(encoding="utf-8"))
+            note_vals = _read_jsonl(plattli_root / "note.jsonl")
             self.assertEqual(note_vals, ["x"])
 
     def test_find_arange_params_none(self):

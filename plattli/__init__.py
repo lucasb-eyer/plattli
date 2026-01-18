@@ -2,11 +2,11 @@
 
 from .bulk_writer import PlattliBulkWriter
 from .reader import Reader, has_plattli
-from .writer import PlattliWriter
+from .writer import CompactingWriter, DirectWriter
 
 try:
     from ._version import version as __version__
 except Exception:  # pragma: no cover
     __version__ = "0+unknown"
 
-__all__ = ("PlattliBulkWriter", "PlattliWriter", "Reader", "has_plattli")
+__all__ = ("CompactingWriter", "DirectWriter", "PlattliBulkWriter", "Reader", "has_plattli")

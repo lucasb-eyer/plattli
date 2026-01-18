@@ -4,7 +4,7 @@ from pathlib import Path
 
 import numpy as np
 
-from .writer import DTYPE_TO_NUMPY
+from .writer import DTYPE_TO_NUMPY, HOT_FILENAME, JSONL_DTYPE
 
 
 def has_plattli(path):
@@ -64,6 +64,8 @@ class Reader:
         self._config = None
         self._rows = None
         self._when_exported = None
+        self._hot_columns = None
+        self._hot_has_file = None
         if self.kind == "zip":
             self._zip = zipfile.ZipFile(self.root)
 
@@ -88,9 +90,6 @@ class Reader:
             return self._zip.read(name)
         return (self.root / name).read_bytes()
 
-    def _zip_size(self, name):
-        return self._zip.getinfo(name).file_size
-
     def _ensure_manifest(self):
         if self._manifest is not None:
             return
@@ -99,11 +98,39 @@ class Reader:
         self._when_exported = manifest.pop("when_exported", None)
         self._manifest = manifest
 
-    def _metric_spec(self, name):
+    def _ensure_hot(self):
+        if self._hot_columns is not None:
+            return
+        self._hot_columns = {}
+        if self.kind != "dir":
+            self._hot_has_file = False
+            return
+        hot_path = self.root / HOT_FILENAME
+        self._hot_has_file = hot_path.exists()
+        if not self._hot_has_file:
+            return
+        with hot_path.open("r", encoding="utf-8") as fh:
+            for line in fh:
+                row = json.loads(line)
+                step = int(row["step"])
+                for name, value in row.items():
+                    if name == "step":
+                        continue
+                    col = self._hot_columns.get(name)
+                    if col is None:
+                        col = {"indices": [], "values": []}
+                        self._hot_columns[name] = col
+                    col["indices"].append(step)
+                    col["values"].append(value)
+    def _metric_spec(self, name, allow_hot=False):
         self._ensure_manifest()
-        if name not in self._manifest:
-            raise KeyError(f"unknown metric: {name}")
-        return self._manifest[name]
+        if name in self._manifest:
+            return self._manifest[name]
+        if allow_hot:
+            self._ensure_hot()
+            if name in self._hot_columns:
+                return None
+        raise KeyError(f"unknown metric: {name}")
 
     def config(self):
         if self._config is None:
@@ -116,29 +143,21 @@ class Reader:
 
     def rows(self):
         self._ensure_manifest()
-        if self._rows is not None:
+        self._ensure_hot()
+        if self._rows is not None and not self._hot_columns:
             return self._rows
         run_rows = 0
-        for name, spec in self._manifest.items():
-            indices_spec = spec.get("indices")
-            if isinstance(indices_spec, dict):
-                start = int(indices_spec.get("start") or 0)
-                stop = int(indices_spec.get("stop") or 0)
-                step = int(indices_spec.get("step") or 1)
-                if step <= 0 or stop <= start:
-                    rows = 0
+        metrics = set(self._manifest.keys()) | set(self._hot_columns.keys())
+        for name in metrics:
+            spec = self._manifest.get(name)
+            columnar_count, last_step = self._columnar_count_and_last_step(name, spec)
+            hot_count = 0
+            if name in self._hot_columns:
+                if last_step is None:
+                    hot_count = len(self._hot_columns[name]["indices"])
                 else:
-                    rows = (stop - start + step - 1) // step
-            elif indices_spec == "indices":
-                if self.kind == "zip":
-                    size = self._zip_size(f"{name}.indices")
-                else:
-                    size = (self.root / f"{name}.indices").stat().st_size
-                if size % 4:
-                    raise ValueError(f"invalid indices file size for {name}: {size}")
-                rows = size // 4
-            else:
-                raise RuntimeError(f"invalid indices spec for {name}: {indices_spec}")
+                    hot_count = sum(1 for step in self._hot_columns[name]["indices"] if step > last_step)
+            rows = columnar_count + hot_count
             if rows > run_rows:
                 run_rows = rows
         self._rows = run_rows
@@ -146,10 +165,54 @@ class Reader:
 
     def metrics(self):
         self._ensure_manifest()
-        return sorted(self._manifest.keys())
+        self._ensure_hot()
+        return sorted(set(self._manifest.keys()) | set(self._hot_columns.keys()))
 
-    def metric_indices(self, name):
-        spec = self._metric_spec(name)
+    def _columnar_count_and_last_step(self, name, spec):
+        if spec is None:
+            return 0, None
+        indices_spec = spec.get("indices")
+        if isinstance(indices_spec, dict):
+            start = int(indices_spec.get("start") or 0)
+            stop = int(indices_spec.get("stop") or 0)
+            step = int(indices_spec.get("step") or 1)
+            if step <= 0 or stop <= start:
+                return 0, None
+            count = (stop - start + step - 1) // step
+            last_step = start + (count - 1) * step if count > 0 else None
+            return int(count), int(last_step) if last_step is not None else None
+        if indices_spec == "indices":
+            if self.kind == "zip":
+                data = self._read_bytes(f"{name}.indices")
+                size = len(data)
+                if size % 4:
+                    raise ValueError(f"invalid indices file size for {name}: {size}")
+                count = size // 4
+                if count == 0:
+                    return 0, None
+                last_step = int(np.frombuffer(data[-4:], dtype=np.uint32)[0])
+                return count, last_step
+            path = self.root / f"{name}.indices"
+            if not path.exists():
+                self._ensure_hot()
+                if self._hot_has_file:
+                    return 0, None
+                raise FileNotFoundError(f"missing indices file for {name}")
+            size = path.stat().st_size
+            if size % 4:
+                raise ValueError(f"invalid indices file size for {name}: {size}")
+            count = size // 4
+            if count == 0:
+                return 0, None
+            with path.open("rb") as fh:
+                fh.seek(-4, 2)
+                last_step = int(np.frombuffer(fh.read(4), dtype=np.uint32)[0])
+            return count, last_step
+        raise RuntimeError(f"invalid indices spec for {name}: {indices_spec}")
+
+    def _columnar_indices(self, name, spec):
+        if spec is None:
+            return np.asarray([], dtype=np.uint32)
         indices_spec = spec.get("indices")
         if isinstance(indices_spec, dict):
             start = int(indices_spec.get("start") or 0)
@@ -161,19 +224,88 @@ class Reader:
         if indices_spec == "indices":
             if self.kind == "zip":
                 return np.frombuffer(self._read_bytes(f"{name}.indices"), dtype=np.uint32)
-            return np.fromfile(self.root / f"{name}.indices", dtype=np.uint32)
+            path = self.root / f"{name}.indices"
+            if not path.exists():
+                self._ensure_hot()
+                if self._hot_has_file:
+                    return np.asarray([], dtype=np.uint32)
+                raise FileNotFoundError(f"missing indices file for {name}")
+            return np.fromfile(path, dtype=np.uint32)
         raise RuntimeError(f"invalid indices spec for {name}: {indices_spec}")
 
-    def metric_values(self, name):
-        spec = self._metric_spec(name)
+    def _columnar_values(self, name, spec):
+        if spec is None:
+            return np.asarray([], dtype=object)
         dtype = spec.get("dtype")
-        if dtype == "json":
-            return np.asarray(json.loads(self._read_text(f"{name}.json")), dtype=object)
+        if dtype == JSONL_DTYPE:
+            if self.kind == "zip":
+                values = [json.loads(line) for line in self._read_bytes(f"{name}.jsonl").splitlines()]
+                return np.asarray(values, dtype=object)
+            path = self.root / f"{name}.jsonl"
+            if not path.exists():
+                self._ensure_hot()
+                if self._hot_has_file:
+                    return np.asarray([], dtype=object)
+                raise FileNotFoundError(f"missing values file for {name}")
+            with path.open("r", encoding="utf-8") as fh:
+                return np.asarray([json.loads(line) for line in fh], dtype=object)
         if dtype not in DTYPE_TO_NUMPY:
             raise ValueError(f"unsupported dtype for {name}: {dtype}")
         if self.kind == "zip":
             return np.frombuffer(self._read_bytes(f"{name}.{dtype}"), dtype=DTYPE_TO_NUMPY[dtype])
-        return np.fromfile(self.root / f"{name}.{dtype}", dtype=DTYPE_TO_NUMPY[dtype])
+        path = self.root / f"{name}.{dtype}"
+        if not path.exists():
+            self._ensure_hot()
+            if self._hot_has_file:
+                return np.asarray([], dtype=DTYPE_TO_NUMPY[dtype])
+            raise FileNotFoundError(f"missing values file for {name}")
+        return np.fromfile(path, dtype=DTYPE_TO_NUMPY[dtype])
+
+    def _hot_for_metric(self, name, last_step):
+        self._ensure_hot()
+        col = self._hot_columns.get(name)
+        if not col:
+            return np.asarray([], dtype=np.uint32), []
+        indices = []
+        values = []
+        for step, value in zip(col["indices"], col["values"]):
+            if last_step is None or step > last_step:
+                indices.append(step)
+                values.append(value)
+        return np.asarray(indices, dtype=np.uint32), values
+
+    def metric_indices(self, name):
+        spec = self._metric_spec(name, allow_hot=True)
+        columnar = self._columnar_indices(name, spec)
+        last_step = int(columnar[-1]) if columnar.size else None
+        hot_idx, _ = self._hot_for_metric(name, last_step)
+        if hot_idx.size == 0:
+            return columnar
+        if columnar.size == 0:
+            return hot_idx
+        return np.concatenate([columnar, hot_idx])
+
+    def metric_values(self, name):
+        spec = self._metric_spec(name, allow_hot=True)
+        columnar = self._columnar_values(name, spec)
+        last_step = None
+        if spec is not None:
+            indices = self._columnar_indices(name, spec)
+            if indices.size:
+                last_step = int(indices[-1])
+        _, hot_values = self._hot_for_metric(name, last_step)
+        if not hot_values:
+            return columnar
+        if spec is None or spec.get("dtype") == JSONL_DTYPE:
+            hot_arr = np.asarray(hot_values, dtype=object)
+            if columnar.size == 0:
+                return hot_arr
+            return np.concatenate([columnar, hot_arr])
+        dtype = spec.get("dtype")
+        hot_arr = np.asarray(hot_values, dtype=DTYPE_TO_NUMPY[dtype])
+        if columnar.size == 0:
+            return hot_arr
+        return np.concatenate([columnar, hot_arr])
 
     def metric(self, name, idx=None):
         if idx is None:

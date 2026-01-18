@@ -3,10 +3,10 @@
 [![Tests](https://github.com/lucasb-eyer/plattli/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/lucasb-eyer/plattli/actions/workflows/ci.yml) [![codecov](https://codecov.io/gh/lucasb-eyer/plattli/branch/main/graph/badge.svg)](https://codecov.io/gh/lucasb-eyer/plattli)
 
 Minimal streaming writer for the Plättli metric format.
-The format is very simple, and allows for efficient appending, reading and slicing.
-It consists of one file per metric, which is just a raw homogeneous array,
+The format is simple and columnar for fast reads, while live runs use a small hot log that is compacted in the background.
+It consists of one file per metric (raw homogeneous array or jsonl),
 plus a metrics manifest (`plattli.json`) that describes dtype and indices,
-and a `config.json` with info about the run.
+a `config.json` with info about the run, and an optional `hot.jsonl` during live logging.
 
 ## Install
 
@@ -30,12 +30,12 @@ With `--outdir`, it writes `<run_name>.plattli` into the output tree.
 ## API
 
 ```python
-from plattli import PlattliWriter
+from plattli import CompactingWriter, DirectWriter
 
-w = PlattliWriter("/experiments/123456", config={"lr": 3e-4, "depth": 32})
+w = CompactingWriter("/experiments/123456", hotsize=200, config={"lr": 3e-4, "depth": 32})
 w.write(loss=1.2)  # First write creates new metric, auto-guesses dtype (float32 here)
 w.write(note="ok")  # strings work too. Writes are non-blocking.
-w.end_step()  # Increments step by one. Makes sure previous writes are flushed.
+w.end_step()  # Increments step by one. Flushes hot log.
 
 w.write(loss=1.3)  # Next write appends
 # Not every metric needs to be written every step.
@@ -47,22 +47,28 @@ del w
 
 # If we specify a start step and destination exists,
 # existing metrics will be truncated to that and we continue from there.
-w = PlattliWriter("/experiments/123456", step=1, config={"lr": 3e-4, "depth": 32})
+w = CompactingWriter("/experiments/123456", step=1, hotsize=200, config={"lr": 3e-4, "depth": 32})
 w.write(loss=1.1)
 
-# You can also write json, btw.
+# You can also write json, btw (stored as jsonl).
 w.write(prediction={"qid": "42096", "answer": "Yes"})
 
 # When finishing cleanly, we can hindsight-optimize the data for faster consumption.
 # This writes /experiments/123456/metrics.plattli and removes /experiments/123456/plattli.
 w.finish()
+
+# For fast local disks, write directly to columnar files:
+d = DirectWriter("/experiments/123456", config={"lr": 3e-4, "depth": 32})
+d.write(loss=1.2)
+d.end_step()
+d.finish()
 ```
 
 Note: this library is meant to be called from a single thread.
-`write` uses threads internally to be non-blocking as it's meant to be used on the critical path,
-but calling `end_step` from a different thread would lead to silently inconsistent data.
+`DirectWriter` uses threads internally to be non-blocking, and `CompactingWriter` compacts in the background.
+Calling `end_step` from a different thread would lead to silently inconsistent data.
 
-### PlattliWriter(outdir, step=0, write_threads=16, config="config.json")
+### DirectWriter(outdir, step=0, write_threads=16, config="config.json")
 - Prepares the writer to write under `outdir/plattli`, creating the dir and writing the config there.
 - If `outdir/plattli/plattli.json` already exists, all metric files are truncated to `step` so you
   can resume a run and overwrite later data safely.
@@ -71,28 +77,39 @@ but calling `end_step` from a different thread would lead to silently inconsiste
   to symlink `config.json` to (default: `"config.json"`).
 - If the target path does not exist, an empty config is written; pass `None` to force an empty config.
 
-### write(**metrics)
+### CompactingWriter(outdir, step=0, hotsize, config="config.json")
+- Hot mode: writes rows to `hot.jsonl` and compacts them into columnar files in the background.
+- `hotsize` must be > 0 and keeps the last N completed steps in the hot log.
+- `config` follows the same rules as `DirectWriter`.
+
+### DirectWriter.write(**metrics)
 - Appends each metric at the current step.
 - Auto-dtype rules:
   - array-like scalars -> use their dtype if supported
-  - bool -> `json`
+  - bool -> `jsonl`
   - float -> `f32`
   - int -> `i64`
-  - everything else -> `json`
+  - everything else -> `jsonl`
 - Force a dtype by casting the value (for example: `write(dim=np.float32(128))`).
 - Only scalar values are supported (including 0-d array-likes).
 - Only standard dtypes are supported for now: no bf16, nvfp4, fp8; no complex/composite.
 
+### CompactingWriter.write(metrics=None, flush=False, **metrics)
+- Appends each metric at the current step (pass a dict or kwargs).
+- `flush=True` forces a `hot.jsonl` rewrite without advancing the step (use `write(flush=True)` to flush only).
+- Uses the same auto-dtype rules and scalar restrictions as `DirectWriter.write`.
+
 ### end_step()
 - Increments step counter by one.
-- Waits for all previous step writes to finish and checks for errors.
-- This could also be made non-blocking with a bit more effort, but let's first keep things simple.
+- `DirectWriter` waits for all previous step writes to finish and checks for errors.
+- `CompactingWriter` flushes the hot row for the current step.
 
 ### set_config(config)
 - Replaces `config.json` with the provided json-dumpable config.
 
 ### finish(optimize=True, zip=True)
-- Flushes writes and updates `plattli.json`.
+- `DirectWriter` flushes writes; `CompactingWriter` compacts any remaining hot rows and removes `hot.jsonl`.
+- Updates `plattli.json`.
 - If `optimize=True`:
   - Tightens numeric dtypes (floats -> `f32`, ints -> smallest fitting int/uint).
   - Converts monotonically spaced indices into `{start, stop, step}` and removes the `.indices` file.
@@ -126,7 +143,8 @@ run_dir/
     config.json
     plattli.json
     <metric>.indices
-    <metric>.<dtype>   # or <metric>.json
+    <metric>.<dtype>   # or <metric>.jsonl
+    hot.jsonl           # present during live logging if hotsize is enabled
   metrics.plattli
 ```
 
@@ -136,7 +154,7 @@ JSON object keyed by metric name, plus metadata keys like `run_rows` and `when_e
 ```
 {
   "loss": {"indices": "indices", "dtype": "f32"},
-  "note": {"indices": "indices", "dtype": "json"},
+  "note": {"indices": "indices", "dtype": "jsonl"},
   "run_rows": 1234,
   "when_exported": "2026-01-03T12:34:56Z"
 }
@@ -144,7 +162,7 @@ JSON object keyed by metric name, plus metadata keys like `run_rows` and `when_e
 
 Fields:
 - `indices`: `"indices"` or `{start, stop, step}`.
-- `dtype`: one of `f{32,64}`, `{i,u}{8,16,32,64}`, or `json`.
+- `dtype`: one of `f{32,64}`, `{i,u}{8,16,32,64}`, or `jsonl`.
 - `run_rows`: optional max rows across all metrics (written on `finish` only).
 - `when_exported`: timestamp updated on manifest writes.
 
@@ -159,16 +177,15 @@ Arbitrary JSON object (dict), written when a config is provided.
 ### Values (`<metric>.<dtype>`)
 Raw little-endian typed array. One scalar is appended per write call.
 
-### JSON values (`<metric>.json`)
-JSON array of values, still valid JSON, but written with newlines:
+### JSONL values (`<metric>.jsonl`)
+One JSON value per line:
 
 ```
-[
-{"event":"start"},
+{"event":"start"}
 {"event":"done"}
-]
 ```
 
 ### Metric names and subfolders
 Metric names are used as file paths. A slash creates subfolders:
 `detail/thing0` -> `detail/thing0.f32`.
+The metric name `step` is reserved.
