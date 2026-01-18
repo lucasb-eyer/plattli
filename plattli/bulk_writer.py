@@ -5,7 +5,8 @@ from pathlib import Path
 
 import numpy as np
 
-from .writer import DTYPE_TO_NUMPY, JSONL_DTYPE, _find_arange_params, _resolve_dtype, _tight_dtype, _zip_path_for_root
+from ._indices import _find_piecewise_params
+from .writer import DTYPE_TO_NUMPY, JSONL_DTYPE, _resolve_dtype, _tight_dtype, _zip_path_for_root
 
 
 class _ColumnBuffer:
@@ -103,8 +104,9 @@ class PlattliBulkWriter:
         run_rows = 0
         for name, column in self._columns.items():
             indices = np.asarray(column.i, dtype=np.uint32)
-            if optimize and (params := _find_arange_params(indices)):
-                indices_spec = {"start": params[0], "stop": params[1], "step": params[2]}
+            segments = _find_piecewise_params(indices) if optimize else None
+            if segments:
+                indices_spec = segments
             else:
                 indices_spec = "indices"
                 write_bytes(f"{name}.indices", indices.tobytes())

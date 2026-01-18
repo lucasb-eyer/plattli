@@ -8,6 +8,17 @@ from shutil import rmtree
 
 import numpy as np
 
+from ._indices import (
+    _append_step_to_indices_spec,
+    _append_steps_to_indices_spec,
+    _find_piecewise_params,
+    _segments_count_and_last,
+    _segments_from_spec,
+    _segments_to_array,
+    _segments_too_many,
+    _segments_truncate,
+)
+
 DTYPE_TO_NUMPY = {
     "f32": np.float32,
     "f64": np.float64,
@@ -71,17 +82,13 @@ def _truncate_to_step(root, manifest, step, allow_missing):
                     continue
                 raise FileNotFoundError(f"missing indices file for {name}")
             indices = np.fromfile(idx_path, dtype=np.uint32)
-            keep = int(np.searchsorted(indices, step, side="left"))
+            keep = int(np.searchsorted(indices, step, side="left")) if indices.size else 0
             with idx_path.open("r+b") as fh:
                 fh.truncate(keep * 4)
-        elif isinstance(indices_spec, dict):
-            indices = np.arange(indices_spec["start"], indices_spec["stop"], indices_spec["step"], dtype=np.uint32)
-            keep = int(np.searchsorted(indices, step, side="left"))
-            with (root / f"{name}.indices").open("wb") as fh:
-                indices[:keep].tofile(fh)
-            spec["indices"] = "indices"
         else:
-            raise RuntimeError(f"invalid indices spec for {name}: {indices_spec}")  # pragma: no cover
+            segments = _segments_from_spec(indices_spec)
+            kept, keep = _segments_truncate(segments, step)
+            spec["indices"] = kept
 
         if (dtype := spec["dtype"]) == JSONL_DTYPE:
             path = root / f"{name}.jsonl"
@@ -110,25 +117,41 @@ def _truncate_to_step(root, manifest, step, allow_missing):
     _write_manifest(root / "plattli.json", manifest)
 
 
+def _force_indices_files(root, manifest):
+    updated = False
+    for name, spec in manifest.items():
+        indices_spec = spec.get("indices")
+        if indices_spec == "indices":
+            continue
+        segments = _segments_from_spec(indices_spec)
+        indices = _segments_to_array(segments)
+        idx_path = root / f"{name}.indices"
+        idx_path.parent.mkdir(parents=True, exist_ok=True)
+        with idx_path.open("wb") as fh:
+            indices.tofile(fh)
+        spec["indices"] = "indices"
+        updated = True
+    if updated:
+        _write_manifest(root / "plattli.json", manifest)
+
+
 def _optimize_indices(root, manifest):
     for name, spec in manifest.items():
         if spec["indices"] != "indices":
             continue  # pragma: no cover
         idx_path = root / f"{name}.indices"
         indices = np.fromfile(idx_path, dtype=np.uint32)
-        if params := _find_arange_params(indices):
-            spec["indices"] = {"start": params[0], "stop": params[1], "step": params[2]}
+        segments = _find_piecewise_params(indices)
+        if segments:
+            spec["indices"] = segments
             idx_path.unlink()
 
 
 def _indices_length(root, name, indices_spec):
-    if isinstance(indices_spec, dict):
-        start = int(indices_spec["start"])
-        stop = int(indices_spec["stop"])
-        step = int(indices_spec["step"])
-        if step <= 0 or stop <= start:
-            return 0  # pragma: no cover
-        return int((stop - start + step - 1) // step)
+    if isinstance(indices_spec, (dict, list)):
+        segments = _segments_from_spec(indices_spec)
+        total, _ = _segments_count_and_last(segments)
+        return total
     if indices_spec == "indices":
         idx_path = root / f"{name}.indices"
         return idx_path.stat().st_size // 4
@@ -190,6 +213,7 @@ class DirectWriter:
             self._manifest.pop("run_rows", None)
             if self._manifest:
                 _truncate_to_step(self.root, self._manifest, self.step, allow_missing=False)
+                _force_indices_files(self.root, self._manifest)
 
         self.set_config(config)
 
@@ -214,10 +238,11 @@ class DirectWriter:
                 new_metric = True
             else:
                 dtype = self._manifest[name]["dtype"]
+            write_indices = self._manifest[name]["indices"] == "indices"
             if self._executor:
-                self._futures.append(self._executor.submit(self._write_entry, name, dtype, value, self.step))
+                self._futures.append(self._executor.submit(self._write_entry, name, dtype, value, self.step, write_indices))
             else:
-                self._write_entry(name, dtype, value, self.step)
+                self._write_entry(name, dtype, value, self.step, write_indices)
             self._step_metrics.add(name)
 
         if new_metric:
@@ -226,6 +251,7 @@ class DirectWriter:
     def end_step(self):
         wait(self._futures)
         self._drain_errors()
+        self._flush_step_indices()
         self._step_metrics.clear()
         self.step += 1
 
@@ -235,6 +261,8 @@ class DirectWriter:
 
         wait(self._futures)
         self._drain_errors()
+        self._flush_step_indices()
+        self._step_metrics.clear()
 
         if optimize:
             _tighten_dtypes(self.root, self._manifest)
@@ -254,12 +282,26 @@ class DirectWriter:
     def set_config(self, config):
         _write_config(self.run_root, self.root / "config.json", config)
 
-    def _write_entry(self, name, dtype, value, step):
+    def _write_entry(self, name, dtype, value, step, write_indices):
         if dtype == JSONL_DTYPE:
             _append_jsonl(self.root / f"{name}.jsonl", [value])
         else:
             _append_numeric(self.root / f"{name}.{dtype}", [value], dtype)
-        _append_indices((self.root / f"{name}.indices"), [step])
+        if write_indices:
+            _append_indices((self.root / f"{name}.indices"), [step])
+
+    def _flush_step_indices(self):
+        if not self._step_metrics:
+            return
+        updated = False
+        for name in self._step_metrics:
+            indices_spec = self._manifest[name]["indices"]
+            if indices_spec == "indices":
+                continue
+            self._manifest[name]["indices"] = _append_step_to_indices_spec(indices_spec, self.step)
+            updated = True
+        if updated:
+            _write_manifest(self.root / "plattli.json", self._manifest)
 
     def _drain_errors(self):
         remaining = []
@@ -338,7 +380,7 @@ class CompactingWriter:
             if name not in self._manifest:
                 dtype = _resolve_dtype(value)
                 (self.root / name).parent.mkdir(parents=True, exist_ok=True)
-                self._manifest[name] = {"indices": "indices", "dtype": dtype}
+                self._manifest[name] = {"indices": [], "dtype": dtype}
                 new_metric = True
             else:
                 dtype = self._manifest[name]["dtype"]
@@ -357,7 +399,8 @@ class CompactingWriter:
             self._step_metrics.add(name)
 
         if new_metric:
-            _write_manifest(self.root / "plattli.json", self._manifest)
+            with self._hot_lock:
+                _write_manifest(self.root / "plattli.json", self._manifest)
         if flush:
             self._flush_hot()
 
@@ -431,7 +474,7 @@ class CompactingWriter:
                     if name not in self._manifest:
                         dtype = _resolve_dtype(value)
                         (self.root / name).parent.mkdir(parents=True, exist_ok=True)
-                        self._manifest[name] = {"indices": "indices", "dtype": dtype}
+                        self._manifest[name] = {"indices": [], "dtype": dtype}
                         new_metric = True
         if step_row is not None:
             self._hot_index[self.step] = len(self._hot_rows)
@@ -441,7 +484,8 @@ class CompactingWriter:
         if rewrite_hot:
             self._write_hot_file()
         if new_metric:
-            _write_manifest(self.root / "plattli.json", self._manifest)
+            with self._hot_lock:
+                _write_manifest(self.root / "plattli.json", self._manifest)
 
     def _drain_errors(self):
         if self._compact_future is None:
@@ -507,16 +551,34 @@ class CompactingWriter:
                 col["indices"].append(step)
                 col["values"].append(value)
 
+        updated_specs = {}
         for name, col in columns.items():
             dtype = self._manifest[name]["dtype"]
             (self.root / name).parent.mkdir(parents=True, exist_ok=True)
-            _append_indices(self.root / f"{name}.indices", col["indices"])
+            indices_spec = self._manifest[name]["indices"]
+            if indices_spec == "indices":
+                _append_indices(self.root / f"{name}.indices", col["indices"])
+            else:
+                spec = _append_steps_to_indices_spec(indices_spec, col["indices"])
+                if _segments_too_many(spec):
+                    indices = _segments_to_array(spec)
+                    idx_path = self.root / f"{name}.indices"
+                    idx_path.parent.mkdir(parents=True, exist_ok=True)
+                    with idx_path.open("wb") as fh:
+                        indices.tofile(fh)
+                    updated_specs[name] = "indices"
+                else:
+                    updated_specs[name] = spec
             if dtype == JSONL_DTYPE:
                 _append_jsonl(self.root / f"{name}.jsonl", col["values"])
             else:
                 _append_numeric(self.root / f"{name}.{dtype}", col["values"], dtype)
 
         with self._hot_lock:
+            if updated_specs:
+                for name, spec in updated_specs.items():
+                    self._manifest[name]["indices"] = spec
+                _write_manifest(self.root / "plattli.json", self._manifest)
             steps = {int(row["step"]) for row in rows}
             self._hot_rows = [row for row in self._hot_rows if row["step"] not in steps]
             self._hot_index = {row["step"]: idx for idx, row in enumerate(self._hot_rows)}

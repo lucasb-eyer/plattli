@@ -44,7 +44,7 @@ class TestPlattliBulkWriter(unittest.TestCase):
             self.assertEqual(meta_vals, [{"a": 1}])
             self.assertEqual(note_idx.tolist(), [0])
             self.assertEqual(manifest["loss"]["dtype"], "f32")
-            self.assertEqual(manifest["loss"]["indices"], {"start": 0, "stop": 2, "step": 1})
+            self.assertEqual(manifest["loss"]["indices"], [{"start": 0, "stop": 2, "step": 1}])
             self.assertEqual(manifest["note"]["dtype"], "jsonl")
             self.assertEqual(manifest["run_rows"], 2)
 
@@ -85,7 +85,7 @@ class TestPlattliBulkWriter(unittest.TestCase):
                 self.assertEqual(manifest["loss"]["dtype"], "u8")
                 self.assertEqual(manifest["delta"]["dtype"], "i8")
                 self.assertEqual(manifest["note"]["dtype"], "jsonl")
-                self.assertEqual(manifest["loss"]["indices"], {"start": 0, "stop": 2, "step": 1})
+                self.assertEqual(manifest["loss"]["indices"], [{"start": 0, "stop": 2, "step": 1}])
                 self.assertEqual(manifest["run_rows"], 2)
                 self.assertIn("loss.u8", zf.namelist())
                 self.assertNotIn("loss.indices", zf.namelist())

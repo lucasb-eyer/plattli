@@ -161,7 +161,7 @@ JSON object keyed by metric name, plus metadata keys like `run_rows` and `when_e
 ```
 
 Fields:
-- `indices`: `"indices"` or `{start, stop, step}`.
+- `indices`: `"indices"`, a list of `{start, stop, step}` segments (canonical), or a single `{start, stop, step}` (legacy).
 - `dtype`: one of `f{32,64}`, `{i,u}{8,16,32,64}`, or `jsonl`.
 - `run_rows`: optional max rows across all metrics (written on `finish` only).
 - `when_exported`: timestamp updated on manifest writes.
@@ -169,7 +169,8 @@ Fields:
 ### Indices (`<metric>.indices`)
 Raw little-endian uint32 array. Each entry is the step value for that metric
 write. If `optimize=True` during `finish()`, the file may be removed and
-replaced by `{start, stop, step}` in the manifest.
+replaced by a list of `{start, stop, step}` segments (canonical) or a single
+`{start, stop, step}` (legacy) in the manifest.
 
 ### Config (`config.json`)
 Arbitrary JSON object (dict), written when a config is provided.

@@ -6,7 +6,7 @@ from pathlib import Path
 
 import numpy as np
 
-from plattli import CompactingWriter, DirectWriter
+from plattli import CompactingWriter, DirectWriter, Reader
 from plattli.writer import _find_arange_params, _zip_path_for_root
 
 
@@ -167,10 +167,28 @@ class TestDirectWriter(unittest.TestCase):
             w.finish(optimize=False, zip=False)
 
             loss_vals = np.fromfile(plattli_root / "loss.f32", dtype=np.float32)
-            loss_idx = np.fromfile(plattli_root / "loss.indices", dtype=np.uint32)
             self.assertTrue(np.allclose(loss_vals, [1.0, 2.0, 3.0]))
-            self.assertEqual(loss_idx.tolist(), [0, 1, 2])
+            manifest = json.loads((plattli_root / "plattli.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["loss"]["indices"], [{"start": 0, "stop": 3, "step": 1}])
+            self.assertFalse((plattli_root / "loss.indices").exists())
             self.assertFalse((plattli_root / "hot.jsonl").exists())
+
+    def test_compacting_indices_fallback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_root = Path(tmp) / "run"
+            plattli_root = run_root / "plattli"
+            w = CompactingWriter(run_root, hotsize=100)
+            steps = [0, 10, 11, 25, 26, 40, 41, 60, 61, 85]
+            for step in steps:
+                w.step = step
+                w.write(loss=float(step))
+                w.end_step()
+            w.finish(optimize=False, zip=False)
+
+            manifest = json.loads((plattli_root / "plattli.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["loss"]["indices"], "indices")
+            idx = np.fromfile(plattli_root / "loss.indices", dtype=np.uint32)
+            self.assertEqual(idx.tolist(), steps)
 
     def test_optimize_indices(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -186,9 +204,38 @@ class TestDirectWriter(unittest.TestCase):
             w.finish(optimize=True, zip=False)
 
             manifest = json.loads((plattli_root / "plattli.json").read_text(encoding="utf-8"))
-            self.assertEqual(manifest["loss"]["indices"], {"start": 0, "stop": 3, "step": 1})
+            self.assertEqual(manifest["loss"]["indices"], [{"start": 0, "stop": 3, "step": 1}])
             self.assertFalse((plattli_root / "loss.indices").exists())
             self.assertEqual(manifest["run_rows"], 3)
+
+    def test_optimize_piecewise_indices(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_root = Path(tmp) / "run"
+            plattli_root = run_root / "plattli"
+            w = DirectWriter(run_root, write_threads=0)
+            w.step = 2
+            w.write(loss=1.0)
+            w.end_step()
+            w.step = 1000
+            w.write(loss=2.0)
+            w.end_step()
+            w.step = 2000
+            w.write(loss=3.0)
+            w.end_step()
+            w.step = 3000
+            w.write(loss=4.0)
+            w.end_step()
+            w.step = 4000
+            w.write(loss=5.0)
+            w.end_step()
+            w.finish(optimize=True, zip=False)
+
+            manifest = json.loads((plattli_root / "plattli.json").read_text(encoding="utf-8"))
+            self.assertEqual(
+                manifest["loss"]["indices"],
+                [{"start": 2, "stop": 1998, "step": 998}, {"start": 2000, "stop": 5000, "step": 1000}],
+            )
+            self.assertFalse((plattli_root / "loss.indices").exists())
 
     def test_optimize_zip_and_tighten(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -275,12 +322,49 @@ class TestDirectWriter(unittest.TestCase):
             self.assertFalse((plattli_root / "loss.indices").exists())
 
             w = DirectWriter(run_root, step=2, write_threads=0)
-            loss_idx = np.fromfile(plattli_root / "loss.indices", dtype=np.uint32)
+            self.assertTrue((plattli_root / "loss.indices").exists())
             loss_vals = np.fromfile(plattli_root / "loss.f32", dtype=np.float32)
             manifest = json.loads((plattli_root / "plattli.json").read_text(encoding="utf-8"))
 
-            self.assertEqual(loss_idx.tolist(), [0, 1])
             self.assertTrue(np.allclose(loss_vals, [1.0, 2.0]))
+            self.assertEqual(manifest["loss"]["indices"], "indices")
+
+            w.write(loss=9.0)
+            w.end_step()
+            w.finish(optimize=False, zip=False)
+            manifest = json.loads((plattli_root / "plattli.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["loss"]["indices"], "indices")
+
+    def test_resume_from_piecewise_indices(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_root = Path(tmp) / "run"
+            plattli_root = run_root / "plattli"
+            w = DirectWriter(run_root, write_threads=0)
+            w.step = 2
+            w.write(loss=1.0)
+            w.end_step()
+            w.step = 1000
+            w.write(loss=2.0)
+            w.end_step()
+            w.step = 2000
+            w.write(loss=3.0)
+            w.end_step()
+            w.finish(optimize=True, zip=False)
+
+            manifest = json.loads((plattli_root / "plattli.json").read_text(encoding="utf-8"))
+            self.assertIsInstance(manifest["loss"]["indices"], list)
+            self.assertFalse((plattli_root / "loss.indices").exists())
+
+            w = DirectWriter(run_root, step=1000, write_threads=0)
+            manifest = json.loads((plattli_root / "plattli.json").read_text(encoding="utf-8"))
+
+            self.assertEqual(manifest["loss"]["indices"], "indices")
+            self.assertTrue((plattli_root / "loss.indices").exists())
+
+            w.write(loss=6.0)
+            w.end_step()
+            w.finish(optimize=False, zip=False)
+            manifest = json.loads((plattli_root / "plattli.json").read_text(encoding="utf-8"))
             self.assertEqual(manifest["loss"]["indices"], "indices")
 
     def test_reject_non_scalar_values(self):
@@ -313,6 +397,40 @@ class TestDirectWriter(unittest.TestCase):
     def test_find_arange_params_none(self):
         self.assertIsNone(_find_arange_params(np.array([0], dtype=np.uint32)))
         self.assertIsNone(_find_arange_params(np.array([0, 1, 3], dtype=np.uint32)))
+
+
+class TestReader(unittest.TestCase):
+    def test_reader_piecewise_indices(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_root = Path(tmp) / "run"
+            plattli_root = run_root / "plattli"
+            w = DirectWriter(run_root, write_threads=0)
+            steps = [2, 1000, 2000, 3000, 4000]
+            for step in steps:
+                w.step = step
+                w.write(loss=float(step))
+                w.end_step()
+            w.finish(optimize=True, zip=False)
+
+            self.assertFalse((plattli_root / "loss.indices").exists())
+            with Reader(run_root) as r:
+                self.assertEqual(r.metric_indices("loss").tolist(), steps)
+                self.assertTrue(np.allclose(r.metric_values("loss"), np.asarray(steps, dtype=np.float32)))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            run_root = Path(tmp) / "run"
+            w = DirectWriter(run_root, write_threads=0)
+            steps = [2, 1000, 2000, 3000, 4000]
+            for step in steps:
+                w.step = step
+                w.write(loss=float(step))
+                w.end_step()
+            w.finish(optimize=True, zip=True)
+
+            self.assertTrue(_zip_path_for_root(run_root).exists())
+            with Reader(run_root) as r:
+                self.assertEqual(r.metric_indices("loss").tolist(), steps)
+                self.assertTrue(np.allclose(r.metric_values("loss"), np.asarray(steps, dtype=np.float32)))
 
 
 if __name__ == "__main__":  # pragma: no cover

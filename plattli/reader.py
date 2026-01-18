@@ -4,6 +4,7 @@ from pathlib import Path
 
 import numpy as np
 
+from ._indices import _segments_count_and_last, _segments_from_spec, _segments_to_array
 from .writer import DTYPE_TO_NUMPY, HOT_FILENAME, JSONL_DTYPE
 
 
@@ -172,15 +173,9 @@ class Reader:
         if spec is None:
             return 0, None
         indices_spec = spec.get("indices")
-        if isinstance(indices_spec, dict):
-            start = int(indices_spec.get("start") or 0)
-            stop = int(indices_spec.get("stop") or 0)
-            step = int(indices_spec.get("step") or 1)
-            if step <= 0 or stop <= start:
-                return 0, None
-            count = (stop - start + step - 1) // step
-            last_step = start + (count - 1) * step if count > 0 else None
-            return int(count), int(last_step) if last_step is not None else None
+        if isinstance(indices_spec, (list, dict)):
+            segments = _segments_from_spec(indices_spec)
+            return _segments_count_and_last(segments)
         if indices_spec == "indices":
             if self.kind == "zip":
                 data = self._read_bytes(f"{name}.indices")
@@ -214,13 +209,9 @@ class Reader:
         if spec is None:
             return np.asarray([], dtype=np.uint32)
         indices_spec = spec.get("indices")
-        if isinstance(indices_spec, dict):
-            start = int(indices_spec.get("start") or 0)
-            stop = int(indices_spec.get("stop") or 0)
-            step = int(indices_spec.get("step") or 1)
-            if step <= 0 or stop <= start:
-                return np.asarray([], dtype=np.uint32)
-            return np.arange(start, stop, step, dtype=np.uint32)
+        if isinstance(indices_spec, (list, dict)):
+            segments = _segments_from_spec(indices_spec)
+            return _segments_to_array(segments)
         if indices_spec == "indices":
             if self.kind == "zip":
                 return np.frombuffer(self._read_bytes(f"{name}.indices"), dtype=np.uint32)
