@@ -532,10 +532,9 @@ class CompactingWriter:
 
     def _compact_batch_locked(self):
         completed = [row for row in self._hot_rows if row["step"] < self.step]
-        excess = len(completed) - self.hotsize
-        if excess <= 0:
+        if len(completed) < self.hotsize:
             return []
-        return completed[:excess]
+        return completed
 
     def _compact_rows(self, rows):
         columns = {}

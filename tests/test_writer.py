@@ -173,6 +173,25 @@ class TestDirectWriter(unittest.TestCase):
             self.assertFalse((plattli_root / "loss.indices").exists())
             self.assertFalse((plattli_root / "hot.jsonl").exists())
 
+    def test_hot_compacts_all_at_threshold(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_root = Path(tmp) / "run"
+            plattli_root = run_root / "plattli"
+            w = CompactingWriter(run_root, hotsize=3)
+            for step in range(4):
+                w.write(loss=float(step))
+                w.end_step()
+            if w._compact_future:
+                w._compact_future.result()
+
+            hot_rows = _read_jsonl(plattli_root / "hot.jsonl")
+            self.assertEqual([row["step"] for row in hot_rows], [3])
+            loss_vals = np.fromfile(plattli_root / "loss.f32", dtype=np.float32)
+            self.assertTrue(np.allclose(loss_vals, [0.0, 1.0, 2.0]))
+            manifest = json.loads((plattli_root / "plattli.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["loss"]["indices"], [{"start": 0, "stop": 3, "step": 1}])
+            w.finish(optimize=False, zip=False)
+
     def test_compacting_indices_fallback(self):
         with tempfile.TemporaryDirectory() as tmp:
             run_root = Path(tmp) / "run"
