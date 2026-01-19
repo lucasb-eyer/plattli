@@ -2,11 +2,16 @@
 
 [![Tests](https://github.com/lucasb-eyer/plattli/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/lucasb-eyer/plattli/actions/workflows/ci.yml) [![codecov](https://codecov.io/gh/lucasb-eyer/plattli/branch/main/graph/badge.svg)](https://codecov.io/gh/lucasb-eyer/plattli)
 
-Minimal streaming writer for the Plättli metric format.
-The format is simple and columnar for fast reads, while live runs use a small hot log that is compacted in the background.
+Readers and writers for the Plättli metric format.
+There is a fundamental issue in metric logging: reads are columnar (metrics), writes are rows (steps).
+Plättli solves this by making the format on disk columnar (like parquet) with an optional row-wise "hot log" (like jsonl) for recent writes.
+
 It consists of one file per metric (raw homogeneous array or jsonl),
 plus a metrics manifest (`plattli.json`) that describes dtype and indices,
 a `config.json` with info about the run, and an optional `hot.jsonl` during live logging.
+
+At some point I will take the time to write more details about it,
+but essentially it combines the best of parquet and jsonl while keeping everything very simple.
 
 ## Install
 
@@ -123,15 +128,17 @@ from plattli import Reader
 
 with Reader("/experiments/123456") as r:
     print(r.metrics())
-    print(r.rows(), r.when_exported())
+    print(r.rows("loss"), r.approx_max_rows(), r.when_exported())
     steps, values = r.metric("loss")
     step, value = r.metric("loss", idx=-1)
 ```
 
 - Prefers `metrics.plattli` if present, otherwise reads the `plattli/` directory.
 - Keeps zip files open until `close()` (use a `with` block or call `close()` manually).
-- Methods: `metrics()`, `config()`, `rows()`, `when_exported()`,
-  `metric(name, idx=None)`, `metric_indices(name)`, `metric_values(name)`.
+- List all available metric names with `metrics()`.
+- Read a metric with one of `metric(name, idx=None) -> (indices, values)`, `metric_indices(name)`, `metric_values(name)`, which return numpy arrays.
+- Some useful metadata: `config()` returns the attached config dict; `when_exported()` is a timestamp, `rows(name)` is the exact row count (not last step!) in the given metric,
+  but because `rows(name)` can be a bit expensive for in-progress runs, `approx_max_rows(faster=True)` is a fast likely-correct estimate of the row count of the most-frequent metric.
 
 ## Data format
 

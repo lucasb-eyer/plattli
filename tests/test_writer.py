@@ -418,39 +418,5 @@ class TestDirectWriter(unittest.TestCase):
         self.assertIsNone(_find_arange_params(np.array([0, 1, 3], dtype=np.uint32)))
 
 
-class TestReader(unittest.TestCase):
-    def test_reader_piecewise_indices(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            run_root = Path(tmp) / "run"
-            plattli_root = run_root / "plattli"
-            w = DirectWriter(run_root, write_threads=0)
-            steps = [2, 1000, 2000, 3000, 4000]
-            for step in steps:
-                w.step = step
-                w.write(loss=float(step))
-                w.end_step()
-            w.finish(optimize=True, zip=False)
-
-            self.assertFalse((plattli_root / "loss.indices").exists())
-            with Reader(run_root) as r:
-                self.assertEqual(r.metric_indices("loss").tolist(), steps)
-                self.assertTrue(np.allclose(r.metric_values("loss"), np.asarray(steps, dtype=np.float32)))
-
-        with tempfile.TemporaryDirectory() as tmp:
-            run_root = Path(tmp) / "run"
-            w = DirectWriter(run_root, write_threads=0)
-            steps = [2, 1000, 2000, 3000, 4000]
-            for step in steps:
-                w.step = step
-                w.write(loss=float(step))
-                w.end_step()
-            w.finish(optimize=True, zip=True)
-
-            self.assertTrue(_zip_path_for_root(run_root).exists())
-            with Reader(run_root) as r:
-                self.assertEqual(r.metric_indices("loss").tolist(), steps)
-                self.assertTrue(np.allclose(r.metric_values("loss"), np.asarray(steps, dtype=np.float32)))
-
-
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

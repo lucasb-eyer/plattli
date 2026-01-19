@@ -63,10 +63,11 @@ class Reader:
         self._zip = None
         self._manifest = None
         self._config = None
-        self._rows = None
+        self._run_rows = None
         self._when_exported = None
         self._hot_columns = None
         self._hot_has_file = None
+        self._rows_cache = {}
         if self.kind == "zip":
             self._zip = zipfile.ZipFile(self.root)
 
@@ -95,7 +96,7 @@ class Reader:
         if self._manifest is not None:
             return
         manifest = json.loads(self._read_text("plattli.json"))
-        self._rows = manifest.pop("run_rows", None)
+        self._run_rows = manifest.pop("run_rows", None)
         self._when_exported = manifest.pop("when_exported", None)
         self._manifest = manifest
 
@@ -142,27 +143,64 @@ class Reader:
         self._ensure_manifest()
         return self._when_exported
 
-    def rows(self):
-        self._ensure_manifest()
+    def rows(self, name):
+        if name in self._rows_cache:
+            return self._rows_cache[name]
         self._ensure_hot()
-        if self._rows is not None and not self._hot_columns:
-            return self._rows
-        run_rows = 0
-        metrics = set(self._manifest.keys()) | set(self._hot_columns.keys())
-        for name in metrics:
-            spec = self._manifest.get(name)
-            columnar_count, last_step = self._columnar_count_and_last_step(name, spec)
-            hot_count = 0
-            if name in self._hot_columns:
-                if last_step is None:
-                    hot_count = len(self._hot_columns[name]["indices"])
-                else:
-                    hot_count = sum(1 for step in self._hot_columns[name]["indices"] if step > last_step)
-            rows = columnar_count + hot_count
-            if rows > run_rows:
-                run_rows = rows
-        self._rows = run_rows
-        return run_rows
+        spec = self._metric_spec(name, allow_hot=True)
+        columnar_count, last_step = self._columnar_count_and_last_step(name, spec)
+        hot_count = 0
+        if name in self._hot_columns:
+            if last_step is None:
+                hot_count = len(self._hot_columns[name]["indices"])
+            else:
+                hot_count = sum(1 for step in self._hot_columns[name]["indices"] if step > last_step)
+        rows = columnar_count + hot_count
+        self._rows_cache[name] = rows
+        return rows
+
+    def approx_max_rows(self, faster=True):
+        self._ensure_manifest()
+        if self._run_rows is not None:
+            return self._run_rows
+
+        max_rows = 0
+        indices_metric = None
+        for name, spec in self._manifest.items():
+            indices_spec = spec.get("indices")
+            if isinstance(indices_spec, (list, dict)):
+                segments = _segments_from_spec(indices_spec)
+                count, _ = _segments_count_and_last(segments)
+                if count > max_rows:
+                    max_rows = count
+            elif indices_spec == "indices" and indices_metric is None:
+                indices_metric = name
+
+        if not faster:
+            self._ensure_hot()
+            if self._hot_columns:
+                hot_metrics = sorted(self._hot_columns.items(),
+                                     key=lambda item: len(item[1]["indices"]),
+                                     reverse=True)
+                for name, _ in hot_metrics[:2]:
+                    rows = self.rows(name)
+                    if rows > max_rows:
+                        max_rows = rows
+
+        if max_rows:
+            return max_rows
+        if indices_metric is None:
+            return 0
+        if self.kind == "zip":
+            info = self._zip.getinfo(f"{indices_metric}.indices")
+            if info.file_size % 4:
+                raise ValueError(f"invalid indices file size for {indices_metric}: {info.file_size}")
+            return info.file_size // 4
+        path = self.root / f"{indices_metric}.indices"
+        size = path.stat().st_size
+        if size % 4:
+            raise ValueError(f"invalid indices file size for {indices_metric}: {size}")
+        return size // 4
 
     def metrics(self):
         self._ensure_manifest()
