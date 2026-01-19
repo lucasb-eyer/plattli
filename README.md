@@ -139,6 +139,7 @@ with Reader("/experiments/123456") as r:
 - Read a metric with one of `metric(name, idx=None) -> (indices, values)`, `metric_indices(name)`, `metric_values(name)`, which return numpy arrays.
 - Some useful metadata: `config()` returns the attached config dict; `when_exported()` is a timestamp, `rows(name)` is the exact row count (not last step!) in the given metric,
   but because `rows(name)` can be a bit expensive for in-progress runs, `approx_max_rows(faster=True)` is a fast likely-correct estimate of the row count of the most-frequent metric.
+- While the data format is simple, the reader code is a bit more complex because it tolerates corrupt tails, such that it's fine to read plattli's while they are being written.
 
 ## Data format
 

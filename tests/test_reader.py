@@ -76,6 +76,51 @@ class TestReader(unittest.TestCase):
             with Reader(run_root) as r:
                 self.assertEqual(r.rows("loss"), 3)
 
+    def test_reader_tolerates_partial_numeric_tail(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_root = Path(tmp) / "run"
+            plattli_root = run_root / "plattli"
+            w = DirectWriter(run_root, write_threads=0)
+            w.write(loss=1.0)
+            w.end_step()
+            w.write(loss=2.0)
+            w.end_step()
+            w.finish(optimize=False, zip=False)
+
+            with (plattli_root / "loss.indices").open("ab") as fh:
+                fh.write(b"\x01\x02")
+            with (plattli_root / "loss.f32").open("ab") as fh:
+                fh.write(b"\x03\x04")
+
+            with Reader(run_root) as r:
+                self.assertEqual(r.metric_indices("loss").tolist(), [0, 1])
+                self.assertTrue(np.allclose(r.metric_values("loss"),
+                                            np.asarray([1.0, 2.0], dtype=np.float32)))
+                self.assertEqual(r.rows("loss"), 2)
+
+    def test_reader_tolerates_mismatch_and_jsonl_tail(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_root = Path(tmp) / "run"
+            plattli_root = run_root / "plattli"
+            w = DirectWriter(run_root, write_threads=0)
+            w.write(loss=1.0, text="a")
+            w.end_step()
+            w.write(loss=2.0, text="b")
+            w.end_step()
+            w.finish(optimize=False, zip=False)
+
+            with (plattli_root / "loss.indices").open("ab") as fh:
+                fh.write(np.asarray([2], dtype=np.uint32).tobytes())
+            with (plattli_root / "text.jsonl").open("ab") as fh:
+                fh.write(b"\"c")
+
+            with Reader(run_root) as r:
+                self.assertEqual(r.metric_indices("loss").tolist(), [0, 1])
+                self.assertTrue(np.allclose(r.metric_values("loss"),
+                                            np.asarray([1.0, 2.0], dtype=np.float32)))
+                self.assertEqual(r.metric_values("text").tolist(), ["a", "b"])
+                self.assertEqual(r.rows("text"), 2)
+
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

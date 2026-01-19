@@ -4,7 +4,7 @@ from pathlib import Path
 
 import numpy as np
 
-from ._indices import _segments_count_and_last, _segments_from_spec, _segments_to_array
+from ._indices import _segment_values, _segments_count_and_last, _segments_from_spec, _segments_to_array
 from .writer import DTYPE_TO_NUMPY, HOT_FILENAME, JSONL_DTYPE
 
 
@@ -92,6 +92,88 @@ class Reader:
             return self._zip.read(name)
         return (self.root / name).read_bytes()
 
+    def _trim_size(self, size, unit):
+        if size <= 0:
+            return 0
+        return size - (size % unit)
+
+    def _read_jsonl_values(self, name):
+        if self.kind == "zip":
+            data = self._read_bytes(f"{name}.jsonl")
+        else:
+            path = self.root / f"{name}.jsonl"
+            if not path.exists():
+                self._ensure_hot()
+                if self._hot_has_file:
+                    return []
+                raise FileNotFoundError(f"missing values file for {name}")
+            data = path.read_bytes()
+        if not data:
+            return []
+        lines = data.splitlines()
+        if not lines:
+            return []
+        values = []
+        for idx, line in enumerate(lines):
+            try:
+                values.append(json.loads(line))
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                if idx == len(lines) - 1:
+                    break
+                raise
+        return values
+
+    def _indices_count_and_last(self, name, indices_spec):
+        if isinstance(indices_spec, (list, dict)):
+            segments = _segments_from_spec(indices_spec)
+            return _segments_count_and_last(segments)
+        if indices_spec == "indices":
+            if self.kind == "zip":
+                data = self._read_bytes(f"{name}.indices")
+                valid = self._trim_size(len(data), 4)
+                count = valid // 4
+                if count == 0:
+                    return 0, None
+                last = int(np.frombuffer(data[valid - 4:valid], dtype=np.uint32)[0])
+                return count, last
+            path = self.root / f"{name}.indices"
+            if not path.exists():
+                self._ensure_hot()
+                if self._hot_has_file:
+                    return 0, None
+                raise FileNotFoundError(f"missing indices file for {name}")
+            size = path.stat().st_size
+            valid = self._trim_size(size, 4)
+            count = valid // 4
+            if count == 0:
+                return 0, None
+            with path.open("rb") as fh:
+                fh.seek(valid - 4)
+                last = int(np.frombuffer(fh.read(4), dtype=np.uint32)[0])
+            return count, last
+        raise RuntimeError(f"invalid indices spec for {name}: {indices_spec}")
+
+    def _values_count(self, name, spec):
+        dtype = spec.get("dtype")
+        if dtype == JSONL_DTYPE:
+            return len(self._read_jsonl_values(name))
+        if dtype not in DTYPE_TO_NUMPY:
+            raise ValueError(f"unsupported dtype for {name}: {dtype}")
+        itemsize = np.dtype(DTYPE_TO_NUMPY[dtype]).itemsize
+        if self.kind == "zip":
+            data = self._read_bytes(f"{name}.{dtype}")
+            valid = self._trim_size(len(data), itemsize)
+            return valid // itemsize
+        path = self.root / f"{name}.{dtype}"
+        if not path.exists():
+            self._ensure_hot()
+            if self._hot_has_file:
+                return 0
+            raise FileNotFoundError(f"missing values file for {name}")
+        size = path.stat().st_size
+        valid = self._trim_size(size, itemsize)
+        return valid // itemsize
+
     def _ensure_manifest(self):
         if self._manifest is not None:
             return
@@ -124,6 +206,7 @@ class Reader:
                         self._hot_columns[name] = col
                     col["indices"].append(step)
                     col["values"].append(value)
+
     def _metric_spec(self, name, allow_hot=False):
         self._ensure_manifest()
         if name in self._manifest:
@@ -193,14 +276,17 @@ class Reader:
             return 0
         if self.kind == "zip":
             info = self._zip.getinfo(f"{indices_metric}.indices")
-            if info.file_size % 4:
-                raise ValueError(f"invalid indices file size for {indices_metric}: {info.file_size}")
-            return info.file_size // 4
+            valid = self._trim_size(info.file_size, 4)
+            return valid // 4
         path = self.root / f"{indices_metric}.indices"
+        if not path.exists():
+            self._ensure_hot()
+            if self._hot_has_file:
+                return 0
+            raise FileNotFoundError(f"missing indices file for {indices_metric}")
         size = path.stat().st_size
-        if size % 4:
-            raise ValueError(f"invalid indices file size for {indices_metric}: {size}")
-        return size // 4
+        valid = self._trim_size(size, 4)
+        return valid // 4
 
     def metrics(self):
         self._ensure_manifest()
@@ -211,19 +297,33 @@ class Reader:
         if spec is None:
             return 0, None
         indices_spec = spec.get("indices")
+        indices_count, indices_last = self._indices_count_and_last(name, indices_spec)
+        if indices_count == 0:
+            return 0, None
+        values_count = self._values_count(name, spec)
+        count = min(indices_count, values_count)
+        if count <= 0:
+            return 0, None
+        if count == indices_count:
+            return count, indices_last
+        idx = count - 1
         if isinstance(indices_spec, (list, dict)):
             segments = _segments_from_spec(indices_spec)
-            return _segments_count_and_last(segments)
+            for segment in segments:
+                start, stop, step = _segment_values(segment)
+                seg_count = (stop - start + step - 1) // step
+                if idx < seg_count:
+                    return count, int(start + idx * step)
+                idx -= seg_count
+            raise RuntimeError(f"indices spec shorter than expected for {name}")
         if indices_spec == "indices":
             if self.kind == "zip":
                 data = self._read_bytes(f"{name}.indices")
-                size = len(data)
-                if size % 4:
-                    raise ValueError(f"invalid indices file size for {name}: {size}")
-                count = size // 4
-                if count == 0:
-                    return 0, None
-                last_step = int(np.frombuffer(data[-4:], dtype=np.uint32)[0])
+                valid = self._trim_size(len(data), 4)
+                offset = idx * 4
+                if offset + 4 > valid:
+                    return count, indices_last
+                last_step = int(np.frombuffer(data[offset:offset + 4], dtype=np.uint32)[0])
                 return count, last_step
             path = self.root / f"{name}.indices"
             if not path.exists():
@@ -232,13 +332,12 @@ class Reader:
                     return 0, None
                 raise FileNotFoundError(f"missing indices file for {name}")
             size = path.stat().st_size
-            if size % 4:
-                raise ValueError(f"invalid indices file size for {name}: {size}")
-            count = size // 4
-            if count == 0:
-                return 0, None
+            valid = self._trim_size(size, 4)
+            offset = idx * 4
+            if offset + 4 > valid:
+                return count, indices_last
             with path.open("rb") as fh:
-                fh.seek(-4, 2)
+                fh.seek(offset)
                 last_step = int(np.frombuffer(fh.read(4), dtype=np.uint32)[0])
             return count, last_step
         raise RuntimeError(f"invalid indices spec for {name}: {indices_spec}")
@@ -247,19 +346,46 @@ class Reader:
         if spec is None:
             return np.asarray([], dtype=np.uint32)
         indices_spec = spec.get("indices")
+        indices_count, _ = self._indices_count_and_last(name, indices_spec)
+        if indices_count == 0:
+            return np.asarray([], dtype=np.uint32)
+        values_count = self._values_count(name, spec)
+        count = min(indices_count, values_count)
+        if count <= 0:
+            return np.asarray([], dtype=np.uint32)
         if isinstance(indices_spec, (list, dict)):
             segments = _segments_from_spec(indices_spec)
-            return _segments_to_array(segments)
+            indices = _segments_to_array(segments)
+            if count < indices.size:
+                return indices[:count]
+            return indices
         if indices_spec == "indices":
             if self.kind == "zip":
-                return np.frombuffer(self._read_bytes(f"{name}.indices"), dtype=np.uint32)
+                data = self._read_bytes(f"{name}.indices")
+                valid = self._trim_size(len(data), 4)
+                max_count = valid // 4
+                count = min(count, max_count)
+                if count <= 0:
+                    return np.asarray([], dtype=np.uint32)
+                return np.frombuffer(data[:count * 4], dtype=np.uint32)
             path = self.root / f"{name}.indices"
             if not path.exists():
                 self._ensure_hot()
                 if self._hot_has_file:
                     return np.asarray([], dtype=np.uint32)
                 raise FileNotFoundError(f"missing indices file for {name}")
-            return np.fromfile(path, dtype=np.uint32)
+            size = path.stat().st_size
+            valid = self._trim_size(size, 4)
+            max_count = valid // 4
+            count = min(count, max_count)
+            if count <= 0:
+                return np.asarray([], dtype=np.uint32)
+            with path.open("rb") as fh:
+                data = fh.read(count * 4)
+            data = data[:self._trim_size(len(data), 4)]
+            if not data:
+                return np.asarray([], dtype=np.uint32)
+            return np.frombuffer(data, dtype=np.uint32)
         raise RuntimeError(f"invalid indices spec for {name}: {indices_spec}")
 
     def _columnar_values(self, name, spec):
@@ -267,28 +393,48 @@ class Reader:
             return np.asarray([], dtype=object)
         dtype = spec.get("dtype")
         if dtype == JSONL_DTYPE:
-            if self.kind == "zip":
-                values = [json.loads(line) for line in self._read_bytes(f"{name}.jsonl").splitlines()]
-                return np.asarray(values, dtype=object)
-            path = self.root / f"{name}.jsonl"
-            if not path.exists():
-                self._ensure_hot()
-                if self._hot_has_file:
-                    return np.asarray([], dtype=object)
-                raise FileNotFoundError(f"missing values file for {name}")
-            with path.open("r", encoding="utf-8") as fh:
-                return np.asarray([json.loads(line) for line in fh], dtype=object)
+            indices_count, _ = self._indices_count_and_last(name, spec.get("indices"))
+            if indices_count == 0:
+                return np.asarray([], dtype=object)
+            values = self._read_jsonl_values(name)
+            if not values:
+                return np.asarray([], dtype=object)
+            count = min(indices_count, len(values))
+            if count <= 0:
+                return np.asarray([], dtype=object)
+            if len(values) > count:
+                values = values[:count]
+            return np.asarray(values, dtype=object)
         if dtype not in DTYPE_TO_NUMPY:
             raise ValueError(f"unsupported dtype for {name}: {dtype}")
+        indices_count, _ = self._indices_count_and_last(name, spec.get("indices"))
+        if indices_count == 0:
+            return np.asarray([], dtype=DTYPE_TO_NUMPY[dtype])
+        values_count = self._values_count(name, spec)
+        count = min(indices_count, values_count)
+        if count <= 0:
+            return np.asarray([], dtype=DTYPE_TO_NUMPY[dtype])
+        itemsize = np.dtype(DTYPE_TO_NUMPY[dtype]).itemsize
         if self.kind == "zip":
-            return np.frombuffer(self._read_bytes(f"{name}.{dtype}"), dtype=DTYPE_TO_NUMPY[dtype])
+            data = self._read_bytes(f"{name}.{dtype}")
+            valid = self._trim_size(len(data), itemsize)
+            max_count = valid // itemsize
+            count = min(count, max_count)
+            if count <= 0:
+                return np.asarray([], dtype=DTYPE_TO_NUMPY[dtype])
+            return np.frombuffer(data[:count * itemsize], dtype=DTYPE_TO_NUMPY[dtype])
         path = self.root / f"{name}.{dtype}"
         if not path.exists():
             self._ensure_hot()
             if self._hot_has_file:
                 return np.asarray([], dtype=DTYPE_TO_NUMPY[dtype])
             raise FileNotFoundError(f"missing values file for {name}")
-        return np.fromfile(path, dtype=DTYPE_TO_NUMPY[dtype])
+        with path.open("rb") as fh:
+            data = fh.read(count * itemsize)
+        data = data[:self._trim_size(len(data), itemsize)]
+        if not data:
+            return np.asarray([], dtype=DTYPE_TO_NUMPY[dtype])
+        return np.frombuffer(data, dtype=DTYPE_TO_NUMPY[dtype])
 
     def _hot_for_metric(self, name, last_step):
         self._ensure_hot()

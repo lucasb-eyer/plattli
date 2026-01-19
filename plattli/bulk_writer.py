@@ -58,13 +58,16 @@ class PlattliBulkWriter:
             return
 
         if zip:
-            zf = zipfile.ZipFile(_zip_path_for_root(self.run_root), "w", compression=zipfile.ZIP_STORED)
+            zip_path = _zip_path_for_root(self.run_root)
+            tmp_path = zip_path.with_name(zip_path.name + ".tmp")
+            zf = zipfile.ZipFile(tmp_path, "w", compression=zipfile.ZIP_STORED)
 
             def write_bytes(name, payload):
                 zf.writestr(name, payload)
 
             def close():
                 zf.close()
+                tmp_path.replace(zip_path)
         else:
             self.root.mkdir(parents=True, exist_ok=True)
 

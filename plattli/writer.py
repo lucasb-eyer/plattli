@@ -47,7 +47,9 @@ def _write_manifest(path, manifest, run_rows=None):
     }
     if run_rows is not None:
         payload["run_rows"] = run_rows
-    path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    tmp_path = path.with_name(path.name + ".tmp")
+    tmp_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    tmp_path.replace(path)
 
 
 def _write_config(run_root, path, config):
@@ -179,7 +181,9 @@ def _tighten_dtypes(root, manifest):
 
 
 def _zip_output(run_root, root):
-    with zipfile.ZipFile(_zip_path_for_root(run_root), "w", compression=zipfile.ZIP_STORED) as zf:
+    zip_path = _zip_path_for_root(run_root)
+    tmp_path = zip_path.with_name(zip_path.name + ".tmp")
+    with zipfile.ZipFile(tmp_path, "w", compression=zipfile.ZIP_STORED) as zf:
         for path in sorted(root.rglob("*")):
             if not path.is_file():
                 continue
@@ -188,6 +192,7 @@ def _zip_output(run_root, root):
                 zf.writestr(rel.as_posix(), path.read_bytes())
                 continue
             zf.write(path, rel)
+    tmp_path.replace(zip_path)
     rmtree(root)
 
 
