@@ -25,6 +25,9 @@ def convert_run(run_dir, dest, use_named_zip, skip_cols=None):
 
     ncols = 0
     nrows = 0
+    saw_step = False
+    saw_no_step = False
+    prev_step = None
     if dest == run_dir:
         config = "config.json"
     else:
@@ -35,8 +38,28 @@ def convert_run(run_dir, dest, use_named_zip, skip_cols=None):
             config = {}
     w = PlattliBulkWriter(dest, config=config)
     with metrics_path.open("r", encoding="utf-8") as fh:
-        for line in fh:
-            row = delcols(json.loads(line))
+        for lineno, line in enumerate(fh, 1):
+            raw = json.loads(line)
+            row_step = raw.pop("step", None)
+            row = delcols(raw)
+            if row_step is not None:
+                if saw_no_step:
+                    raise ValueError(f"mixed step/no-step rows at {metrics_path}:{lineno}")
+                if isinstance(row_step, bool) or not isinstance(row_step, int):
+                    raise TypeError(f"step must be an int at {metrics_path}:{lineno}")
+                if row_step < 0 or row_step > 0xFFFFFFFF:
+                    raise ValueError(f"step out of uint32 range at {metrics_path}:{lineno}: {row_step}")
+                if prev_step is not None and row_step <= prev_step:
+                    raise ValueError(f"step must strictly increase at {metrics_path}:{lineno}: {row_step} after {prev_step}")
+                if row_step < w.step:
+                    raise ValueError(f"step went backwards at {metrics_path}:{lineno}: {row_step} < {w.step}")
+                w.step = row_step
+                saw_step = True
+                prev_step = row_step
+            else:
+                if saw_step:
+                    raise ValueError(f"mixed step/no-step rows at {metrics_path}:{lineno}")
+                saw_no_step = True
             ncols = max(ncols, len(row))
             nrows += 1
             if row:
