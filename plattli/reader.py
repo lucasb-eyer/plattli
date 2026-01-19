@@ -103,8 +103,7 @@ class Reader:
         else:
             path = self.root / f"{name}.jsonl"
             if not path.exists():
-                self._ensure_hot()
-                if self._hot_has_file:
+                if self._ensure_hot():
                     return []
                 raise FileNotFoundError(f"missing values file for {name}")
             data = path.read_bytes()
@@ -138,8 +137,7 @@ class Reader:
                 return count, last
             path = self.root / f"{name}.indices"
             if not path.exists():
-                self._ensure_hot()
-                if self._hot_has_file:
+                if self._ensure_hot():
                     return 0, None
                 raise FileNotFoundError(f"missing indices file for {name}")
             size = path.stat().st_size
@@ -166,8 +164,7 @@ class Reader:
             return valid // itemsize
         path = self.root / f"{name}.{dtype}"
         if not path.exists():
-            self._ensure_hot()
-            if self._hot_has_file:
+            if self._ensure_hot():
                 return 0
             raise FileNotFoundError(f"missing values file for {name}")
         size = path.stat().st_size
@@ -184,15 +181,15 @@ class Reader:
 
     def _ensure_hot(self):
         if self._hot_columns is not None:
-            return
+            return self._hot_has_file
         self._hot_columns = {}
         if self.kind != "dir":
             self._hot_has_file = False
-            return
+            return False
         hot_path = self.root / HOT_FILENAME
         self._hot_has_file = hot_path.exists()
         if not self._hot_has_file:
-            return
+            return False
         with hot_path.open("r", encoding="utf-8") as fh:
             for line in fh:
                 row = json.loads(line)
@@ -206,6 +203,7 @@ class Reader:
                         self._hot_columns[name] = col
                     col["indices"].append(step)
                     col["values"].append(value)
+        return True
 
     def _metric_spec(self, name, allow_hot=False):
         self._ensure_manifest()
@@ -280,8 +278,7 @@ class Reader:
             return valid // 4
         path = self.root / f"{indices_metric}.indices"
         if not path.exists():
-            self._ensure_hot()
-            if self._hot_has_file:
+            if self._ensure_hot():
                 return 0
             raise FileNotFoundError(f"missing indices file for {indices_metric}")
         size = path.stat().st_size
@@ -327,8 +324,7 @@ class Reader:
                 return count, last_step
             path = self.root / f"{name}.indices"
             if not path.exists():
-                self._ensure_hot()
-                if self._hot_has_file:
+                if self._ensure_hot():
                     return 0, None
                 raise FileNotFoundError(f"missing indices file for {name}")
             size = path.stat().st_size
@@ -370,8 +366,7 @@ class Reader:
                 return np.frombuffer(data[:count * 4], dtype=np.uint32)
             path = self.root / f"{name}.indices"
             if not path.exists():
-                self._ensure_hot()
-                if self._hot_has_file:
+                if self._ensure_hot():
                     return np.asarray([], dtype=np.uint32)
                 raise FileNotFoundError(f"missing indices file for {name}")
             size = path.stat().st_size
@@ -425,8 +420,7 @@ class Reader:
             return np.frombuffer(data[:count * itemsize], dtype=DTYPE_TO_NUMPY[dtype])
         path = self.root / f"{name}.{dtype}"
         if not path.exists():
-            self._ensure_hot()
-            if self._hot_has_file:
+            if self._ensure_hot():
                 return np.asarray([], dtype=DTYPE_TO_NUMPY[dtype])
             raise FileNotFoundError(f"missing values file for {name}")
         with path.open("rb") as fh:
