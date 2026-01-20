@@ -13,7 +13,7 @@ from .writer import _zip_path_for_root
 DEFAULT_SKIP_PATTERN = r"[pg]norm.*"
 
 
-def convert_run(run_dir, dest, use_named_zip, skip_cols=None):
+def convert_run(run_dir, dest, use_named_zip, skip_cols=None, allow_rewinds=False):
     metrics_path = run_dir / "metrics.jsonl"
 
     if not metrics_path.exists():
@@ -28,6 +28,7 @@ def convert_run(run_dir, dest, use_named_zip, skip_cols=None):
     saw_step = False
     saw_no_step = False
     prev_step = None
+    rewind_hint = " If this is expected (such as due to preemptions), use the --allow-rewinds flag."
     if dest == run_dir:
         config = "config.json"
     else:
@@ -50,9 +51,22 @@ def convert_run(run_dir, dest, use_named_zip, skip_cols=None):
                 if row_step < 0 or row_step > 0xFFFFFFFF:
                     raise ValueError(f"step out of uint32 range at {metrics_path}:{lineno}: {row_step}")
                 if prev_step is not None and row_step <= prev_step:
-                    raise ValueError(f"step must strictly increase at {metrics_path}:{lineno}: {row_step} after {prev_step}")
-                if row_step < w.step:
-                    raise ValueError(f"step went backwards at {metrics_path}:{lineno}: {row_step} < {w.step}")
+                    if allow_rewinds and row_step < prev_step:
+                        for column in w._columns.values():
+                            while column.i and column.i[-1] >= row_step:
+                                column.i.pop()
+                                column.v.pop()
+                        w._step_metrics.clear()
+                    else:
+                        raise ValueError(
+                            f"step must strictly increase at {metrics_path}:{lineno}: {row_step} after {prev_step}."
+                            f"{rewind_hint}"
+                        )
+                if not allow_rewinds and row_step < w.step:
+                    raise ValueError(
+                        f"step went backwards at {metrics_path}:{lineno}: {row_step} < {w.step}."
+                        f"{rewind_hint}"
+                    )
                 w.step = row_step
                 saw_step = True
                 prev_step = row_step
@@ -115,7 +129,7 @@ def main():
     skip_cols = None
     if args.skipcols is not None:
         skip_cols = [pattern if pattern != "DEFAULT" else DEFAULT_SKIP_PATTERN for pattern in args.skipcols]
-    jobs = [(run_dir, dest, outdir is not None, skip_cols) for run_dir, dest in runs]
+    jobs = [(run_dir, dest, outdir is not None, skip_cols, args.allow_rewinds) for run_dir, dest in runs]
 
     converted = 0
     with Pool(processes=args.workers) as pool:
@@ -141,6 +155,8 @@ def parse_args():
                         " Can be repeated multiple times for skipping multiple patterns.")
     p.add_argument("--deep", action="store_true",
                    help="Recurse into subdirectories when discovering runs (default: immediate children only).")
+    p.add_argument("--allow-rewinds", action="store_true",
+                   help="Allow step numbers to decrease and truncate existing data to the new step.")
     return p.parse_args()
 
 
