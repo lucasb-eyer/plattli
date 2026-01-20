@@ -6,7 +6,7 @@ from pathlib import Path
 
 import numpy as np
 
-from plattli import PlattliBulkWriter
+import plattli
 from plattli.writer import _zip_path_for_root
 
 
@@ -19,13 +19,13 @@ class TestPlattliBulkWriter(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             run_root = Path(tmp)
             with self.assertRaises(AssertionError):
-                PlattliBulkWriter(run_root, step=-1)
+                plattli.PlattliBulkWriter(run_root, step=-1)
 
     def test_basic_write(self):
         with tempfile.TemporaryDirectory() as tmp:
             run_root = Path(tmp) / "run"
             plattli_root = run_root / "plattli"
-            w = PlattliBulkWriter(run_root)
+            w = plattli.PlattliBulkWriter(run_root)
             w.write(loss=1.2, note="ok", meta={"a": 1})
             w.end_step()
             w.write(loss=1.3)
@@ -52,7 +52,7 @@ class TestPlattliBulkWriter(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             run_root = Path(tmp)
             plattli_root = run_root / "plattli"
-            w = PlattliBulkWriter(run_root)
+            w = plattli.PlattliBulkWriter(run_root)
             w.write(loss=1.0)
             with self.assertRaises(RuntimeError):
                 w.write(loss=2.0)
@@ -71,7 +71,7 @@ class TestPlattliBulkWriter(unittest.TestCase):
     def test_optimize_zip_and_tighten(self):
         with tempfile.TemporaryDirectory() as tmp:
             run_root = Path(tmp) / "run"
-            w = PlattliBulkWriter(run_root)
+            w = plattli.PlattliBulkWriter(run_root)
             w.write(loss=1, delta=-1, note="ok")
             w.end_step()
             w.write(loss=2, delta=-2)
@@ -97,7 +97,7 @@ class TestPlattliBulkWriter(unittest.TestCase):
             run_root = Path(tmp) / "run"
             target = Path(tmp) / "config_source.json"
             target.write_text(json.dumps({"seed": 7}), encoding="utf-8")
-            w = PlattliBulkWriter(run_root, config=str(target))
+            w = plattli.PlattliBulkWriter(run_root, config=str(target))
             w.write(loss=1.0)
             w.end_step()
             w.finish(zip=True)
@@ -113,7 +113,7 @@ class TestPlattliBulkWriter(unittest.TestCase):
             plattli_root = run_root / "plattli"
             run_root.mkdir(parents=True, exist_ok=True)
             (run_root / "config.json").write_text(json.dumps({"seed": 3}), encoding="utf-8")
-            w = PlattliBulkWriter(run_root)
+            w = plattli.PlattliBulkWriter(run_root)
             w.write(loss=1.0)
             w.end_step()
             w.finish(zip=False)
@@ -126,7 +126,7 @@ class TestPlattliBulkWriter(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             run_root = Path(tmp) / "run"
             plattli_root = run_root / "plattli"
-            w = PlattliBulkWriter(run_root, config={"seed": 7})
+            w = plattli.PlattliBulkWriter(run_root, config={"seed": 7})
             w.write(loss=1.0)
             w.end_step()
             w.set_config({"seed": 9, "note": "ok"})

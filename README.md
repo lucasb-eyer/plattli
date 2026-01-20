@@ -1,6 +1,9 @@
 # Plättli
 
-[![Tests](https://github.com/lucasb-eyer/plattli/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/lucasb-eyer/plattli/actions/workflows/ci.yml) [![codecov](https://codecov.io/gh/lucasb-eyer/plattli/branch/main/graph/badge.svg)](https://codecov.io/gh/lucasb-eyer/plattli)
+[![PyPI - Version](https://img.shields.io/pypi/v/plattli)](https://pypi.org/project/plattli/)
+[![Tests](https://github.com/lucasb-eyer/plattli/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/lucasb-eyer/plattli/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/lucasb-eyer/plattli/branch/main/graph/badge.svg)](https://codecov.io/gh/lucasb-eyer/plattli)
+[![PyPI - License](https://img.shields.io/pypi/l/plattli)](https://github.com/lucasb-eyer/plattli?tab=MIT-1-ov-file#readme)
 
 Readers and writers for the Plättli metric format.
 There is a fundamental issue in metric logging: reads are columnar (metrics), writes are rows (steps).
@@ -140,6 +143,11 @@ with Reader("/experiments/123456") as r:
 - Some useful metadata: `config()` returns the attached config dict; `when_exported()` is a timestamp, `rows(name)` is the exact row count (not last step!) in the given metric,
   but because `rows(name)` can be a bit expensive for in-progress runs, `approx_max_rows(faster=True)` is a fast likely-correct estimate of the row count of the most-frequent metric.
 - While the data format is simple, the reader code is a bit more complex because it tolerates corrupt tails, such that it's fine to read plattli's while they are being written.
+
+### Helpers
+- `plattli.is_run(path)` -> whether the `path` is a plattli run (a correct folder structure, or a `metrics.plattli` zipfile).
+- `plattli.is_run_dir(path)` -> whether the folder `path` contains plattli metrics (be it as subfolder or zipped).
+- `plattli.resolve_run_dir(path)` -> resolved directory that contains `plattli.json` (returns either `path` or `path/plattli`), or `None`.
 
 ## Data format
 

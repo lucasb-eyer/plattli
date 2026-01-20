@@ -7,9 +7,22 @@ import numpy as np
 from ._indices import _segment_values, _segments_count_and_last, _segments_from_spec, _segments_to_array
 from .writer import DTYPE_TO_NUMPY, HOT_FILENAME, JSONL_DTYPE
 
+def is_run(path):
+    return _resolve_plattli(path)[0] is not None
 
-def has_plattli(path):
-    return _resolve_plattli(path)[0]
+def resolve_run_dir(path):
+    target = Path(path).expanduser()
+    if not target.is_dir():
+        return None
+    if (target / "plattli.json").is_file():
+        return target.resolve()
+    plattli_dir = target / "plattli"
+    if (plattli_dir / "plattli.json").is_file():
+        return plattli_dir.resolve()
+    return None
+
+def is_run_dir(path):
+    return resolve_run_dir(path) is not None
 
 
 def _is_plattli_zip(path):
@@ -37,14 +50,12 @@ def _resolve_plattli(path):
         return None, None
 
     zip_path = target / "metrics.plattli"
+    if _is_plattli_zip(zip_path):
+        return "zip", zip_path.resolve()
     dir_path = target / "plattli"
-
     direct_ok = (target / "plattli.json").is_file()
     dir_ok = (dir_path / "plattli.json").is_file()
-    zip_ok = _is_plattli_zip(zip_path)
 
-    if zip_ok:
-        return "zip", zip_path.resolve()
     if direct_ok:
         return "dir", target.resolve()
     if dir_ok:

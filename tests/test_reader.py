@@ -6,7 +6,7 @@ from pathlib import Path
 
 import numpy as np
 
-from plattli import CompactingWriter, DirectWriter, Reader
+import plattli
 from plattli.writer import _zip_path_for_root
 
 
@@ -15,7 +15,7 @@ class TestReader(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             run_root = Path(tmp) / "run"
             plattli_root = run_root / "plattli"
-            w = DirectWriter(run_root, write_threads=0)
+            w = plattli.DirectWriter(run_root, write_threads=0)
             steps = [2, 1000, 2000, 3000, 4000]
             for step in steps:
                 w.step = step
@@ -24,13 +24,13 @@ class TestReader(unittest.TestCase):
             w.finish(optimize=True, zip=False)
 
             self.assertFalse((plattli_root / "loss.indices").exists())
-            with Reader(run_root) as r:
+            with plattli.Reader(run_root) as r:
                 self.assertEqual(r.metric_indices("loss").tolist(), steps)
                 self.assertTrue(np.allclose(r.metric_values("loss"), np.asarray(steps, dtype=np.float32)))
 
         with tempfile.TemporaryDirectory() as tmp:
             run_root = Path(tmp) / "run"
-            w = DirectWriter(run_root, write_threads=0)
+            w = plattli.DirectWriter(run_root, write_threads=0)
             steps = [2, 1000, 2000, 3000, 4000]
             for step in steps:
                 w.step = step
@@ -39,7 +39,7 @@ class TestReader(unittest.TestCase):
             w.finish(optimize=True, zip=True)
 
             self.assertTrue(_zip_path_for_root(run_root).exists())
-            with Reader(run_root) as r:
+            with plattli.Reader(run_root) as r:
                 self.assertEqual(r.metric_indices("loss").tolist(), steps)
                 self.assertTrue(np.allclose(r.metric_values("loss"), np.asarray(steps, dtype=np.float32)))
 
@@ -47,7 +47,7 @@ class TestReader(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             run_root = Path(tmp) / "run"
             plattli_root = run_root / "plattli"
-            w = CompactingWriter(run_root, hotsize=100)
+            w = plattli.CompactingWriter(run_root, hotsize=100)
             w.write(loss=1.0, acc=0.5)
             w.end_step()
             w.write(loss=2.0)
@@ -56,15 +56,47 @@ class TestReader(unittest.TestCase):
             w.end_step()
 
             self.assertTrue((plattli_root / "hot.jsonl").exists())
-            with Reader(run_root) as r:
+            with plattli.Reader(run_root) as r:
                 self.assertEqual(r.rows("loss"), 3)
                 self.assertEqual(r.rows("acc"), 2)
+
+    def test_run_helpers(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_root = Path(tmp) / "run"
+            plattli_root = run_root / "plattli"
+            w = plattli.DirectWriter(run_root, write_threads=0)
+            w.write(loss=1.0)
+            w.end_step()
+            w.finish(optimize=False, zip=False)
+
+            self.assertTrue(plattli.is_run(run_root))
+            self.assertTrue(plattli.is_run_dir(run_root))
+            self.assertEqual(plattli.resolve_run_dir(run_root), plattli_root.resolve())
+            self.assertTrue(plattli.is_run(plattli_root))
+            self.assertTrue(plattli.is_run_dir(plattli_root))
+            self.assertEqual(plattli.resolve_run_dir(plattli_root), plattli_root.resolve())
+
+        with tempfile.TemporaryDirectory() as tmp:
+            run_root = Path(tmp) / "ziprun"
+            w = plattli.DirectWriter(run_root, write_threads=0)
+            w.write(loss=1.0)
+            w.end_step()
+            w.finish(optimize=False, zip=True)
+
+            zip_path = run_root / "metrics.plattli"
+            self.assertTrue(zip_path.exists())
+            self.assertTrue(plattli.is_run(run_root))
+            self.assertFalse(plattli.is_run_dir(run_root))
+            self.assertIsNone(plattli.resolve_run_dir(run_root))
+            self.assertTrue(plattli.is_run(zip_path))
+            self.assertFalse(plattli.is_run_dir(zip_path))
+            self.assertIsNone(plattli.resolve_run_dir(zip_path))
 
     def test_reader_rows_columnar_plus_hot(self):
         with tempfile.TemporaryDirectory() as tmp:
             run_root = Path(tmp) / "run"
             plattli_root = run_root / "plattli"
-            w = CompactingWriter(run_root, hotsize=2)
+            w = plattli.CompactingWriter(run_root, hotsize=2)
             w.write(loss=1.0)
             w.end_step()
             w.write(loss=2.0)
@@ -75,14 +107,14 @@ class TestReader(unittest.TestCase):
             w.end_step()
 
             self.assertTrue((plattli_root / "hot.jsonl").exists())
-            with Reader(run_root) as r:
+            with plattli.Reader(run_root) as r:
                 self.assertEqual(r.rows("loss"), 3)
 
     def test_reader_tolerates_partial_numeric_tail(self):
         with tempfile.TemporaryDirectory() as tmp:
             run_root = Path(tmp) / "run"
             plattli_root = run_root / "plattli"
-            w = DirectWriter(run_root, write_threads=0)
+            w = plattli.DirectWriter(run_root, write_threads=0)
             w.write(loss=1.0)
             w.end_step()
             w.write(loss=2.0)
@@ -94,7 +126,7 @@ class TestReader(unittest.TestCase):
             with (plattli_root / "loss.f32").open("ab") as fh:
                 fh.write(b"\x03\x04")
 
-            with Reader(run_root) as r:
+            with plattli.Reader(run_root) as r:
                 self.assertEqual(r.metric_indices("loss").tolist(), [0, 1])
                 self.assertTrue(np.allclose(r.metric_values("loss"),
                                             np.asarray([1.0, 2.0], dtype=np.float32)))
@@ -104,7 +136,7 @@ class TestReader(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             run_root = Path(tmp) / "run"
             plattli_root = run_root / "plattli"
-            w = DirectWriter(run_root, write_threads=0)
+            w = plattli.DirectWriter(run_root, write_threads=0)
             w.write(loss=1.0, text="a")
             w.end_step()
             w.write(loss=2.0, text="b")
@@ -116,7 +148,7 @@ class TestReader(unittest.TestCase):
             with (plattli_root / "text.jsonl").open("ab") as fh:
                 fh.write(b"\"c")
 
-            with Reader(run_root) as r:
+            with plattli.Reader(run_root) as r:
                 self.assertEqual(r.metric_indices("loss").tolist(), [0, 1])
                 self.assertTrue(np.allclose(r.metric_values("loss"),
                                             np.asarray([1.0, 2.0], dtype=np.float32)))
@@ -127,7 +159,7 @@ class TestReader(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             run_root = Path(tmp) / "run"
             plattli_root = run_root / "plattli"
-            w = DirectWriter(run_root, write_threads=0)
+            w = plattli.DirectWriter(run_root, write_threads=0)
             w.write(loss=1.0, note="ok")
             w.end_step()
             w.finish(optimize=False, zip=False)
@@ -135,7 +167,7 @@ class TestReader(unittest.TestCase):
             (plattli_root / "loss.f32").unlink()
             (plattli_root / "note.indices").unlink()
 
-            with Reader(run_root) as r:
+            with plattli.Reader(run_root) as r:
                 with self.assertRaises(FileNotFoundError):
                     r.metric_values("loss")
                 with self.assertRaises(FileNotFoundError):
@@ -145,7 +177,7 @@ class TestReader(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             run_root = Path(tmp) / "run"
             plattli_root = run_root / "plattli"
-            w = DirectWriter(run_root, write_threads=0)
+            w = plattli.DirectWriter(run_root, write_threads=0)
             for step in range(3):
                 w.write(loss=float(step))
                 w.end_step()
@@ -158,14 +190,14 @@ class TestReader(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            with Reader(run_root) as r:
+            with plattli.Reader(run_root) as r:
                 self.assertEqual(r.rows("loss"), 4)
 
     def test_reader_zip_indices_mismatch_and_metric(self):
         with tempfile.TemporaryDirectory() as tmp:
             run_root = Path(tmp) / "run"
             plattli_root = run_root / "plattli"
-            w = DirectWriter(run_root, write_threads=0)
+            w = plattli.DirectWriter(run_root, write_threads=0)
             for step in range(3):
                 w.step = step
                 w.write(loss=float(step))
@@ -186,7 +218,7 @@ class TestReader(unittest.TestCase):
                     else:
                         zf.write(path, rel)
 
-            with Reader(run_root) as r:
+            with plattli.Reader(run_root) as r:
                 self.assertEqual(r.metric_indices("loss").tolist(), [0, 1, 2])
                 self.assertEqual(r.rows("loss"), 3)
                 idx, value = r.metric("loss", idx=1)
@@ -197,7 +229,7 @@ class TestReader(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             run_root = Path(tmp) / "run"
             plattli_root = run_root / "plattli"
-            w = DirectWriter(run_root, write_threads=0)
+            w = plattli.DirectWriter(run_root, write_threads=0)
             for step in range(5):
                 w.step = step
                 w.write(loss=float(step))
@@ -211,7 +243,7 @@ class TestReader(unittest.TestCase):
             with value_path.open("r+b") as fh:
                 fh.truncate(3 * np.dtype(np.float32).itemsize)
 
-            with Reader(run_root) as r:
+            with plattli.Reader(run_root) as r:
                 self.assertEqual(r.rows("loss"), 3)
                 self.assertEqual(r.metric_indices("loss").tolist(), [0, 1, 2])
 
@@ -219,7 +251,7 @@ class TestReader(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             run_root = Path(tmp) / "run"
             plattli_root = run_root / "plattli"
-            w = CompactingWriter(run_root, hotsize=2)
+            w = plattli.CompactingWriter(run_root, hotsize=2)
             w.write(loss=1.0, text="a")
             w.end_step()
             w.write(loss=2.0, text="b")
@@ -230,7 +262,7 @@ class TestReader(unittest.TestCase):
             w.end_step()
 
             self.assertTrue((plattli_root / "hot.jsonl").exists())
-            with Reader(run_root) as r:
+            with plattli.Reader(run_root) as r:
                 self.assertEqual(r.metric_values("loss").tolist(), [1.0, 2.0, 3.0])
                 self.assertEqual(r.metric_values("text").tolist(), ["a", "b", "c"])
                 self.assertEqual(r.metric_values("hot_only").tolist(), [7])
@@ -241,7 +273,7 @@ class TestReader(unittest.TestCase):
     def test_reader_approx_max_rows_hot(self):
         with tempfile.TemporaryDirectory() as tmp:
             run_root = Path(tmp) / "run"
-            w = CompactingWriter(run_root, hotsize=2)
+            w = plattli.CompactingWriter(run_root, hotsize=2)
             w.write(loss=1.0)
             w.end_step()
             w.write(loss=2.0)
@@ -250,7 +282,7 @@ class TestReader(unittest.TestCase):
             w.end_step()
             if w._compact_future:
                 w._compact_future.result()
-            with Reader(run_root) as r:
+            with plattli.Reader(run_root) as r:
                 self.assertEqual(r.approx_max_rows(), 2)
                 self.assertEqual(r.approx_max_rows(faster=False), 3)
             w.finish(optimize=False, zip=False)
@@ -258,12 +290,12 @@ class TestReader(unittest.TestCase):
     def test_reader_approx_max_rows_indices_fallback(self):
         with tempfile.TemporaryDirectory() as tmp:
             run_root = Path(tmp) / "run"
-            w = DirectWriter(run_root, write_threads=0)
+            w = plattli.DirectWriter(run_root, write_threads=0)
             for step in range(3):
                 w.step = step
                 w.write(loss=float(step))
                 w.end_step()
-            with Reader(run_root) as r:
+            with plattli.Reader(run_root) as r:
                 self.assertEqual(r.approx_max_rows(), 3)
 
             plattli_root = run_root / "plattli"
@@ -277,7 +309,7 @@ class TestReader(unittest.TestCase):
                         zf.writestr(rel.as_posix(), path.read_bytes())
                     else:
                         zf.write(path, rel)
-            with Reader(run_root) as r:
+            with plattli.Reader(run_root) as r:
                 self.assertEqual(r.approx_max_rows(), 3)
 
 
