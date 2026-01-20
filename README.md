@@ -1,6 +1,6 @@
 # Plättli
 
-[![PyPI - Version](https://img.shields.io/pypi/v/plattli)](https://pypi.org/project/plattli/)
+[![PyPI - Version](https://img.shields.io/pypi/v/plattli?logo=python&logoColor=white&color=green)](https://pypi.org/project/plattli/)
 [![Tests](https://github.com/lucasb-eyer/plattli/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/lucasb-eyer/plattli/actions/workflows/ci.yml)
 [![codecov](https://codecov.io/gh/lucasb-eyer/plattli/branch/main/graph/badge.svg)](https://codecov.io/gh/lucasb-eyer/plattli)
 [![PyPI - License](https://img.shields.io/pypi/l/plattli)](https://github.com/lucasb-eyer/plattli?tab=MIT-1-ov-file#readme)
