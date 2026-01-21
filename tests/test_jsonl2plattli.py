@@ -159,7 +159,7 @@ class TestJsonl2Plattli(unittest.TestCase):
             output = _run_cli([root, "--deep", "--outdir", outdir, "--skipcols", "DEFAULT", "--workers", "1"])
 
             dest = outdir / root.name / run_dir.relative_to(root)
-            outpath = dest / f"{dest.name}.plattli"
+            outpath = dest.with_name(f"{dest.name}.plattli")
             self.assertTrue(outpath.exists())
             with zipfile.ZipFile(outpath) as zf:
                 manifest = json.loads(zf.read("plattli.json"))

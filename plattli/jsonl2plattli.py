@@ -82,10 +82,15 @@ def convert_run(run_dir, dest, use_named_zip, skip_cols=None, allow_rewinds=Fals
     w.finish(optimize=True, zip=True)
     outpath = _zip_path_for_root(dest)
     if use_named_zip:
-        named = dest / f"{dest.name}.plattli"
+        named = dest.with_name(f"{dest.name}.plattli")
         if named != outpath:
             outpath.replace(named)
             outpath = named
+        if dest.is_dir():
+            try:
+                dest.rmdir()
+            except OSError:
+                pass
     with zipfile.ZipFile(outpath) as zf:
         manifest = json.loads(zf.read("plattli.json"))
     return outpath, nrows, ncols, manifest
