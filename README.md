@@ -76,19 +76,22 @@ Note: this library is meant to be called from a single thread.
 `DirectWriter` uses threads internally to be non-blocking, and `CompactingWriter` compacts in the background.
 Calling `end_step` from a different thread would lead to silently inconsistent data.
 
-### DirectWriter(outdir, step=0, write_threads=16, config="config.json")
+### DirectWriter(outdir, step=0, write_threads=16, config="config.json", allow_resume_finalized=False)
 - Prepares the writer to write under `outdir/plattli`, creating the dir and writing the config there.
 - If `outdir/plattli/plattli.json` already exists, all metric files are truncated to `step` so you
   can resume a run and overwrite later data safely.
+- If `outdir/metrics.plattli` exists, the constructor refuses to proceed unless
+  `allow_resume_finalized=True`, which unzips into `outdir/plattli` and removes the zip.
 - `write_threads=0` disables background writes.
 - `config` is a dict written to `config.json`, or a string path (resolved relative to `outdir`)
   to symlink `config.json` to (default: `"config.json"`).
 - If the target path does not exist, an empty config is written; pass `None` to force an empty config.
 
-### CompactingWriter(outdir, step=0, hotsize, config="config.json")
+### CompactingWriter(outdir, step=0, hotsize, config="config.json", allow_resume_finalized=False)
 - Hot mode: writes rows to `hot.jsonl` and compacts them into columnar files in the background.
 - `hotsize` must be > 0 and sets the compaction batch size: once the hot log reaches N completed steps, all completed hot rows are compacted at once.
 - `config` follows the same rules as `DirectWriter`.
+- `allow_resume_finalized` follows the same rules as `DirectWriter`.
 
 ### DirectWriter.write(**metrics)
 - Appends each metric at the current step.

@@ -173,6 +173,29 @@ class TestDirectWriter(unittest.TestCase):
             self.assertFalse((plattli_root / "loss.indices").exists())
             self.assertFalse((plattli_root / "hot.jsonl").exists())
 
+    def test_compacting_resume_finalized(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_root = Path(tmp) / "run"
+            plattli_root = run_root / "plattli"
+            w = plattli.CompactingWriter(run_root, hotsize=2)
+            w.write(loss=1.0)
+            w.end_step()
+            w.write(loss=2.0)
+            w.end_step()
+            w.finish(optimize=False, zip=True)
+
+            with self.assertRaises(RuntimeError):
+                plattli.CompactingWriter(run_root, hotsize=2)
+
+            w = plattli.CompactingWriter(run_root, step=2, hotsize=2, allow_resume_finalized=True)
+            w.write(loss=3.0)
+            w.end_step()
+            w.finish(optimize=False, zip=False)
+
+            self.assertTrue(
+                np.allclose(np.fromfile(plattli_root / "loss.f32", dtype=np.float32), [1.0, 2.0, 3.0])
+            )
+
     def test_hot_compacts_all_at_threshold(self):
         with tempfile.TemporaryDirectory() as tmp:
             run_root = Path(tmp) / "run"
@@ -283,6 +306,43 @@ class TestDirectWriter(unittest.TestCase):
                 self.assertNotIn("delta.i64", zf.namelist())
                 self.assertIn("note.jsonl", zf.namelist())
                 self.assertEqual(manifest["run_rows"], 2)
+
+    def test_resume_finalized_requires_flag(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_root = Path(tmp) / "run"
+            w = plattli.DirectWriter(run_root, write_threads=0)
+            w.write(loss=1.0)
+            w.end_step()
+            w.finish(optimize=False, zip=True)
+            with self.assertRaises(RuntimeError):
+                plattli.DirectWriter(run_root, write_threads=0)
+
+    def test_resume_finalized_unzips(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_root = Path(tmp) / "run"
+            plattli_root = run_root / "plattli"
+            w = plattli.DirectWriter(run_root, write_threads=0)
+            w.write(loss=1.0)
+            w.end_step()
+            w.write(loss=2.0)
+            w.end_step()
+            w.finish(optimize=False, zip=True)
+
+            zip_path = _zip_path_for_root(run_root)
+            self.assertTrue(zip_path.exists())
+            self.assertFalse(plattli_root.exists())
+
+            w = plattli.DirectWriter(run_root, step=2, write_threads=0, allow_resume_finalized=True)
+            self.assertTrue(plattli_root.exists())
+            self.assertFalse(zip_path.exists())
+            self.assertTrue(np.allclose(np.fromfile(plattli_root / "loss.f32", dtype=np.float32), [1.0, 2.0]))
+
+            w.write(loss=3.0)
+            w.end_step()
+            w.finish(optimize=False, zip=False)
+            self.assertTrue(
+                np.allclose(np.fromfile(plattli_root / "loss.f32", dtype=np.float32), [1.0, 2.0, 3.0])
+            )
 
     def test_config_symlink_and_zip(self):
         with tempfile.TemporaryDirectory() as tmp:

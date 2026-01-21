@@ -196,12 +196,41 @@ def _zip_output(run_root, root):
     rmtree(root)
 
 
+def _maybe_resume_finalized(run_root, root, allow_resume_finalized):
+    zip_path = _zip_path_for_root(run_root)
+    if not zip_path.exists():
+        return
+    if not allow_resume_finalized:
+        raise RuntimeError(
+            f"found finalized run at {zip_path}; pass allow_resume_finalized=True to resume or remove the zip"
+        )
+    if not zip_path.is_file():
+        raise RuntimeError(f"found {zip_path} but it is not a file")
+    if root.exists():
+        if not root.is_dir():
+            raise RuntimeError(f"expected {root} to be a directory")
+        if any(root.iterdir()):
+            raise RuntimeError(f"found both {zip_path} and {root}; refuse to merge")
+    else:
+        root.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(zip_path) as zf:
+        zf.getinfo("plattli.json")
+        for name in zf.namelist():
+            if name.endswith("/"):
+                continue
+            out_path = root / name
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_bytes(zf.read(name))
+    zip_path.unlink()
+
+
 class DirectWriter:
-    def __init__(self, outdir, step=0, write_threads=16, config="config.json"):
+    def __init__(self, outdir, step=0, write_threads=16, config="config.json", allow_resume_finalized=False):
         self.run_root = Path(outdir)
         if self.run_root.name == "plattli":
             raise ValueError("outdir should be a run directory, not the plattli folder")
         self.root = self.run_root / "plattli"
+        _maybe_resume_finalized(self.run_root, self.root, allow_resume_finalized)
         self.root.mkdir(parents=True, exist_ok=True)
 
         self.step = int(step)
@@ -320,11 +349,12 @@ class DirectWriter:
 
 
 class CompactingWriter:
-    def __init__(self, outdir, step=0, hotsize=None, config="config.json"):
+    def __init__(self, outdir, step=0, hotsize=None, config="config.json", allow_resume_finalized=False):
         self.run_root = Path(outdir)
         if self.run_root.name == "plattli":
             raise ValueError("outdir should be a run directory, not the plattli folder")
         self.root = self.run_root / "plattli"
+        _maybe_resume_finalized(self.run_root, self.root, allow_resume_finalized)
         self.root.mkdir(parents=True, exist_ok=True)
 
         self.step = int(step)
