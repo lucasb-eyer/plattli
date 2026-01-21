@@ -64,6 +64,18 @@ def _resolve_plattli(path):
     return None, None
 
 
+def _run_name_for_root(root):
+    if root.is_file():
+        if root.name == "metrics.plattli":
+            return root.parent.name
+        if root.suffix == ".plattli":
+            return root.stem
+        return root.name
+    if root.name == "plattli":
+        return root.parent.name
+    return root.name
+
+
 class Reader:
     def __init__(self, path):
         kind, root = _resolve_plattli(path)
@@ -71,6 +83,7 @@ class Reader:
             raise FileNotFoundError(f"not a plattli run: {path}")
         self.kind = kind
         self.root = root
+        self._run_name = _run_name_for_root(root)
         self._zip = None
         self._manifest = None
         self._config = None
@@ -116,7 +129,7 @@ class Reader:
             if not path.exists():
                 if self._ensure_hot():
                     return []
-                raise FileNotFoundError(f"missing values file for {name}")
+                raise FileNotFoundError(f"missing values file for {name} in run {self._run_name}")
             data = path.read_bytes()
         if not data:
             return []
@@ -135,8 +148,11 @@ class Reader:
 
     def _indices_count_and_last(self, name, indices_spec):
         if isinstance(indices_spec, (list, dict)):
-            segments = _segments_from_spec(indices_spec)
-            return _segments_count_and_last(segments)
+            try:
+                segments = _segments_from_spec(indices_spec)
+                return _segments_count_and_last(segments)
+            except (ValueError, RuntimeError) as exc:
+                raise type(exc)(f"{exc} (metric {name}, run {self._run_name})") from exc
         if indices_spec == "indices":
             if self.kind == "zip":
                 data = self._read_bytes(f"{name}.indices")
@@ -150,7 +166,7 @@ class Reader:
             if not path.exists():
                 if self._ensure_hot():
                     return 0, None
-                raise FileNotFoundError(f"missing indices file for {name}")
+                raise FileNotFoundError(f"missing indices file for {name} in run {self._run_name}")
             size = path.stat().st_size
             valid = self._trim_size(size, 4)
             count = valid // 4
@@ -160,14 +176,14 @@ class Reader:
                 fh.seek(valid - 4)
                 last = int(np.frombuffer(fh.read(4), dtype=np.uint32)[0])
             return count, last
-        raise RuntimeError(f"invalid indices spec for {name}: {indices_spec}")
+        raise RuntimeError(f"invalid indices spec for {name} in run {self._run_name}: {indices_spec}")
 
     def _values_count(self, name, spec):
         dtype = spec.get("dtype")
         if dtype == JSONL_DTYPE:
             return len(self._read_jsonl_values(name))
         if dtype not in DTYPE_TO_NUMPY:
-            raise ValueError(f"unsupported dtype for {name}: {dtype}")
+            raise ValueError(f"unsupported dtype for {name} in run {self._run_name}: {dtype}")
         itemsize = np.dtype(DTYPE_TO_NUMPY[dtype]).itemsize
         if self.kind == "zip":
             data = self._read_bytes(f"{name}.{dtype}")
@@ -177,7 +193,7 @@ class Reader:
         if not path.exists():
             if self._ensure_hot():
                 return 0
-            raise FileNotFoundError(f"missing values file for {name}")
+            raise FileNotFoundError(f"missing values file for {name} in run {self._run_name}")
         size = path.stat().st_size
         valid = self._trim_size(size, itemsize)
         return valid // itemsize
@@ -224,7 +240,7 @@ class Reader:
             self._ensure_hot()
             if name in self._hot_columns:
                 return None
-        raise KeyError(f"unknown metric: {name}")
+        raise KeyError(f"unknown metric {name} in run {self._run_name}")
 
     def config(self):
         if self._config is None:
@@ -261,8 +277,11 @@ class Reader:
         for name, spec in self._manifest.items():
             indices_spec = spec.get("indices")
             if isinstance(indices_spec, (list, dict)):
-                segments = _segments_from_spec(indices_spec)
-                count, _ = _segments_count_and_last(segments)
+                try:
+                    segments = _segments_from_spec(indices_spec)
+                    count, _ = _segments_count_and_last(segments)
+                except (ValueError, RuntimeError) as exc:
+                    raise type(exc)(f"{exc} (metric {name}, run {self._run_name})") from exc
                 if count > max_rows:
                     max_rows = count
             elif indices_spec == "indices" and indices_metric is None:
@@ -291,7 +310,7 @@ class Reader:
         if not path.exists():
             if self._ensure_hot():
                 return 0
-            raise FileNotFoundError(f"missing indices file for {indices_metric}")
+            raise FileNotFoundError(f"missing indices file for {indices_metric} in run {self._run_name}")
         size = path.stat().st_size
         valid = self._trim_size(size, 4)
         return valid // 4
@@ -316,14 +335,17 @@ class Reader:
             return count, indices_last
         idx = count - 1
         if isinstance(indices_spec, (list, dict)):
-            segments = _segments_from_spec(indices_spec)
-            for segment in segments:
-                start, stop, step = _segment_values(segment)
-                seg_count = (stop - start + step - 1) // step
-                if idx < seg_count:
-                    return count, int(start + idx * step)
-                idx -= seg_count
-            raise RuntimeError(f"indices spec shorter than expected for {name}")
+            try:
+                segments = _segments_from_spec(indices_spec)
+                for segment in segments:
+                    start, stop, step = _segment_values(segment)
+                    seg_count = (stop - start + step - 1) // step
+                    if idx < seg_count:
+                        return count, int(start + idx * step)
+                    idx -= seg_count
+            except (ValueError, RuntimeError) as exc:
+                raise type(exc)(f"{exc} (metric {name}, run {self._run_name})") from exc
+            raise RuntimeError(f"indices spec shorter than expected for {name} in run {self._run_name}")
         if indices_spec == "indices":
             if self.kind == "zip":
                 data = self._read_bytes(f"{name}.indices")
@@ -337,7 +359,7 @@ class Reader:
             if not path.exists():
                 if self._ensure_hot():
                     return 0, None
-                raise FileNotFoundError(f"missing indices file for {name}")
+                raise FileNotFoundError(f"missing indices file for {name} in run {self._run_name}")
             size = path.stat().st_size
             valid = self._trim_size(size, 4)
             offset = idx * 4
@@ -347,7 +369,7 @@ class Reader:
                 fh.seek(offset)
                 last_step = int(np.frombuffer(fh.read(4), dtype=np.uint32)[0])
             return count, last_step
-        raise RuntimeError(f"invalid indices spec for {name}: {indices_spec}")
+        raise RuntimeError(f"invalid indices spec for {name} in run {self._run_name}: {indices_spec}")
 
     def _columnar_indices(self, name, spec):
         if spec is None:
@@ -361,8 +383,11 @@ class Reader:
         if count <= 0:
             return np.asarray([], dtype=np.uint32)
         if isinstance(indices_spec, (list, dict)):
-            segments = _segments_from_spec(indices_spec)
-            indices = _segments_to_array(segments)
+            try:
+                segments = _segments_from_spec(indices_spec)
+                indices = _segments_to_array(segments)
+            except (ValueError, RuntimeError) as exc:
+                raise type(exc)(f"{exc} (metric {name}, run {self._run_name})") from exc
             if count < indices.size:
                 return indices[:count]
             return indices
@@ -379,7 +404,7 @@ class Reader:
             if not path.exists():
                 if self._ensure_hot():
                     return np.asarray([], dtype=np.uint32)
-                raise FileNotFoundError(f"missing indices file for {name}")
+                raise FileNotFoundError(f"missing indices file for {name} in run {self._run_name}")
             size = path.stat().st_size
             valid = self._trim_size(size, 4)
             max_count = valid // 4
@@ -392,7 +417,7 @@ class Reader:
             if not data:
                 return np.asarray([], dtype=np.uint32)
             return np.frombuffer(data, dtype=np.uint32)
-        raise RuntimeError(f"invalid indices spec for {name}: {indices_spec}")
+        raise RuntimeError(f"invalid indices spec for {name} in run {self._run_name}: {indices_spec}")
 
     def _columnar_values(self, name, spec):
         if spec is None:
@@ -412,7 +437,7 @@ class Reader:
                 values = values[:count]
             return np.asarray(values, dtype=object)
         if dtype not in DTYPE_TO_NUMPY:
-            raise ValueError(f"unsupported dtype for {name}: {dtype}")
+            raise ValueError(f"unsupported dtype for {name} in run {self._run_name}: {dtype}")
         indices_count, _ = self._indices_count_and_last(name, spec.get("indices"))
         if indices_count == 0:
             return np.asarray([], dtype=DTYPE_TO_NUMPY[dtype])
@@ -433,7 +458,7 @@ class Reader:
         if not path.exists():
             if self._ensure_hot():
                 return np.asarray([], dtype=DTYPE_TO_NUMPY[dtype])
-            raise FileNotFoundError(f"missing values file for {name}")
+            raise FileNotFoundError(f"missing values file for {name} in run {self._run_name}")
         with path.open("rb") as fh:
             data = fh.read(count * itemsize)
         data = data[:self._trim_size(len(data), itemsize)]

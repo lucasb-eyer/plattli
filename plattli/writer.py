@@ -40,6 +40,13 @@ def _zip_path_for_root(root):
     return Path(root) / "metrics.plattli"
 
 
+def _run_name_for_root(root):
+    root = Path(root)
+    if root.name == "plattli":
+        return root.parent.name
+    return root.name
+
+
 def _write_manifest(path, manifest, run_rows=None):
     payload = {
         **manifest,
@@ -53,6 +60,7 @@ def _write_manifest(path, manifest, run_rows=None):
 
 
 def _write_config(run_root, path, config):
+    run_name = _run_name_for_root(run_root)
     if config is None:
         if path.exists() or path.is_symlink():
             return
@@ -61,7 +69,7 @@ def _write_config(run_root, path, config):
         target = (run_root / config).expanduser()
         if target.exists():
             if not target.is_file():
-                raise FileNotFoundError(f"config target is not a file: {target}")
+                raise FileNotFoundError(f"config target is not a file: {target} (run {run_name})")
             if path.exists() or path.is_symlink():
                 path.unlink()
             path.symlink_to(target.resolve())
@@ -75,6 +83,7 @@ def _write_config(run_root, path, config):
 
 
 def _truncate_to_step(root, manifest, step, allow_missing):
+    run_name = _run_name_for_root(root)
     for name, spec in manifest.items():
         indices_spec = spec["indices"]
         if indices_spec == "indices":
@@ -82,14 +91,17 @@ def _truncate_to_step(root, manifest, step, allow_missing):
             if not idx_path.exists():
                 if allow_missing:
                     continue
-                raise FileNotFoundError(f"missing indices file for {name}")
+                raise FileNotFoundError(f"missing indices file for {name} in run {run_name}")
             indices = np.fromfile(idx_path, dtype=np.uint32)
             keep = int(np.searchsorted(indices, step, side="left")) if indices.size else 0
             with idx_path.open("r+b") as fh:
                 fh.truncate(keep * 4)
         else:
-            segments = _segments_from_spec(indices_spec)
-            kept, keep = _segments_truncate(segments, step)
+            try:
+                segments = _segments_from_spec(indices_spec)
+                kept, keep = _segments_truncate(segments, step)
+            except (ValueError, RuntimeError) as exc:
+                raise type(exc)(f"{exc} (metric {name}, run {run_name})") from exc
             spec["indices"] = kept
 
         if (dtype := spec["dtype"]) == JSONL_DTYPE:
@@ -97,7 +109,7 @@ def _truncate_to_step(root, manifest, step, allow_missing):
             if not path.exists():
                 if allow_missing:
                     continue
-                raise FileNotFoundError(f"missing values file for {name}")
+                raise FileNotFoundError(f"missing values file for {name} in run {run_name}")
             if keep <= 0:
                 path.write_text("", encoding="utf-8")
                 continue
@@ -113,20 +125,24 @@ def _truncate_to_step(root, manifest, step, allow_missing):
             if not value_path.exists():
                 if allow_missing:
                     continue
-                raise FileNotFoundError(f"missing values file for {name}")
+                raise FileNotFoundError(f"missing values file for {name} in run {run_name}")
             with value_path.open("r+b") as fh:
                 fh.truncate(keep * np.dtype(DTYPE_TO_NUMPY[dtype]).itemsize)
     _write_manifest(root / "plattli.json", manifest)
 
 
 def _force_indices_files(root, manifest):
+    run_name = _run_name_for_root(root)
     updated = False
     for name, spec in manifest.items():
         indices_spec = spec.get("indices")
         if indices_spec == "indices":
             continue
-        segments = _segments_from_spec(indices_spec)
-        indices = _segments_to_array(segments)
+        try:
+            segments = _segments_from_spec(indices_spec)
+            indices = _segments_to_array(segments)
+        except (ValueError, RuntimeError) as exc:
+            raise type(exc)(f"{exc} (metric {name}, run {run_name})") from exc
         idx_path = root / f"{name}.indices"
         idx_path.parent.mkdir(parents=True, exist_ok=True)
         with idx_path.open("wb") as fh:
@@ -151,8 +167,11 @@ def _optimize_indices(root, manifest):
 
 def _indices_length(root, name, indices_spec):
     if isinstance(indices_spec, (dict, list)):
-        segments = _segments_from_spec(indices_spec)
-        total, _ = _segments_count_and_last(segments)
+        try:
+            segments = _segments_from_spec(indices_spec)
+            total, _ = _segments_count_and_last(segments)
+        except (ValueError, RuntimeError) as exc:
+            raise type(exc)(f"{exc} (metric {name}, run {_run_name_for_root(root)})") from exc
         return total
     if indices_spec == "indices":
         idx_path = root / f"{name}.indices"
@@ -200,17 +219,16 @@ def _maybe_resume_finalized(run_root, root, allow_resume_finalized):
     zip_path = _zip_path_for_root(run_root)
     if not zip_path.exists():
         return
+    run_name = _run_name_for_root(run_root)
     if not allow_resume_finalized:
-        raise RuntimeError(
-            f"found finalized run at {zip_path}; pass allow_resume_finalized=True to resume or remove the zip"
-        )
+        raise RuntimeError(f"found finalized run {run_name} at {zip_path}; pass allow_resume_finalized=True to resume or remove the zip")
     if not zip_path.is_file():
-        raise RuntimeError(f"found {zip_path} but it is not a file")
+        raise RuntimeError(f"found {zip_path} for run {run_name} but it is not a file")
     if root.exists():
         if not root.is_dir():
-            raise RuntimeError(f"expected {root} to be a directory")
+            raise RuntimeError(f"expected {root} to be a directory for run {run_name}")
         if any(root.iterdir()):
-            raise RuntimeError(f"found both {zip_path} and {root}; refuse to merge")
+            raise RuntimeError(f"found both {zip_path} and {root} for run {run_name}; refuse to merge")
     else:
         root.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(zip_path) as zf:
@@ -228,13 +246,13 @@ class DirectWriter:
     def __init__(self, outdir, step=0, write_threads=16, config="config.json", allow_resume_finalized=False):
         self.run_root = Path(outdir)
         if self.run_root.name == "plattli":
-            raise ValueError("outdir should be a run directory, not the plattli folder")
+            raise ValueError(f"outdir should be a run directory, not the plattli folder: {outdir}")
         self.root = self.run_root / "plattli"
         _maybe_resume_finalized(self.run_root, self.root, allow_resume_finalized)
         self.root.mkdir(parents=True, exist_ok=True)
 
         self.step = int(step)
-        assert self.step >= 0, "step must be >= 0"
+        assert self.step >= 0, f"step must be >= 0 for run {self.run_root.name}: {self.step}"
 
         self._manifest = {}
         self._executor = ThreadPoolExecutor(max_workers=write_threads) if write_threads else None
@@ -257,16 +275,16 @@ class DirectWriter:
             return
 
         if self.step < 0 or self.step > 0xFFFFFFFF:
-            raise ValueError(f"step out of uint32 range: {self.step}")
+            raise ValueError(f"step out of uint32 range for run {self.run_root.name}: {self.step}")
 
         new_metric = False
         for name, value in metrics.items():
             if name == "step":
-                raise ValueError("metric name 'step' is reserved")
+                raise ValueError(f"metric name 'step' is reserved in run {self.run_root.name}")
             if name in self._step_metrics:
-                raise RuntimeError(f"metric already written in step {self.step}: {name}")
+                raise RuntimeError(f"metric already written in step {self.step} for {name} in run {self.run_root.name}")
             if name not in self._manifest:
-                dtype = _resolve_dtype(value)
+                dtype = _resolve_dtype(value, name=name, run_name=self.run_root.name)
                 (self.root / name).parent.mkdir(parents=True, exist_ok=True)
                 self._manifest[name] = {"indices": "indices", "dtype": dtype}
                 new_metric = True
@@ -328,11 +346,15 @@ class DirectWriter:
         if not self._step_metrics:
             return
         updated = False
+        run_name = self.run_root.name
         for name in self._step_metrics:
             indices_spec = self._manifest[name]["indices"]
             if indices_spec == "indices":
                 continue
-            self._manifest[name]["indices"] = _append_step_to_indices_spec(indices_spec, self.step)
+            try:
+                self._manifest[name]["indices"] = _append_step_to_indices_spec(indices_spec, self.step)
+            except (ValueError, RuntimeError) as exc:
+                raise type(exc)(f"{exc} (metric {name}, run {run_name})") from exc
             updated = True
         if updated:
             _write_manifest(self.root / "plattli.json", self._manifest)
@@ -352,19 +374,19 @@ class CompactingWriter:
     def __init__(self, outdir, step=0, hotsize=None, config="config.json", allow_resume_finalized=False):
         self.run_root = Path(outdir)
         if self.run_root.name == "plattli":
-            raise ValueError("outdir should be a run directory, not the plattli folder")
+            raise ValueError(f"outdir should be a run directory, not the plattli folder: {outdir}")
         self.root = self.run_root / "plattli"
         _maybe_resume_finalized(self.run_root, self.root, allow_resume_finalized)
         self.root.mkdir(parents=True, exist_ok=True)
 
         self.step = int(step)
-        assert self.step >= 0, "step must be >= 0"
+        assert self.step >= 0, f"step must be >= 0 for run {self.run_root.name}: {self.step}"
 
         if hotsize is None:
-            raise ValueError("hotsize is required")
+            raise ValueError(f"hotsize is required for run {self.run_root.name}")
         self.hotsize = int(hotsize)
         if self.hotsize <= 0:
-            raise ValueError("hotsize must be > 0")
+            raise ValueError(f"hotsize must be > 0 for run {self.run_root.name}: {self.hotsize}")
 
         self._manifest = {}
         self._compact_executor = ThreadPoolExecutor(max_workers=1)
@@ -391,11 +413,11 @@ class CompactingWriter:
         if metrics is None:
             metrics = {}
         if not isinstance(metrics, dict):
-            raise TypeError("metrics must be a dict")
+            raise TypeError(f"metrics must be a dict in run {self.run_root.name} (got {type(metrics).__name__})")
         if kwargs:
             overlap = metrics.keys() & kwargs.keys()
             if overlap:
-                raise ValueError(f"duplicate metric names: {sorted(overlap)}")
+                raise ValueError(f"duplicate metric names in run {self.run_root.name}: {sorted(overlap)}")
             metrics = {**metrics, **kwargs}
         if not metrics and flush:
             self._flush_hot()
@@ -404,16 +426,16 @@ class CompactingWriter:
             return
 
         if self.step < 0 or self.step > 0xFFFFFFFF:
-            raise ValueError(f"step out of uint32 range: {self.step}")
+            raise ValueError(f"step out of uint32 range for run {self.run_root.name}: {self.step}")
 
         new_metric = False
         for name, value in metrics.items():
             if name == "step":
-                raise ValueError("metric name 'step' is reserved")
+                raise ValueError(f"metric name 'step' is reserved in run {self.run_root.name}")
             if name in self._step_metrics:
-                raise RuntimeError(f"metric already written in step {self.step}: {name}")
+                raise RuntimeError(f"metric already written in step {self.step} for {name} in run {self.run_root.name}")
             if name not in self._manifest:
-                dtype = _resolve_dtype(value)
+                dtype = _resolve_dtype(value, name=name, run_name=self.run_root.name)
                 (self.root / name).parent.mkdir(parents=True, exist_ok=True)
                 self._manifest[name] = {"indices": [], "dtype": dtype}
                 new_metric = True
@@ -423,12 +445,12 @@ class CompactingWriter:
                 value = np.asarray(value)
             if isinstance(value, (np.ndarray, np.generic)):
                 if value.shape != ():
-                    raise ValueError("only scalar values are supported")
+                    raise ValueError(f"only scalar values are supported for {name} in run {self.run_root.name} (shape {value.shape})")
                 value = value.item()
             if dtype != JSONL_DTYPE:
                 arr = np.asarray(value)
                 if arr.shape != ():
-                    raise ValueError("only scalar values are supported")
+                    raise ValueError(f"only scalar values are supported for {name} in run {self.run_root.name} (shape {arr.shape})")
                 value = np.asarray(arr, dtype=DTYPE_TO_NUMPY[dtype]).item()
             self._current_row[name] = value
             self._step_metrics.add(name)
@@ -507,7 +529,7 @@ class CompactingWriter:
                     if name == "step":
                         continue
                     if name not in self._manifest:
-                        dtype = _resolve_dtype(value)
+                        dtype = _resolve_dtype(value, name=name, run_name=self.run_root.name)
                         (self.root / name).parent.mkdir(parents=True, exist_ok=True)
                         self._manifest[name] = {"indices": [], "dtype": dtype}
                         new_metric = True
@@ -586,6 +608,7 @@ class CompactingWriter:
                 col["values"].append(value)
 
         updated_specs = {}
+        run_name = self.run_root.name
         for name, col in columns.items():
             dtype = self._manifest[name]["dtype"]
             (self.root / name).parent.mkdir(parents=True, exist_ok=True)
@@ -593,9 +616,15 @@ class CompactingWriter:
             if indices_spec == "indices":
                 _append_indices(self.root / f"{name}.indices", col["indices"])
             else:
-                spec = _append_steps_to_indices_spec(indices_spec, col["indices"])
+                try:
+                    spec = _append_steps_to_indices_spec(indices_spec, col["indices"])
+                except (ValueError, RuntimeError) as exc:
+                    raise type(exc)(f"{exc} (metric {name}, run {run_name})") from exc
                 if _segments_too_many(spec):
-                    indices = _segments_to_array(spec)
+                    try:
+                        indices = _segments_to_array(spec)
+                    except (ValueError, RuntimeError) as exc:
+                        raise type(exc)(f"{exc} (metric {name}, run {run_name})") from exc
                     idx_path = self.root / f"{name}.indices"
                     idx_path.parent.mkdir(parents=True, exist_ok=True)
                     with idx_path.open("wb") as fh:
@@ -663,7 +692,7 @@ def _tight_dtype(array):
 def _append_numeric(path, values, dtype):
     arr = np.asarray(values)
     if arr.ndim != 1:
-        raise ValueError("expected 1d values")
+        raise ValueError(f"expected 1d values for {path} (shape {arr.shape})")
     with path.open("ab") as fh:
         np.asarray(arr, dtype=DTYPE_TO_NUMPY[dtype]).tofile(fh)
 
@@ -671,7 +700,7 @@ def _append_numeric(path, values, dtype):
 def _append_indices(path, indices):
     arr = np.asarray(indices)
     if arr.ndim != 1:
-        raise ValueError("expected 1d indices")
+        raise ValueError(f"expected 1d indices for {path} (shape {arr.shape})")
     with path.open("ab") as fh:
         np.asarray(arr, dtype=np.uint32).tofile(fh)
 
@@ -689,12 +718,18 @@ def _append_jsonl(path, values):
         fh.write(payload.encode("utf-8"))
 
 
-def _resolve_dtype(value):
+def _resolve_dtype(value, name=None, run_name=None):
     if hasattr(value, "__array__"):
         value = np.asarray(value)
     if isinstance(value, (np.ndarray, np.generic)):
         if value.shape != ():
-            raise ValueError("only scalar array-like values are supported")
+            detail = "only scalar array-like values are supported"
+            if name is not None:
+                detail += f" for {name}"
+            if run_name is not None:
+                detail += f" in run {run_name}"
+            detail += f" (shape {value.shape})"
+            raise ValueError(detail)
         if (kind := value.dtype.kind) in "fiu":
             dtype = f"{kind}{value.dtype.itemsize * 8}"
             return dtype if dtype in DTYPE_TO_NUMPY else JSONL_DTYPE

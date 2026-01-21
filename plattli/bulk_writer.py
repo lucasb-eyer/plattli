@@ -21,11 +21,11 @@ class PlattliBulkWriter:
     def __init__(self, outdir, step=0, config="config.json"):
         self.run_root = Path(outdir)
         if self.run_root.name == "plattli":
-            raise ValueError("outdir should be a run directory, not the plattli folder")
+            raise ValueError(f"outdir should be a run directory, not the plattli folder: {outdir}")
         self.run_root.mkdir(parents=True, exist_ok=True)
         self.root = self.run_root / "plattli"
         self.step = int(step)
-        assert self.step >= 0, "step must be >= 0"
+        assert self.step >= 0, f"step must be >= 0 for run {self.run_root.name}: {self.step}"
 
         self._columns = {}
         self._step_metrics = set()
@@ -35,12 +35,12 @@ class PlattliBulkWriter:
         self._config = config
 
     def write(self, **metrics):
-        assert 0 <= self.step <= 0xFFFFFFFF, f"step out of uint32 range: {self.step}"
+        assert 0 <= self.step <= 0xFFFFFFFF, f"step out of uint32 range for run {self.run_root.name}: {self.step}"
         for name, value in metrics.items():
             if name == "step":
-                raise ValueError("metric name 'step' is reserved")
+                raise ValueError(f"metric name 'step' is reserved in run {self.run_root.name}")
             if name in self._step_metrics:
-                raise RuntimeError(f"metric already written in step {self.step}: {name}")
+                raise RuntimeError(f"metric already written in step {self.step} for {name} in run {self.run_root.name}")
             bucket = self._columns.get(name)
             if bucket is None:
                 bucket = _ColumnBuffer()
@@ -88,7 +88,7 @@ class PlattliBulkWriter:
             target = (self.run_root / config).expanduser()
             if target.exists():
                 if not target.is_file():
-                    raise FileNotFoundError(f"config target is not a file: {target}")
+                    raise FileNotFoundError(f"config target is not a file: {target} (run {self.run_root.name})")
                 if zip:
                     write_bytes("config.json", target.read_bytes())
                 else:
@@ -125,7 +125,7 @@ class PlattliBulkWriter:
                     write_bytes(f"{name}.{dtype_tag}", tightened.tobytes())
                     continue
 
-            if (dtype := _resolve_dtype(column.v[0])) == JSONL_DTYPE:
+            if (dtype := _resolve_dtype(column.v[0], name=name, run_name=self.run_root.name)) == JSONL_DTYPE:
                 manifest[name] = {"indices": indices_spec, "dtype": JSONL_DTYPE}
                 lines = "\n".join(json.dumps(v.item() if isinstance(v, (np.ndarray, np.generic)) else v,
                                              ensure_ascii=False) for v in column.v)
