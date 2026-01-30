@@ -391,6 +391,7 @@ class CompactingWriter:
         self._manifest = {}
         self._compact_executor = ThreadPoolExecutor(max_workers=1)
         self._compact_future = None
+        self._compact_steps = set()
         self._step_metrics = set()
 
         self._hot_rows = []
@@ -474,7 +475,8 @@ class CompactingWriter:
 
         if self._compact_future:
             wait([self._compact_future])
-            self._drain_errors()
+            with self._hot_lock:
+                self._maybe_finalize_compaction_locked()
         with self._hot_lock:
             if self._current_row:
                 self._upsert_hot_row(self.step, self._current_row)
@@ -513,6 +515,7 @@ class CompactingWriter:
         step_row = None
         new_metric = False
         rewrite_hot = False
+        min_hot_step = None
         with hot_path.open("r", encoding="utf-8") as fh:
             for line in fh:
                 row = json.loads(line)
@@ -520,6 +523,8 @@ class CompactingWriter:
                 if row_step > self.step:
                     rewrite_hot = True
                     continue
+                if min_hot_step is None or row_step < min_hot_step:
+                    min_hot_step = row_step
                 if row_step == self.step:
                     step_row = row
                 else:
@@ -540,6 +545,9 @@ class CompactingWriter:
             self._step_metrics = set(self._current_row.keys())
         if rewrite_hot:
             self._write_hot_file()
+        if min_hot_step is not None:
+            _truncate_to_step(self.root, self._manifest, min_hot_step, allow_missing=True)
+            new_metric = False
         if new_metric:
             with self._hot_lock:
                 _write_manifest(self.root / "plattli.json", self._manifest)
@@ -549,26 +557,26 @@ class CompactingWriter:
             return
         if self._compact_future.done():
             if (err := self._compact_future.exception()) is not None:
+                with self._hot_lock:
+                    self._compact_future = None
+                    self._compact_steps = set()
                 raise err
-            self._compact_future = None
 
     def _flush_hot(self):
         wrote = False
-        while True:
-            with self._hot_lock:
-                if self._current_row and not wrote:
-                    self._upsert_hot_row(self.step, self._current_row)
-                    self._write_hot_file()
-                    wrote = True
+        with self._hot_lock:
+            if self._current_row:
+                self._upsert_hot_row(self.step, self._current_row)
+                wrote = True
+            if self._maybe_finalize_compaction_locked():
+                wrote = True
+            if wrote:
+                self._write_hot_file()
+            if self._compact_future is None:
                 batch = self._compact_batch_locked()
-                if not batch:
-                    return
-                future = self._compact_future
-                if future is None:
+                if batch:
+                    self._compact_steps = {int(row["step"]) for row in batch}
                     self._compact_future = self._compact_executor.submit(self._compact_rows, batch)
-                    return
-            wait([future])
-            self._drain_errors()
 
     def _upsert_hot_row(self, step, row):
         payload = {"step": int(step)}
@@ -587,11 +595,28 @@ class CompactingWriter:
         tmp_path.write_text(payload, encoding="utf-8")
         tmp_path.replace(path)
 
+    def _maybe_finalize_compaction_locked(self):
+        future = self._compact_future
+        if future is None or not future.done():
+            return False
+        if (err := future.exception()) is not None:
+            self._compact_future = None
+            self._compact_steps = set()
+            raise err
+        if self._compact_steps:
+            steps = self._compact_steps
+            self._hot_rows = [row for row in self._hot_rows if row["step"] not in steps]
+            self._hot_index = {row["step"]: idx for idx, row in enumerate(self._hot_rows)}
+            self._compact_steps = set()
+        self._compact_future = None
+        return True
+
     def _compact_batch_locked(self):
         completed = [row for row in self._hot_rows if row["step"] < self.step]
         if len(completed) < self.hotsize:
             return []
-        return completed
+        completed.sort(key=lambda row: row["step"])
+        return completed[:self.hotsize]
 
     def _compact_rows(self, rows):
         columns = {}
@@ -642,10 +667,6 @@ class CompactingWriter:
                 for name, spec in updated_specs.items():
                     self._manifest[name]["indices"] = spec
                 _write_manifest(self.root / "plattli.json", self._manifest)
-            steps = {int(row["step"]) for row in rows}
-            self._hot_rows = [row for row in self._hot_rows if row["step"] not in steps]
-            self._hot_index = {row["step"]: idx for idx, row in enumerate(self._hot_rows)}
-            self._write_hot_file()
 
 
 def _find_arange_params(array):

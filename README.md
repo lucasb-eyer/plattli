@@ -89,7 +89,7 @@ Calling `end_step` from a different thread would lead to silently inconsistent d
 
 ### CompactingWriter(outdir, step=0, hotsize, config="config.json", allow_resume_finalized=False)
 - Hot mode: writes rows to `hot.jsonl` and compacts them into columnar files in the background.
-- `hotsize` must be > 0 and sets the compaction batch size: once the hot log reaches N completed steps, all completed hot rows are compacted at once.
+- `hotsize` must be > 0 and sets the compaction batch size: once the hot log reaches `hotsize` completed steps, the oldest `hotsize` rows are compacted at once.
 - `config` follows the same rules as `DirectWriter`.
 - `allow_resume_finalized` follows the same rules as `DirectWriter`.
 

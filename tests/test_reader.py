@@ -105,6 +105,8 @@ class TestReader(unittest.TestCase):
                 w._compact_future.result()
             w.write(loss=3.0)
             w.end_step()
+            if w._compact_future:
+                w._compact_future.result()
 
             self.assertTrue((plattli_root / "hot.jsonl").exists())
             with plattli.Reader(run_root) as r:

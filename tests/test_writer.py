@@ -206,6 +206,7 @@ class TestDirectWriter(unittest.TestCase):
                 w.end_step()
             if w._compact_future:
                 w._compact_future.result()
+            w.write(flush=True)
 
             hot_rows = _read_jsonl(plattli_root / "hot.jsonl")
             self.assertEqual([row["step"] for row in hot_rows], [3])
