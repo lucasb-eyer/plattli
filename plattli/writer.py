@@ -54,9 +54,21 @@ def _write_manifest(path, manifest, run_rows=None):
     }
     if run_rows is not None:
         payload["run_rows"] = run_rows
+    _replace_text_checked(path, json.dumps(payload, ensure_ascii=False), "manifest")
+
+
+def _replace_text_checked(path, payload, label):
+    if not payload:
+        raise RuntimeError(f"{label} payload must not be empty for {path}")
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_name(path.name + ".tmp")
-    tmp_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    tmp_path.write_text(payload, encoding="utf-8")
+    if tmp_path.stat().st_size <= 0:
+        raise RuntimeError(f"{label} tmp file is empty after write: {tmp_path}")
     tmp_path.replace(path)
+    if path.stat().st_size <= 0:
+        raise RuntimeError(f"{label} file is empty after replace: {path}")
 
 
 def _write_config(run_root, path, config):
@@ -590,10 +602,12 @@ class CompactingWriter:
 
     def _write_hot_file(self):
         path = self.root / HOT_FILENAME
-        tmp_path = path.with_name(path.name + ".tmp")
+        if not self._hot_rows:
+            if path.exists():
+                path.unlink()
+            return
         payload = "".join(f"{json.dumps(row, ensure_ascii=False)}\n" for row in self._hot_rows)
-        tmp_path.write_text(payload, encoding="utf-8")
-        tmp_path.replace(path)
+        _replace_text_checked(path, payload, "hot")
 
     def _maybe_finalize_compaction_locked(self):
         future = self._compact_future

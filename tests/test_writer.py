@@ -3,11 +3,12 @@ import tempfile
 import unittest
 import zipfile
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 
 import plattli
-from plattli.writer import _find_arange_params, _zip_path_for_root
+from plattli.writer import _find_arange_params, _replace_text_checked, _zip_path_for_root
 
 
 def _read_jsonl(path):
@@ -15,6 +16,26 @@ def _read_jsonl(path):
 
 
 class TestDirectWriter(unittest.TestCase):
+    def test_replace_text_checked_rejects_empty_payload(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "plattli.json"
+            with self.assertRaises(RuntimeError):
+                _replace_text_checked(path, "", "manifest")
+
+    def test_replace_text_checked_detects_empty_replace(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "plattli.json"
+            original_replace = Path.replace
+
+            def fake_replace(self, target):
+                result = original_replace(self, target)
+                Path(target).write_text("", encoding="utf-8")
+                return result
+
+            with mock.patch("pathlib.Path.replace", fake_replace):
+                with self.assertRaises(RuntimeError):
+                    _replace_text_checked(path, '{"ok":1}', "manifest")
+
     def test_negative_step(self):
         with tempfile.TemporaryDirectory() as tmp:
             run_root = Path(tmp)
@@ -214,6 +235,27 @@ class TestDirectWriter(unittest.TestCase):
             self.assertTrue(np.allclose(loss_vals, [0.0, 1.0, 2.0]))
             manifest = json.loads((plattli_root / "plattli.json").read_text(encoding="utf-8"))
             self.assertEqual(manifest["loss"]["indices"], [{"start": 0, "stop": 3, "step": 1}])
+            w.finish(optimize=False, zip=False)
+
+    def test_hot_file_removed_when_empty(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_root = Path(tmp) / "run"
+            plattli_root = run_root / "plattli"
+            w = plattli.CompactingWriter(run_root, hotsize=1)
+            w.write(loss=1.0)
+            w.end_step()
+            w.write(loss=2.0)
+            w.end_step()
+
+            if w._compact_future:
+                w._compact_future.result()
+            w.write(flush=True)
+            if w._compact_future:
+                w._compact_future.result()
+            w.write(flush=True)
+
+            self.assertFalse((plattli_root / "hot.jsonl").exists())
+            self.assertTrue((plattli_root / "plattli.json").exists())
             w.finish(optimize=False, zip=False)
 
     def test_compacting_indices_fallback(self):
