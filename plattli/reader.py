@@ -251,6 +251,10 @@ class Reader:
         self._ensure_manifest()
         return self._when_exported
 
+    def manifest(self):
+        self._ensure_manifest()
+        return self._manifest
+
     def rows(self, name):
         if name in self._rows_cache:
             return self._rows_cache[name]
