@@ -528,28 +528,35 @@ class CompactingWriter:
         new_metric = False
         rewrite_hot = False
         min_hot_step = None
-        with hot_path.open("r", encoding="utf-8") as fh:
-            for line in fh:
+        data = hot_path.read_bytes()
+        lines = data.splitlines()
+        for idx, line in enumerate(lines):
+            try:
                 row = json.loads(line)
-                row_step = int(row["step"])
-                if row_step > self.step:
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                if idx == len(lines) - 1:
                     rewrite_hot = True
+                    break
+                raise
+            row_step = int(row["step"])
+            if row_step > self.step:
+                rewrite_hot = True
+                continue
+            if min_hot_step is None or row_step < min_hot_step:
+                min_hot_step = row_step
+            if row_step == self.step:
+                step_row = row
+            else:
+                self._hot_index[row_step] = len(self._hot_rows)
+                self._hot_rows.append(row)
+            for name, value in row.items():
+                if name == "step":
                     continue
-                if min_hot_step is None or row_step < min_hot_step:
-                    min_hot_step = row_step
-                if row_step == self.step:
-                    step_row = row
-                else:
-                    self._hot_index[row_step] = len(self._hot_rows)
-                    self._hot_rows.append(row)
-                for name, value in row.items():
-                    if name == "step":
-                        continue
-                    if name not in self._manifest:
-                        dtype = _resolve_dtype(value, name=name, run_name=self.run_root.name)
-                        (self.root / name).parent.mkdir(parents=True, exist_ok=True)
-                        self._manifest[name] = {"indices": [], "dtype": dtype}
-                        new_metric = True
+                if name not in self._manifest:
+                    dtype = _resolve_dtype(value, name=name, run_name=self.run_root.name)
+                    (self.root / name).parent.mkdir(parents=True, exist_ok=True)
+                    self._manifest[name] = {"indices": [], "dtype": dtype}
+                    new_metric = True
         if step_row is not None:
             self._hot_index[self.step] = len(self._hot_rows)
             self._hot_rows.append(step_row)
@@ -575,15 +582,19 @@ class CompactingWriter:
                 raise err
 
     def _flush_hot(self):
-        wrote = False
+        append_row = None
+        rewrite = False
         with self._hot_lock:
             if self._current_row:
-                self._upsert_hot_row(self.step, self._current_row)
-                wrote = True
+                mode, append_row = self._upsert_hot_row(self.step, self._current_row)
+                rewrite = mode == "rewrite"
             if self._maybe_finalize_compaction_locked():
-                wrote = True
-            if wrote:
+                rewrite = True
+                append_row = None
+            if rewrite:
                 self._write_hot_file()
+            elif append_row is not None:
+                self._append_hot_row(append_row)
             if self._compact_future is None:
                 batch = self._compact_batch_locked()
                 if batch:
@@ -595,10 +606,13 @@ class CompactingWriter:
         payload.update(row)
         if step in self._hot_index:
             idx = self._hot_index[step]
+            if self._hot_rows[idx] == payload:
+                return None, None
             self._hot_rows[idx] = payload
-        else:
-            self._hot_index[step] = len(self._hot_rows)
-            self._hot_rows.append(payload)
+            return "rewrite", None
+        self._hot_index[step] = len(self._hot_rows)
+        self._hot_rows.append(payload)
+        return "append", payload
 
     def _write_hot_file(self):
         path = self.root / HOT_FILENAME
@@ -606,8 +620,14 @@ class CompactingWriter:
             if path.exists():
                 path.unlink()
             return
-        payload = "".join(f"{json.dumps(row, ensure_ascii=False)}\n" for row in self._hot_rows)
+        payload = "".join(f"{json.dumps(row, ensure_ascii=False, separators=(',', ':'))}\n" for row in self._hot_rows)
         _replace_text_checked(path, payload, "hot")
+
+    def _append_hot_row(self, row):
+        path = self.root / HOT_FILENAME
+        line = json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n"
+        with path.open("ab") as fh:
+            fh.write(line.encode("utf-8"))
 
     def _maybe_finalize_compaction_locked(self):
         future = self._compact_future

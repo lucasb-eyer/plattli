@@ -157,6 +157,25 @@ class TestReader(unittest.TestCase):
                 self.assertEqual(r.metric_values("text").tolist(), ["a", "b"])
                 self.assertEqual(r.rows("text"), 2)
 
+    def test_reader_tolerates_hot_tail(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_root = Path(tmp) / "run"
+            plattli_root = run_root / "plattli"
+            w = plattli.CompactingWriter(run_root, hotsize=100)
+            w.write(loss=1.0)
+            w.end_step()
+            w.write(loss=2.0)
+            w.end_step()
+
+            with (plattli_root / "hot.jsonl").open("ab") as fh:
+                fh.write(b"{\"step\":2,\"loss\":")
+
+            with plattli.Reader(run_root) as r:
+                self.assertEqual(r.metric_indices("loss").tolist(), [0, 1])
+                self.assertTrue(np.allclose(r.metric_values("loss"),
+                                            np.asarray([1.0, 2.0], dtype=np.float32)))
+                self.assertEqual(r.rows("loss"), 2)
+
     def test_reader_missing_files_fail_loud(self):
         with tempfile.TemporaryDirectory() as tmp:
             run_root = Path(tmp) / "run"

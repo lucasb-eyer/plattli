@@ -194,6 +194,28 @@ class TestDirectWriter(unittest.TestCase):
             self.assertFalse((plattli_root / "loss.indices").exists())
             self.assertFalse((plattli_root / "hot.jsonl").exists())
 
+    def test_hot_resume_after_crash_with_partial_tail(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_root = Path(tmp) / "run"
+            plattli_root = run_root / "plattli"
+            w = plattli.CompactingWriter(run_root, hotsize=5)
+            w.write(loss=1.0)
+            w.end_step()
+            w.write(loss=2.0)
+            w.end_step()
+            with (plattli_root / "hot.jsonl").open("ab") as fh:
+                fh.write(b"{\"step\":2,\"loss\":")
+            w = None
+
+            w = plattli.CompactingWriter(run_root, step=2, hotsize=5)
+            w.write(loss=3.0)
+            w.end_step()
+            w.finish(optimize=False, zip=False)
+
+            loss_vals = np.fromfile(plattli_root / "loss.f32", dtype=np.float32)
+            self.assertTrue(np.allclose(loss_vals, [1.0, 2.0, 3.0]))
+            self.assertFalse((plattli_root / "hot.jsonl").exists())
+
     def test_compacting_resume_finalized(self):
         with tempfile.TemporaryDirectory() as tmp:
             run_root = Path(tmp) / "run"

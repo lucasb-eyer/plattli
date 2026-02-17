@@ -217,19 +217,25 @@ class Reader:
         self._hot_has_file = hot_path.exists()
         if not self._hot_has_file:
             return False
-        with hot_path.open("r", encoding="utf-8") as fh:
-            for line in fh:
+        data = hot_path.read_bytes()
+        lines = data.splitlines()
+        for idx, line in enumerate(lines):
+            try:
                 row = json.loads(line)
-                step = int(row["step"])
-                for name, value in row.items():
-                    if name == "step":
-                        continue
-                    col = self._hot_columns.get(name)
-                    if col is None:
-                        col = {"indices": [], "values": []}
-                        self._hot_columns[name] = col
-                    col["indices"].append(step)
-                    col["values"].append(value)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                if idx == len(lines) - 1:
+                    break
+                raise
+            step = int(row["step"])
+            for name, value in row.items():
+                if name == "step":
+                    continue
+                col = self._hot_columns.get(name)
+                if col is None:
+                    col = {"indices": [], "values": []}
+                    self._hot_columns[name] = col
+                col["indices"].append(step)
+                col["values"].append(value)
         return True
 
     def _metric_spec(self, name, allow_hot=False):
