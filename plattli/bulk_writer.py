@@ -118,7 +118,10 @@ class PlattliBulkWriter:
                 run_rows = indices.size
 
             if optimize:
-                tightened = _tight_dtype(column.v)
+                values = np.asarray(column.v)
+                if values.dtype.kind == "f" and all(isinstance(v, float) for v in column.v):
+                    values = values.astype(np.float32, copy=False)
+                tightened = _tight_dtype(values)
                 if tightened is not None:
                     dtype_tag = f"{tightened.dtype.kind}{tightened.dtype.itemsize * 8}"
                     manifest[name] = {"indices": indices_spec, "dtype": dtype_tag}
