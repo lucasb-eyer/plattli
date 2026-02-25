@@ -100,6 +100,7 @@ Calling `end_step` from a different thread would lead to silently inconsistent d
   - bool -> `jsonl`
   - float -> `f32`
   - int -> `i64`
+  - explicit numpy types (eg `np.float64`) are taken as-is.
   - everything else -> `jsonl`
 - Force a dtype by casting the value (for example: `write(dim=np.float32(128))`).
 - Only scalar values are supported (including 0-d array-likes).
@@ -122,7 +123,7 @@ Calling `end_step` from a different thread would lead to silently inconsistent d
 - `DirectWriter` flushes writes; `CompactingWriter` compacts any remaining hot rows and removes `hot.jsonl`.
 - Updates `plattli.json`.
 - If `optimize=True`:
-  - Tightens numeric dtypes (floats -> `f32`, ints -> smallest fitting int/uint).
+  - Tightens numeric dtypes (floats -> keep original float width, ints -> smallest fitting int/uint).
   - Converts monotonically spaced indices into `{start, stop, step}` and removes the `.indices` file.
   - Writes `run_rows` (max rows across metrics) into the manifest.
 - If `zip=True`, zips the run folder to `<outdir>/metrics.plattli` (stored, not compressed).

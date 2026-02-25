@@ -83,6 +83,23 @@ class TestDirectWriter(unittest.TestCase):
             self.assertEqual(loss_vals.tolist(), [1.5])
             self.assertEqual((plattli_root / "loss.f64").stat().st_size, 8)
 
+    def test_dtype_tighten_preserves_float64(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_root = Path(tmp)
+            plattli_root = run_root / "plattli"
+            w = plattli.DirectWriter(run_root, write_threads=0)
+            w.write(loss=np.float64(1.5))
+            w.end_step()
+            w.write(loss=np.float64(2.5))
+            w.end_step()
+            w.finish(optimize=True, zip=False)
+
+            manifest = json.loads((plattli_root / "plattli.json").read_text(encoding="utf-8"))
+            loss_vals = np.fromfile(plattli_root / "loss.f64", dtype=np.float64)
+            self.assertEqual(manifest["loss"]["dtype"], "f64")
+            self.assertEqual((plattli_root / "loss.f64").stat().st_size, 16)
+            self.assertEqual(loss_vals.tolist(), [1.5, 2.5])
+
     def test_dtype_cast_existing_metric(self):
         with tempfile.TemporaryDirectory() as tmp:
             run_root = Path(tmp)

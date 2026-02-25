@@ -738,7 +738,7 @@ def _tightest_int(array):
 def _tight_dtype(array):
     array = np.asarray(array)
     if array.dtype.kind == "f":
-        return array.astype(np.float32, copy=False)
+        return array
     if array.dtype.kind in "iu":
         return _tightest_int(array)
     return None  # pragma: no cover - unreachable
