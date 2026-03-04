@@ -539,7 +539,7 @@ class CompactingWriter:
                     break
                 raise
             row_step = int(row["step"])
-            if row_step > self.step:
+            if row_step >= self.step:
                 rewrite_hot = True
                 continue
             if min_hot_step is None or row_step < min_hot_step:
