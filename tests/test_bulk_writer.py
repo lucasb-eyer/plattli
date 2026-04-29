@@ -92,6 +92,26 @@ class TestPlattliBulkWriter(unittest.TestCase):
                 self.assertIn("note.indices", zf.namelist())
                 self.assertIn("note.jsonl", zf.namelist())
 
+    def test_monotonic_metadata(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_root = Path(tmp) / "run"
+            plattli_root = run_root / "plattli"
+            w = plattli.PlattliBulkWriter(run_root)
+            w.write(loss=1.0, delta=3.0, broken=1.0, flat=2.0, note="a")
+            w.end_step()
+            w.write(loss=2.0, delta=2.0, broken=2.0, flat=2.0, note="b")
+            w.end_step()
+            w.write(loss=2.0, delta=1.0, broken=1.0, flat=2.0)
+            w.end_step()
+            w.finish(zip=False)
+
+            manifest = json.loads((plattli_root / "plattli.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["loss"]["monotonic"], "inc")
+            self.assertEqual(manifest["delta"]["monotonic"], "dec")
+            self.assertNotIn("monotonic", manifest["broken"])
+            self.assertEqual(manifest["flat"]["monotonic"], "inc")
+            self.assertNotIn("monotonic", manifest["note"])
+
     def test_config_symlink_zip(self):
         with tempfile.TemporaryDirectory() as tmp:
             run_root = Path(tmp) / "run"

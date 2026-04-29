@@ -6,7 +6,7 @@ from pathlib import Path
 import numpy as np
 
 from ._indices import _find_piecewise_params
-from .writer import DTYPE_TO_NUMPY, JSONL_DTYPE, _resolve_dtype, _tight_dtype, _zip_path_for_root
+from .writer import DTYPE_TO_NUMPY, JSONL_DTYPE, _resolve_dtype, _set_monotonic, _tight_dtype, _zip_path_for_root
 
 
 class _ColumnBuffer:
@@ -125,6 +125,7 @@ class PlattliBulkWriter:
                 if tightened is not None:
                     dtype_tag = f"{tightened.dtype.kind}{tightened.dtype.itemsize * 8}"
                     manifest[name] = {"indices": indices_spec, "dtype": dtype_tag}
+                    _set_monotonic(manifest[name], tightened)
                     write_bytes(f"{name}.{dtype_tag}", tightened.tobytes())
                     continue
 
@@ -139,6 +140,7 @@ class PlattliBulkWriter:
 
             arr = np.asarray(column.v, dtype=DTYPE_TO_NUMPY[dtype])
             manifest[name] = {"indices": indices_spec, "dtype": dtype}
+            _set_monotonic(manifest[name], arr)
             write_bytes(f"{name}.{dtype}", arr.tobytes())
 
         manifest["when_exported"] = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")

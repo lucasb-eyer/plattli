@@ -144,6 +144,59 @@ class TestDirectWriter(unittest.TestCase):
             flag_vals = _read_jsonl(plattli_root / "flag.jsonl")
             self.assertEqual(flag_vals, [True, False])
 
+    def test_monotonic_metadata_direct(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_root = Path(tmp)
+            plattli_root = run_root / "plattli"
+            w = plattli.DirectWriter(run_root, write_threads=0)
+            w.write(loss=1.0, delta=3.0, flat=2.0, note="a")
+            w.end_step()
+            w.write(loss=2.0, delta=2.0, flat=2.0, note="b")
+            w.end_step()
+            w.write(loss=2.0, delta=1.0, flat=2.0)
+            w.end_step()
+            w.finish(optimize=False, zip=False)
+
+            manifest = json.loads((plattli_root / "plattli.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["loss"]["monotonic"], "inc")
+            self.assertEqual(manifest["delta"]["monotonic"], "dec")
+            self.assertEqual(manifest["flat"]["monotonic"], "inc")
+            self.assertNotIn("monotonic", manifest["note"])
+
+    def test_monotonic_metadata_removed_when_direction_breaks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_root = Path(tmp)
+            plattli_root = run_root / "plattli"
+            w = plattli.DirectWriter(run_root, write_threads=0)
+            w.write(loss=1.0)
+            w.end_step()
+            w.write(loss=2.0)
+            w.end_step()
+            w.write(loss=1.0)
+            w.end_step()
+            w.finish(optimize=False, zip=False)
+
+            manifest = json.loads((plattli_root / "plattli.json").read_text(encoding="utf-8"))
+            self.assertNotIn("monotonic", manifest["loss"])
+
+    def test_monotonic_metadata_written_before_finish(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_root = Path(tmp)
+            plattli_root = run_root / "plattli"
+            w = plattli.DirectWriter(run_root, write_threads=0)
+            w.write(loss=1.0)
+            w.end_step()
+            w.write(loss=2.0)
+
+            manifest = json.loads((plattli_root / "plattli.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["loss"]["monotonic"], "inc")
+
+            w.end_step()
+            w.write(loss=1.0)
+            manifest = json.loads((plattli_root / "plattli.json").read_text(encoding="utf-8"))
+            self.assertNotIn("monotonic", manifest["loss"])
+            w.finish(optimize=False, zip=False)
+
     def test_background_error_note(self):
         with tempfile.TemporaryDirectory() as tmp:
             run_root = Path(tmp)
@@ -186,6 +239,29 @@ class TestDirectWriter(unittest.TestCase):
             loss_idx = np.fromfile(plattli_root / "loss.indices", dtype=np.uint32)
             self.assertTrue(np.allclose(loss_vals, [1.0, 9.0]))
             self.assertEqual(loss_idx.tolist(), [0, 1])
+
+    def test_monotonic_metadata_recomputed_after_resume_truncate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_root = Path(tmp)
+            plattli_root = run_root / "plattli"
+            w = plattli.DirectWriter(run_root, write_threads=0)
+            w.write(loss=1.0)
+            w.end_step()
+            w.write(loss=2.0)
+            w.end_step()
+            w.write(loss=1.0)
+            w.end_step()
+            w.finish(optimize=False, zip=False)
+
+            w = plattli.DirectWriter(run_root, step=2, write_threads=0)
+            manifest = json.loads((plattli_root / "plattli.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["loss"]["monotonic"], "inc")
+            w.write(loss=3.0)
+            w.end_step()
+            w.finish(optimize=False, zip=False)
+
+            manifest = json.loads((plattli_root / "plattli.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["loss"]["monotonic"], "inc")
 
     def test_hot_resume_after_crash(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -294,6 +370,43 @@ class TestDirectWriter(unittest.TestCase):
             self.assertTrue(np.allclose(loss_vals, [0.0, 1.0, 2.0]))
             manifest = json.loads((plattli_root / "plattli.json").read_text(encoding="utf-8"))
             self.assertEqual(manifest["loss"]["indices"], [{"start": 0, "stop": 3, "step": 1}])
+            w.finish(optimize=False, zip=False)
+
+    def test_monotonic_metadata_compacting(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_root = Path(tmp) / "run"
+            plattli_root = run_root / "plattli"
+            w = plattli.CompactingWriter(run_root, hotsize=2)
+            w.write(loss=1.0, delta=3.0)
+            w.end_step()
+            w.write(loss=2.0, delta=2.0)
+            w.end_step()
+            w.write(loss=3.0, delta=1.0)
+            w.end_step()
+            if w._compact_future:
+                w._compact_future.result()
+            w.finish(optimize=False, zip=False)
+
+            manifest = json.loads((plattli_root / "plattli.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["loss"]["monotonic"], "inc")
+            self.assertEqual(manifest["delta"]["monotonic"], "dec")
+
+    def test_monotonic_metadata_compacting_before_finish(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_root = Path(tmp) / "run"
+            plattli_root = run_root / "plattli"
+            w = plattli.CompactingWriter(run_root, hotsize=10)
+            w.write(loss=1.0)
+            w.end_step()
+            w.write(loss=2.0)
+
+            manifest = json.loads((plattli_root / "plattli.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["loss"]["monotonic"], "inc")
+
+            w.end_step()
+            w.write(loss=1.0)
+            manifest = json.loads((plattli_root / "plattli.json").read_text(encoding="utf-8"))
+            self.assertNotIn("monotonic", manifest["loss"])
             w.finish(optimize=False, zip=False)
 
     def test_hot_file_removed_when_empty(self):

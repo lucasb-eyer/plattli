@@ -183,6 +183,7 @@ JSON object keyed by metric name, plus metadata keys like `run_rows` and `when_e
 Fields:
 - `indices`: `"indices"`, a list of `{start, stop, step}` segments (canonical), or a single `{start, stop, step}` (legacy).
 - `dtype`: one of `f{32,64}`, `{i,u}{8,16,32,64}`, or `jsonl`.
+- `monotonic`: optional `"inc"` or `"dec"` for numeric metrics whose stored values are monotonic; flat-only metrics use `"inc"`.
 - `run_rows`: optional max rows across all metrics (written on `finish` only).
 - `when_exported`: timestamp updated on manifest writes.
 

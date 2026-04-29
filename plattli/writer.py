@@ -191,6 +191,101 @@ def _indices_length(root, name, indices_spec):
     return 0  # pragma: no cover
 
 
+def _coerce_stored_value(value, dtype, name, run_name):
+    if hasattr(value, "__array__"):
+        value = np.asarray(value)
+    if isinstance(value, (np.ndarray, np.generic)):
+        if value.shape != ():
+            raise ValueError(f"only scalar values are supported for {name} in run {run_name} (shape {value.shape})")
+        value = value.item()
+    if dtype == JSONL_DTYPE:
+        return value
+
+    arr = np.asarray(value)
+    if arr.shape != ():
+        raise ValueError(f"only scalar values are supported for {name} in run {run_name} (shape {arr.shape})")
+    return np.asarray(arr, dtype=DTYPE_TO_NUMPY[dtype]).item()
+
+
+class _Monotonic:
+    def __init__(self, dtype):
+        self.last = None
+        self.direction = None
+        self.broken = dtype not in DTYPE_TO_NUMPY
+        self.seen = False
+
+    def add(self, value):
+        if self.broken:
+            return
+        if value != value:
+            self.broken = True
+            self.direction = None
+            return
+        if not self.seen:
+            self.last = value
+            self.seen = True
+            return
+        if value == self.last:
+            return
+        direction = "inc" if value > self.last else "dec"
+        if self.direction is None:
+            self.direction = direction
+        elif self.direction != direction:
+            self.broken = True
+            self.direction = None
+        self.last = value
+
+    def apply(self, spec):
+        direction = None if self.broken or not self.seen else self.direction or "inc"
+        if direction is None:
+            if "monotonic" not in spec:
+                return False
+            spec.pop("monotonic")
+            return True
+        if spec.get("monotonic") == direction:
+            return False
+        spec["monotonic"] = direction
+        return True
+
+
+def _set_monotonic(spec, values):
+    state = _Monotonic(spec["dtype"])
+    for value in values:
+        state.add(value)
+    state.apply(spec)
+
+
+def _refresh_monotonic_metadata(root, manifest, hot_rows=()):
+    states = {}
+    changed = False
+    run_name = _run_name_for_root(root)
+    sorted_hot_rows = sorted(hot_rows, key=lambda row: int(row["step"]))
+    for name, spec in manifest.items():
+        dtype = spec["dtype"]
+        state = _Monotonic(dtype)
+        if dtype in DTYPE_TO_NUMPY:
+            path = root / f"{name}.{dtype}"
+            if path.exists():
+                for value in np.fromfile(path, dtype=DTYPE_TO_NUMPY[dtype]):
+                    state.add(value)
+            for row in sorted_hot_rows:
+                if name in row:
+                    state.add(_coerce_stored_value(row[name], dtype, name, run_name))
+        states[name] = state
+        changed = state.apply(spec) or changed
+    return states, changed
+
+
+def _track_monotonic_value(manifest, states, name, value):
+    spec = manifest[name]
+    state = states.get(name)
+    if state is None:
+        state = _Monotonic(spec["dtype"])
+        states[name] = state
+    state.add(value)
+    return state.apply(spec)
+
+
 def _tighten_dtypes(root, manifest):
     for name, spec in manifest.items():
         dtype = spec["dtype"]
@@ -270,6 +365,7 @@ class DirectWriter:
         self._executor = ThreadPoolExecutor(max_workers=write_threads) if write_threads else None
         self._futures = []
         self._step_metrics = set()
+        self._monotonic = {}
 
         if (self.root / "plattli.json").exists():
             self._manifest = json.loads((self.root / "plattli.json").read_text(encoding="utf-8"))
@@ -278,6 +374,9 @@ class DirectWriter:
             if self._manifest:
                 _truncate_to_step(self.root, self._manifest, self.step, allow_missing=False)
                 _force_indices_files(self.root, self._manifest)
+                self._monotonic, monotonic_changed = _refresh_monotonic_metadata(self.root, self._manifest)
+                if monotonic_changed:
+                    _write_manifest(self.root / "plattli.json", self._manifest)
 
         self.set_config(config)
 
@@ -302,6 +401,8 @@ class DirectWriter:
                 new_metric = True
             else:
                 dtype = self._manifest[name]["dtype"]
+            value = _coerce_stored_value(value, dtype, name, self.run_root.name)
+            new_metric = _track_monotonic_value(self._manifest, self._monotonic, name, value) or new_metric
             write_indices = self._manifest[name]["indices"] == "indices"
             if self._executor:
                 self._futures.append(self._executor.submit(self._write_entry, name, dtype, value, self.step, write_indices))
@@ -405,6 +506,7 @@ class CompactingWriter:
         self._compact_future = None
         self._compact_steps = set()
         self._step_metrics = set()
+        self._monotonic = {}
 
         self._hot_rows = []
         self._hot_index = {}
@@ -419,6 +521,10 @@ class CompactingWriter:
                 _truncate_to_step(self.root, self._manifest, self.step, allow_missing=True)
 
         self._load_hot_rows()
+        if self._manifest:
+            self._monotonic, monotonic_changed = _refresh_monotonic_metadata(self.root, self._manifest, self._hot_rows)
+            if monotonic_changed:
+                _write_manifest(self.root / "plattli.json", self._manifest)
         self.set_config(config)
 
     def write(self, metrics=None, flush=False, **kwargs):
@@ -454,17 +560,8 @@ class CompactingWriter:
                 new_metric = True
             else:
                 dtype = self._manifest[name]["dtype"]
-            if hasattr(value, "__array__"):
-                value = np.asarray(value)
-            if isinstance(value, (np.ndarray, np.generic)):
-                if value.shape != ():
-                    raise ValueError(f"only scalar values are supported for {name} in run {self.run_root.name} (shape {value.shape})")
-                value = value.item()
-            if dtype != JSONL_DTYPE:
-                arr = np.asarray(value)
-                if arr.shape != ():
-                    raise ValueError(f"only scalar values are supported for {name} in run {self.run_root.name} (shape {arr.shape})")
-                value = np.asarray(arr, dtype=DTYPE_TO_NUMPY[dtype]).item()
+            value = _coerce_stored_value(value, dtype, name, self.run_root.name)
+            new_metric = _track_monotonic_value(self._manifest, self._monotonic, name, value) or new_metric
             self._current_row[name] = value
             self._step_metrics.add(name)
 
