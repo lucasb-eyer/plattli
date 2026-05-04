@@ -148,6 +148,24 @@ with Reader("/experiments/123456") as r:
   but because `rows(name)` can be a bit expensive for in-progress runs, `approx_max_rows(faster=True)` is a fast likely-correct estimate of the row count of the most-frequent metric.
 - While the data format is simple, the reader code is a bit more complex because it tolerates corrupt tails, such that it's fine to read plattli's while they are being written.
 
+### Advanced API topics
+
+#### Range selectors
+Range selectors can be passed to any metric read:
+- `start`/`stop` read this range of **step values**. `stop` is inclusive, like label slicing with pandas `.loc`.
+- `vstart`/`vstop` read this range of **metric values**. `vstop` is inclusive. Mostly useful for monotonic metrics.
+- `istart`/`istop` read this range of **physical row positions**. `istop` is exclusive, like Python ranges and pandas `.iloc`.
+
+These cannot be mixed.
+
+```python
+from plattli import Reader
+
+with Reader("/experiments/123456") as r:
+    zoomed_loss_steps, zoomed_loss_values = r.metric("loss", start=100, stop=200)
+    x_steps, x_values = r.metric("walltime", vstart=10.0, vstop=20.0)
+```
+
 ### Helpers
 - `plattli.is_run(path)` -> whether the `path` is a plattli run (a correct folder structure, or a `metrics.plattli` zipfile).
 - `plattli.is_run_dir(path)` -> whether the folder `path` contains plattli metrics (be it as subfolder or zipped).

@@ -28,6 +28,95 @@ class TestReader(unittest.TestCase):
                 self.assertEqual(r.metric_indices("loss").tolist(), steps)
                 self.assertTrue(np.allclose(r.metric_values("loss"), np.asarray(steps, dtype=np.float32)))
 
+    def test_reader_metric_position_range(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_root = Path(tmp) / "run"
+            w = plattli.DirectWriter(run_root, write_threads=0)
+            for step in range(10):
+                w.step = step * 10
+                w.write(loss=float(step))
+                w.end_step()
+            w.finish(optimize=True, zip=False)
+
+            with plattli.Reader(run_root) as r:
+                self.assertEqual(r.metric_indices("loss", istart=2, istop=5).tolist(), [20, 30, 40])
+                self.assertTrue(np.allclose(r.metric_values("loss", istart=2, istop=5), [2, 3, 4]))
+                idx, values = r.metric("loss", istart=2, istop=5)
+                self.assertEqual(idx.tolist(), [20, 30, 40])
+                self.assertTrue(np.allclose(values, [2, 3, 4]))
+
+    def test_reader_metric_step_range(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_root = Path(tmp) / "run"
+            w = plattli.DirectWriter(run_root, write_threads=0)
+            for step in [0, 2, 4, 20, 22, 24]:
+                w.step = step
+                w.write(loss=float(step))
+                w.end_step()
+            w.finish(optimize=True, zip=False)
+
+            with plattli.Reader(run_root) as r:
+                idx, values = r.metric("loss", start=3, stop=22)
+                self.assertEqual(idx.tolist(), [4, 20, 22])
+                self.assertTrue(np.allclose(values, [4, 20, 22]))
+
+    def test_reader_metric_value_range_uses_monotonic_metadata(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_root = Path(tmp) / "run"
+            w = plattli.DirectWriter(run_root, write_threads=0)
+            for step, value in enumerate([10.0, 11.0, 12.0, 13.0, 14.0]):
+                w.step = step
+                w.write(walltime=value)
+                w.end_step()
+            w.finish(optimize=False, zip=False)
+
+            with plattli.Reader(run_root) as r:
+                idx, values = r.metric("walltime", vstart=11.0, vstop=13.0)
+                self.assertEqual(idx.tolist(), [1, 2, 3])
+                self.assertTrue(np.allclose(values, [11, 12, 13]))
+
+    def test_reader_metric_value_range_descending(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_root = Path(tmp) / "run"
+            w = plattli.DirectWriter(run_root, write_threads=0)
+            for step, value in enumerate([5.0, 4.0, 3.0, 2.0, 1.0]):
+                w.step = step
+                w.write(delta=value)
+                w.end_step()
+            w.finish(optimize=False, zip=False)
+
+            with plattli.Reader(run_root) as r:
+                idx, values = r.metric("delta", vstart=2.0, vstop=4.0)
+                self.assertEqual(idx.tolist(), [1, 2, 3])
+                self.assertTrue(np.allclose(values, [4, 3, 2]))
+
+    def test_reader_metric_value_range_falls_back_when_not_monotonic(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_root = Path(tmp) / "run"
+            w = plattli.DirectWriter(run_root, write_threads=0)
+            for step, value in enumerate([0.0, 10.0, 2.0, 3.0, 30.0]):
+                w.step = step
+                w.write(walltime=value)
+                w.end_step()
+            w.finish(optimize=False, zip=False)
+
+            with plattli.Reader(run_root) as r:
+                idx, values = r.metric("walltime", vstart=2.0, vstop=10.0)
+                self.assertEqual(idx.tolist(), [1, 2, 3])
+                self.assertTrue(np.allclose(values, [10, 2, 3]))
+
+    def test_reader_metric_range_selectors_cannot_be_mixed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_root = Path(tmp) / "run"
+            w = plattli.DirectWriter(run_root, write_threads=0)
+            w.write(loss=1.0)
+            w.end_step()
+            w.finish(optimize=False, zip=False)
+
+            with plattli.Reader(run_root) as r:
+                with self.assertRaises(ValueError):
+                    r.metric("loss", start=0, istart=0)
+
         with tempfile.TemporaryDirectory() as tmp:
             run_root = Path(tmp) / "run"
             w = plattli.DirectWriter(run_root, write_threads=0)

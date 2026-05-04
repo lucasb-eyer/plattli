@@ -121,6 +121,256 @@ class Reader:
             return 0
         return size - (size % unit)
 
+    def _selector_kind(self, start, stop, istart, istop, vstart, vstop):
+        kinds = []
+        if start is not None or stop is not None:
+            kinds.append("step")
+        if istart is not None or istop is not None:
+            kinds.append("position")
+        if vstart is not None or vstop is not None:
+            kinds.append("value")
+        if len(kinds) > 1:
+            raise ValueError("Use only one range selector: start/stop, istart/istop, or vstart/vstop.")
+        return kinds[0] if kinds else None
+
+    def _position_slice(self, count, istart, istop):
+        istart = 0 if istart is None else int(istart)
+        istop = count if istop is None else int(istop)
+        if istart < 0 or istop < 0:
+            raise ValueError("istart/istop must be non-negative.")
+        istart = min(istart, count)
+        istop = min(max(istop, istart), count)
+        return [(istart, istop)] if istart < istop else []
+
+    def _ceil_div(self, value, step):
+        return -(-value // step)
+
+    def _read_indices_file(self, name, count):
+        if self.kind == "zip":
+            data = self._read_bytes(f"{name}.indices")
+            data = data[:self._trim_size(len(data), 4)]
+            if not data:
+                return np.asarray([], dtype=np.uint32)
+            return np.frombuffer(data[:count * 4], dtype=np.uint32)
+        path = self.root / f"{name}.indices"
+        if not path.exists():
+            if self._ensure_hot():
+                return np.asarray([], dtype=np.uint32)
+            raise FileNotFoundError(f"missing indices file for {name} in run {self._run_name}")
+        with path.open("rb") as fh:
+            data = fh.read(count * 4)
+        data = data[:self._trim_size(len(data), 4)]
+        if not data:
+            return np.asarray([], dtype=np.uint32)
+        return np.frombuffer(data, dtype=np.uint32)
+
+    def _step_chunks_for_spec(self, name, indices_spec, start, stop, count):
+        if start is not None and stop is not None and start > stop:
+            return []
+        if isinstance(indices_spec, (list, dict)):
+            chunks = []
+            offset = 0
+            for segment in _segments_from_spec(indices_spec):
+                seg_start, seg_stop, seg_step = _segment_values(segment)
+                seg_count = min((seg_stop - seg_start + seg_step - 1) // seg_step, max(0, count - offset))
+                if seg_count <= 0:
+                    break
+                left = 0 if start is None else self._ceil_div(int(np.ceil(start - seg_start)), seg_step)
+                right = seg_count if stop is None else int(np.floor((stop - seg_start) / seg_step)) + 1
+                left = min(max(left, 0), seg_count)
+                right = min(max(right, 0), seg_count)
+                if left < right:
+                    chunks.append((offset + left, offset + right))
+                offset += seg_count
+            return chunks
+        if indices_spec == "indices":
+            indices = self._read_indices_file(name, count)
+            left = 0 if start is None else int(np.searchsorted(indices, start, side="left"))
+            right = len(indices) if stop is None else int(np.searchsorted(indices, stop, side="right"))
+            return [(left, right)] if left < right else []
+        raise RuntimeError(f"invalid indices spec: {indices_spec}")
+
+    def _metric_count(self, name, spec):
+        if spec is None:
+            return 0
+        indices_count, _ = self._indices_count_and_last(name, spec.get("indices"))
+        if indices_count == 0:
+            return 0
+        return min(indices_count, self._values_count(name, spec))
+
+    def _read_indices_slice(self, name, offset, count):
+        if count <= 0:
+            return np.asarray([], dtype=np.uint32)
+        if self.kind == "zip":
+            data = self._read_bytes(f"{name}.indices")
+            data = data[offset * 4:(offset + count) * 4]
+        else:
+            path = self.root / f"{name}.indices"
+            if not path.exists():
+                if self._ensure_hot():
+                    return np.asarray([], dtype=np.uint32)
+                raise FileNotFoundError(f"missing indices file for {name} in run {self._run_name}")
+            with path.open("rb") as fh:
+                fh.seek(offset * 4)
+                data = fh.read(count * 4)
+        data = data[:self._trim_size(len(data), 4)]
+        if not data:
+            return np.asarray([], dtype=np.uint32)
+        return np.frombuffer(data, dtype=np.uint32)
+
+    def _read_value_slice(self, name, spec, offset, count):
+        dtype = spec.get("dtype")
+        if count <= 0:
+            if dtype == JSONL_DTYPE:
+                return np.asarray([], dtype=object)
+            if dtype not in DTYPE_TO_NUMPY:
+                raise ValueError(f"unsupported dtype for {name} in run {self._run_name}: {dtype}")
+            return np.asarray([], dtype=DTYPE_TO_NUMPY[dtype])
+        if dtype == JSONL_DTYPE:
+            return self._columnar_values(name, spec)[offset:offset + count]
+        if dtype not in DTYPE_TO_NUMPY:
+            raise ValueError(f"unsupported dtype for {name} in run {self._run_name}: {dtype}")
+        target = DTYPE_TO_NUMPY[dtype]
+        itemsize = np.dtype(target).itemsize
+        if self.kind == "zip":
+            data = self._read_bytes(f"{name}.{dtype}")
+            data = data[offset * itemsize:(offset + count) * itemsize]
+        else:
+            path = self.root / f"{name}.{dtype}"
+            if not path.exists():
+                if self._ensure_hot():
+                    return np.asarray([], dtype=target)
+                raise FileNotFoundError(f"missing values file for {name} in run {self._run_name}")
+            with path.open("rb") as fh:
+                fh.seek(offset * itemsize)
+                data = fh.read(count * itemsize)
+        data = data[:self._trim_size(len(data), itemsize)]
+        if not data:
+            return np.asarray([], dtype=target)
+        return np.frombuffer(data, dtype=target)
+
+    def _concat(self, pieces, dtype):
+        pieces = [piece for piece in pieces if len(piece)]
+        if not pieces:
+            return np.asarray([], dtype=dtype)
+        if len(pieces) == 1:
+            return pieces[0]
+        return np.concatenate(pieces)
+
+    def _indices_chunks_from_segments(self, indices_spec, chunks):
+        segments = _segments_from_spec(indices_spec)
+        pieces = []
+        for chunk_start, chunk_stop in chunks:
+            offset = 0
+            for segment in segments:
+                start, stop, step = _segment_values(segment)
+                count = (stop - start + step - 1) // step
+                left = max(chunk_start - offset, 0)
+                right = min(chunk_stop - offset, count)
+                if left < right:
+                    pieces.append(np.arange(start + left * step, start + right * step, step, dtype=np.uint32))
+                offset += count
+                if offset >= chunk_stop:
+                    break
+        return self._concat(pieces, np.uint32)
+
+    def _columnar_indices_chunks(self, name, spec, chunks):
+        if spec is None:
+            return np.asarray([], dtype=np.uint32)
+        indices_spec = spec.get("indices")
+        if isinstance(indices_spec, (list, dict)):
+            return self._indices_chunks_from_segments(indices_spec, chunks)
+        if indices_spec == "indices":
+            return self._concat(
+                [self._read_indices_slice(name, start, stop - start) for start, stop in chunks],
+                np.uint32,
+            )
+        raise RuntimeError(f"invalid indices spec for {name} in run {self._run_name}: {indices_spec}")
+
+    def _columnar_values_chunks(self, name, spec, chunks):
+        dtype = spec.get("dtype")
+        return self._concat(
+            [self._read_value_slice(name, spec, start, stop - start) for start, stop in chunks],
+            object if dtype == JSONL_DTYPE else DTYPE_TO_NUMPY[dtype],
+        )
+
+    def _monotonic_value_chunks(self, name, spec, vstart, vstop, count):
+        if count <= 0:
+            return []
+        if vstart is not None and vstop is not None and vstart > vstop:
+            return []
+        if self.kind != "dir":
+            return None
+        dtype = spec.get("dtype")
+        if dtype not in DTYPE_TO_NUMPY:
+            return None
+        direction = spec.get("monotonic")
+        if direction not in ("inc", "dec"):
+            return None
+
+        path = self.root / f"{name}.{dtype}"
+        target = DTYPE_TO_NUMPY[dtype]
+        itemsize = np.dtype(target).itemsize
+        with path.open("rb") as fh:
+            def value_at(pos):
+                fh.seek(pos * itemsize)
+                return np.frombuffer(fh.read(itemsize), dtype=target)[0]
+
+            def first_true(pred):
+                lo, hi = 0, count
+                while lo < hi:
+                    mid = (lo + hi) // 2
+                    if pred(value_at(mid)):
+                        hi = mid
+                    else:
+                        lo = mid + 1
+                return lo
+
+            if direction == "inc":
+                left = 0 if vstart is None else first_true(lambda value: value >= vstart)
+                right = count if vstop is None else first_true(lambda value: value > vstop)
+            else:
+                left = 0 if vstop is None else first_true(lambda value: value <= vstop)
+                right = count if vstart is None else first_true(lambda value: value < vstart)
+        return [(left, right)] if left < right else []
+
+    def _selector_chunks(self, name, spec, start, stop, istart, istop, vstart, vstop):
+        kind = self._selector_kind(start, stop, istart, istop, vstart, vstop)
+        if kind is None:
+            return None
+        if spec is None or self._ensure_hot():
+            return None
+        count = self._metric_count(name, spec)
+        if kind == "position":
+            return self._position_slice(count, istart, istop)
+        if kind == "step":
+            return self._step_chunks_for_spec(name, spec.get("indices"), start, stop, count)
+        return self._monotonic_value_chunks(name, spec, vstart, vstop, count)
+
+    def _apply_selector(self, indices, values, start, stop, istart, istop, vstart, vstop):
+        kind = self._selector_kind(start, stop, istart, istop, vstart, vstop)
+        if kind is None:
+            return indices, values
+        if kind == "position":
+            chunks = self._position_slice(len(values), istart, istop)
+            if not chunks:
+                return indices[:0], values[:0]
+            start, stop = chunks[0]
+            return indices[start:stop], values[start:stop]
+        if kind == "step":
+            mask = np.ones(len(indices), dtype=bool)
+            if start is not None:
+                mask &= indices >= start
+            if stop is not None:
+                mask &= indices <= stop
+            return indices[mask], values[mask]
+        mask = np.ones(len(values), dtype=bool)
+        if vstart is not None:
+            mask &= values >= vstart
+        if vstop is not None:
+            mask &= values <= vstop
+        return indices[mask], values[mask]
+
     def _read_jsonl_values(self, name):
         if self.kind == "zip":
             data = self._read_bytes(f"{name}.jsonl")
@@ -489,7 +739,7 @@ class Reader:
                 values.append(value)
         return np.asarray(indices, dtype=np.uint32), values
 
-    def metric_indices(self, name):
+    def _metric_indices_full(self, name):
         spec = self._metric_spec(name, allow_hot=True)
         columnar = self._columnar_indices(name, spec)
         last_step = int(columnar[-1]) if columnar.size else None
@@ -500,7 +750,7 @@ class Reader:
             return hot_idx
         return np.concatenate([columnar, hot_idx])
 
-    def metric_values(self, name):
+    def _metric_values_full(self, name):
         spec = self._metric_spec(name, allow_hot=True)
         columnar = self._columnar_values(name, spec)
         last_step = None
@@ -522,9 +772,43 @@ class Reader:
             return hot_arr
         return np.concatenate([columnar, hot_arr])
 
-    def metric(self, name, idx=None):
+    def _metric_full(self, name):
+        return self._metric_indices_full(name), self._metric_values_full(name)
+
+    def metric_indices(self, name, start=None, stop=None, istart=None, istop=None, vstart=None, vstop=None):
+        if self._selector_kind(start, stop, istart, istop, vstart, vstop) is None:
+            return self._metric_indices_full(name)
+        spec = self._metric_spec(name, allow_hot=True)
+        chunks = self._selector_chunks(name, spec, start, stop, istart, istop, vstart, vstop)
+        if chunks is not None:
+            return self._columnar_indices_chunks(name, spec, chunks)
+        indices, values = self._metric_full(name)
+        return self._apply_selector(indices, values, start, stop, istart, istop, vstart, vstop)[0]
+
+    def metric_values(self, name, start=None, stop=None, istart=None, istop=None, vstart=None, vstop=None):
+        if self._selector_kind(start, stop, istart, istop, vstart, vstop) is None:
+            return self._metric_values_full(name)
+        spec = self._metric_spec(name, allow_hot=True)
+        chunks = self._selector_chunks(name, spec, start, stop, istart, istop, vstart, vstop)
+        if chunks is not None:
+            return self._columnar_values_chunks(name, spec, chunks)
+        indices, values = self._metric_full(name)
+        return self._apply_selector(indices, values, start, stop, istart, istop, vstart, vstop)[1]
+
+    def metric(self, name, idx=None, start=None, stop=None, istart=None, istop=None, vstart=None, vstop=None):
+        if self._selector_kind(start, stop, istart, istop, vstart, vstop) is None:
+            indices, values = self._metric_full(name)
+        else:
+            spec = self._metric_spec(name, allow_hot=True)
+            chunks = self._selector_chunks(name, spec, start, stop, istart, istop, vstart, vstop)
+            if chunks is None:
+                indices, values = self._apply_selector(
+                    *self._metric_full(name),
+                    start, stop, istart, istop, vstart, vstop,
+                )
+            else:
+                indices = self._columnar_indices_chunks(name, spec, chunks)
+                values = self._columnar_values_chunks(name, spec, chunks)
         if idx is None:
-            return self.metric_indices(name), self.metric_values(name)
-        indices = self.metric_indices(name)
-        values = self.metric_values(name)
+            return indices, values
         return indices[idx], values[idx]
