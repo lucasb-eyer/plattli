@@ -512,6 +512,7 @@ class CompactingWriter:
         self._hot_index = {}
         self._current_row = {}
         self._hot_lock = threading.Lock()
+        self._hot_fh = None
 
         if (self.root / "plattli.json").exists():
             self._manifest = json.loads((self.root / "plattli.json").read_text(encoding="utf-8"))
@@ -526,6 +527,10 @@ class CompactingWriter:
             if monotonic_changed:
                 _write_manifest(self.root / "plattli.json", self._manifest)
         self.set_config(config)
+
+    def __del__(self):
+        # Some callers intentionally drop unfinished writers to resume later.
+        self._close_hot_file()
 
     def write(self, metrics=None, flush=False, **kwargs):
         self._drain_errors()
@@ -596,6 +601,7 @@ class CompactingWriter:
         if rows:
             self._compact_rows(rows)
         hot_path = self.root / HOT_FILENAME
+        self._close_hot_file()
         if hot_path.exists():
             hot_path.unlink()
 
@@ -712,6 +718,7 @@ class CompactingWriter:
         return "append", payload
 
     def _write_hot_file(self):
+        self._close_hot_file()
         path = self.root / HOT_FILENAME
         if not self._hot_rows:
             if path.exists():
@@ -721,10 +728,22 @@ class CompactingWriter:
         _replace_text_checked(path, payload, "hot")
 
     def _append_hot_row(self, row):
-        path = self.root / HOT_FILENAME
         line = json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n"
-        with path.open("ab") as fh:
-            fh.write(line.encode("utf-8"))
+        fh = self._open_hot_file()
+        fh.write(line.encode("utf-8"))
+        fh.flush()
+
+    def _open_hot_file(self):
+        if self._hot_fh is None or self._hot_fh.closed:
+            path = self.root / HOT_FILENAME
+            path.parent.mkdir(parents=True, exist_ok=True)
+            self._hot_fh = path.open("ab")
+        return self._hot_fh
+
+    def _close_hot_file(self):
+        if getattr(self, "_hot_fh", None) is not None:
+            self._hot_fh.close()
+            self._hot_fh = None
 
     def _maybe_finalize_compaction_locked(self):
         future = self._compact_future

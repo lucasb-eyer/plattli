@@ -36,6 +36,28 @@ class TestDirectWriter(unittest.TestCase):
                 with self.assertRaises(RuntimeError):
                     _replace_text_checked(path, '{"ok":1}', "manifest")
 
+    def test_compacting_hot_append_reuses_open_handle(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_root = Path(tmp) / "run"
+            plattli_root = run_root / "plattli"
+            w = plattli.CompactingWriter(run_root, hotsize=100)
+
+            w.write(loss=1.0)
+            w.end_step()
+            hot_fh = w._hot_fh
+            self.assertIsNotNone(hot_fh)
+            self.assertEqual(hot_fh.mode, "ab")
+
+            w.write(loss=2.0)
+            w.end_step()
+
+            self.assertIs(w._hot_fh, hot_fh)
+            self.assertFalse(hot_fh.closed)
+            self.assertEqual([row["step"] for row in _read_jsonl(plattli_root / "hot.jsonl")], [0, 1])
+
+            w.finish(optimize=False, zip=False)
+            self.assertTrue(hot_fh.closed)
+
     def test_negative_step(self):
         with tempfile.TemporaryDirectory() as tmp:
             run_root = Path(tmp)
