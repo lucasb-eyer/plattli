@@ -1,4 +1,5 @@
 import json
+import os
 import threading
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, wait
@@ -63,12 +64,26 @@ def _replace_text_checked(path, payload, label):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_name(path.name + ".tmp")
-    tmp_path.write_text(payload, encoding="utf-8")
+    with tmp_path.open("w", encoding="utf-8") as fh:  # Do this whole dance to be atomic on NFS.
+        fh.write(payload)
+        fh.flush()
+        os.fsync(fh.fileno())
     if tmp_path.stat().st_size <= 0:
         raise RuntimeError(f"{label} tmp file is empty after write: {tmp_path}")
     tmp_path.replace(path)
+    _fsync_dir(path.parent)  # Again, for NFS-atomicity.
     if path.stat().st_size <= 0:
         raise RuntimeError(f"{label} file is empty after replace: {path}")
+
+
+def _fsync_dir(path):
+    if not hasattr(os, "O_DIRECTORY"):
+        return
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
 
 
 def _write_config(run_root, path, config):
