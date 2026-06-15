@@ -391,8 +391,39 @@ class TestDirectWriter(unittest.TestCase):
             loss_vals = np.fromfile(plattli_root / "loss.f32", dtype=np.float32)
             self.assertTrue(np.allclose(loss_vals, [0.0, 1.0, 2.0]))
             manifest = json.loads((plattli_root / "plattli.json").read_text(encoding="utf-8"))
-            self.assertEqual(manifest["loss"]["indices"], [{"start": 0, "stop": 3, "step": 1}])
+            self.assertEqual(manifest["loss"]["indices"], [{"start": 0, "step": 1}])
             w.finish(optimize=False, zip=False)
+            manifest = json.loads((plattli_root / "plattli.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["loss"]["indices"], [{"start": 0, "stop": 4, "step": 1}])
+
+    def test_contiguous_compaction_keeps_manifest_open(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_root = Path(tmp) / "run"
+            plattli_root = run_root / "plattli"
+            w = plattli.CompactingWriter(run_root, hotsize=2)
+            for step in range(3):
+                w.write(loss=float(step))
+                w.end_step()
+            if w._compact_future:
+                w._compact_future.result()
+            w.write(flush=True)
+            first_manifest = (plattli_root / "plattli.json").read_text(encoding="utf-8")
+
+            for step in range(3, 5):
+                w.write(loss=float(step))
+                w.end_step()
+            if w._compact_future:
+                w._compact_future.result()
+            w.write(flush=True)
+
+            self.assertEqual((plattli_root / "plattli.json").read_text(encoding="utf-8"), first_manifest)
+            with plattli.Reader(run_root) as r:
+                self.assertEqual(r.metric_indices("loss").tolist(), [0, 1, 2, 3, 4])
+                self.assertTrue(np.allclose(r.metric_values("loss"), [0, 1, 2, 3, 4]))
+
+            w.finish(optimize=False, zip=False)
+            manifest = json.loads((plattli_root / "plattli.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["loss"]["indices"], [{"start": 0, "stop": 5, "step": 1}])
 
     def test_monotonic_metadata_compacting(self):
         with tempfile.TemporaryDirectory() as tmp:

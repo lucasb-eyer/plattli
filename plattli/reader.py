@@ -4,7 +4,13 @@ from pathlib import Path
 
 import numpy as np
 
-from ._indices import _segment_values, _segments_count_and_last, _segments_from_spec, _segments_to_array
+from ._indices import (
+    _segments_count_and_last,
+    _segments_from_spec,
+    _segments_have_open_tail,
+    _segments_to_array,
+    _segments_with_counts,
+)
 from .writer import DTYPE_TO_NUMPY, HOT_FILENAME, JSONL_DTYPE
 
 def is_run(path):
@@ -170,18 +176,22 @@ class Reader:
         if isinstance(indices_spec, (list, dict)):
             chunks = []
             offset = 0
-            for segment in _segments_from_spec(indices_spec):
-                seg_start, seg_stop, seg_step = _segment_values(segment)
-                seg_count = min((seg_stop - seg_start + seg_step - 1) // seg_step, max(0, count - offset))
-                if seg_count <= 0:
-                    break
-                left = 0 if start is None else self._ceil_div(int(np.ceil(start - seg_start)), seg_step)
-                right = seg_count if stop is None else int(np.floor((stop - seg_start) / seg_step)) + 1
-                left = min(max(left, 0), seg_count)
-                right = min(max(right, 0), seg_count)
-                if left < right:
-                    chunks.append((offset + left, offset + right))
-                offset += seg_count
+            try:
+                segments = _segments_from_spec(indices_spec)
+                counted = _segments_with_counts(segments, total_count=count if _segments_have_open_tail(segments) else None)
+                for seg_start, raw_count, seg_step, _ in counted:
+                    seg_count = min(raw_count, max(0, count - offset))
+                    if seg_count <= 0:
+                        break
+                    left = 0 if start is None else self._ceil_div(int(np.ceil(start - seg_start)), seg_step)
+                    right = seg_count if stop is None else int(np.floor((stop - seg_start) / seg_step)) + 1
+                    left = min(max(left, 0), seg_count)
+                    right = min(max(right, 0), seg_count)
+                    if left < right:
+                        chunks.append((offset + left, offset + right))
+                    offset += seg_count
+            except (ValueError, RuntimeError) as exc:
+                raise type(exc)(f"{exc} (metric {name}, run {self._run_name})") from exc
             return chunks
         if indices_spec == "indices":
             indices = self._read_indices_file(name, count)
@@ -259,12 +269,11 @@ class Reader:
 
     def _indices_chunks_from_segments(self, indices_spec, chunks):
         segments = _segments_from_spec(indices_spec)
+        total_count = max((stop for _, stop in chunks), default=0) if _segments_have_open_tail(segments) else None
         pieces = []
         for chunk_start, chunk_stop in chunks:
             offset = 0
-            for segment in segments:
-                start, stop, step = _segment_values(segment)
-                count = (stop - start + step - 1) // step
+            for start, count, step, _ in _segments_with_counts(segments, total_count=total_count):
                 left = max(chunk_start - offset, 0)
                 right = min(chunk_stop - offset, count)
                 if left < right:
@@ -400,7 +409,8 @@ class Reader:
         if isinstance(indices_spec, (list, dict)):
             try:
                 segments = _segments_from_spec(indices_spec)
-                return _segments_count_and_last(segments)
+                total_count = self._values_count(name, self._manifest[name]) if _segments_have_open_tail(segments) else None
+                return _segments_count_and_last(segments, total_count=total_count)
             except (ValueError, RuntimeError) as exc:
                 raise type(exc)(f"{exc} (metric {name}, run {self._run_name})") from exc
         if indices_spec == "indices":
@@ -539,7 +549,8 @@ class Reader:
             if isinstance(indices_spec, (list, dict)):
                 try:
                     segments = _segments_from_spec(indices_spec)
-                    count, _ = _segments_count_and_last(segments)
+                    total_count = self._values_count(name, spec) if _segments_have_open_tail(segments) else None
+                    count, _ = _segments_count_and_last(segments, total_count=total_count)
                 except (ValueError, RuntimeError) as exc:
                     raise type(exc)(f"{exc} (metric {name}, run {self._run_name})") from exc
                 if count > max_rows:
@@ -597,9 +608,8 @@ class Reader:
         if isinstance(indices_spec, (list, dict)):
             try:
                 segments = _segments_from_spec(indices_spec)
-                for segment in segments:
-                    start, stop, step = _segment_values(segment)
-                    seg_count = (stop - start + step - 1) // step
+                total_count = values_count if _segments_have_open_tail(segments) else None
+                for start, seg_count, step, _ in _segments_with_counts(segments, total_count=total_count):
                     if idx < seg_count:
                         return count, int(start + idx * step)
                     idx -= seg_count
@@ -645,7 +655,8 @@ class Reader:
         if isinstance(indices_spec, (list, dict)):
             try:
                 segments = _segments_from_spec(indices_spec)
-                indices = _segments_to_array(segments)
+                total_count = values_count if _segments_have_open_tail(segments) else None
+                indices = _segments_to_array(segments, total_count=total_count)
             except (ValueError, RuntimeError) as exc:
                 raise type(exc)(f"{exc} (metric {name}, run {self._run_name})") from exc
             if count < indices.size:

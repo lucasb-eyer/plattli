@@ -199,7 +199,7 @@ JSON object keyed by metric name, plus metadata keys like `run_rows` and `when_e
 ```
 
 Fields:
-- `indices`: `"indices"`, a list of `{start, stop, step}` segments (canonical), or a single `{start, stop, step}` (legacy).
+- `indices`: `"indices"`, a list of `{start, stop, step}` segments (canonical), or a single `{start, stop, step}` (legacy). During live compacting writes, the final segment may omit `stop`; readers derive it from the value file length.
 - `dtype`: one of `f{32,64}`, `{i,u}{8,16,32,64}`, or `jsonl`.
 - `monotonic`: optional `"inc"` or `"dec"` for numeric metrics whose stored values are monotonic; flat-only metrics use `"inc"`.
 - `run_rows`: optional max rows across all metrics (written on `finish` only).
@@ -209,7 +209,8 @@ Fields:
 Raw little-endian uint32 array. Each entry is the step value for that metric
 write. If `optimize=True` during `finish()`, the file may be removed and
 replaced by a list of `{start, stop, step}` segments (canonical) or a single
-`{start, stop, step}` (legacy) in the manifest.
+`{start, stop, step}` (legacy) in the manifest. Live compacted runs may
+omit `stop` from the final segment until `finish()` closes it.
 
 ### Config (`config.json`)
 Arbitrary JSON object (dict), written when a config is provided.

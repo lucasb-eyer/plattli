@@ -13,8 +13,10 @@ from ._indices import (
     _append_step_to_indices_spec,
     _append_steps_to_indices_spec,
     _find_piecewise_params,
+    _segments_close_open_tail,
     _segments_count_and_last,
     _segments_from_spec,
+    _segments_have_open_tail,
     _segments_to_array,
     _segments_too_many,
     _segments_truncate,
@@ -112,6 +114,7 @@ def _write_config(run_root, path, config):
 def _truncate_to_step(root, manifest, step, allow_missing):
     run_name = _run_name_for_root(root)
     for name, spec in manifest.items():
+        dtype = spec["dtype"]
         indices_spec = spec["indices"]
         if indices_spec == "indices":
             idx_path = root / f"{name}.indices"
@@ -126,12 +129,13 @@ def _truncate_to_step(root, manifest, step, allow_missing):
         else:
             try:
                 segments = _segments_from_spec(indices_spec)
-                kept, keep = _segments_truncate(segments, step)
+                total_count = _stored_values_count(root, name, dtype, allow_missing) if _segments_have_open_tail(segments) else None
+                kept, keep = _segments_truncate(segments, step, total_count=total_count)
             except (ValueError, RuntimeError) as exc:
                 raise type(exc)(f"{exc} (metric {name}, run {run_name})") from exc
             spec["indices"] = kept
 
-        if (dtype := spec["dtype"]) == JSONL_DTYPE:
+        if dtype == JSONL_DTYPE:
             path = root / f"{name}.jsonl"
             if not path.exists():
                 if allow_missing:
@@ -167,7 +171,8 @@ def _force_indices_files(root, manifest):
             continue
         try:
             segments = _segments_from_spec(indices_spec)
-            indices = _segments_to_array(segments)
+            total_count = _stored_values_count(root, name, spec["dtype"], allow_missing=False) if _segments_have_open_tail(segments) else None
+            indices = _segments_to_array(segments, total_count=total_count)
         except (ValueError, RuntimeError) as exc:
             raise type(exc)(f"{exc} (metric {name}, run {run_name})") from exc
         idx_path = root / f"{name}.indices"
@@ -192,11 +197,13 @@ def _optimize_indices(root, manifest):
             idx_path.unlink()
 
 
-def _indices_length(root, name, indices_spec):
+def _indices_length(root, name, spec):
+    indices_spec = spec["indices"]
     if isinstance(indices_spec, (dict, list)):
         try:
             segments = _segments_from_spec(indices_spec)
-            total, _ = _segments_count_and_last(segments)
+            total_count = _stored_values_count(root, name, spec["dtype"], allow_missing=False) if _segments_have_open_tail(segments) else None
+            total, _ = _segments_count_and_last(segments, total_count=total_count)
         except (ValueError, RuntimeError) as exc:
             raise type(exc)(f"{exc} (metric {name}, run {_run_name_for_root(root)})") from exc
         return total
@@ -204,6 +211,47 @@ def _indices_length(root, name, indices_spec):
         idx_path = root / f"{name}.indices"
         return idx_path.stat().st_size // 4
     return 0  # pragma: no cover
+
+
+def _stored_values_count(root, name, dtype, allow_missing):
+    if dtype == JSONL_DTYPE:
+        path = root / f"{name}.jsonl"
+        if not path.exists():
+            if allow_missing:
+                return 0
+            raise FileNotFoundError(f"missing values file for {name} in run {_run_name_for_root(root)}")
+        count = 0
+        lines = path.read_bytes().splitlines()
+        for idx, line in enumerate(lines):
+            try:
+                json.loads(line)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                if idx == len(lines) - 1:
+                    break
+                raise
+            count += 1
+        return count
+    path = root / f"{name}.{dtype}"
+    if not path.exists():
+        if allow_missing:
+            return 0
+        raise FileNotFoundError(f"missing values file for {name} in run {_run_name_for_root(root)}")
+    return path.stat().st_size // np.dtype(DTYPE_TO_NUMPY[dtype]).itemsize
+
+
+def _close_open_indices(root, manifest):
+    changed = False
+    for name, spec in manifest.items():
+        indices_spec = spec["indices"]
+        if not isinstance(indices_spec, (dict, list)):
+            continue
+        segments = _segments_from_spec(indices_spec)
+        if not _segments_have_open_tail(segments):
+            continue
+        total_count = _stored_values_count(root, name, spec["dtype"], allow_missing=False)
+        spec["indices"] = _segments_close_open_tail(segments, total_count)
+        changed = True
+    return changed
 
 
 def _coerce_stored_value(value, dtype, name, run_name):
@@ -448,8 +496,9 @@ class DirectWriter:
             _tighten_dtypes(self.root, self._manifest)
             _optimize_indices(self.root, self._manifest)
 
+        _close_open_indices(self.root, self._manifest)
         _write_manifest(self.root / "plattli.json", self._manifest,
-                        run_rows=max(_indices_length(self.root, name, spec["indices"])
+                        run_rows=max(_indices_length(self.root, name, spec)
                                      for name, spec in self._manifest.items()))
 
         if zip:
@@ -624,8 +673,9 @@ class CompactingWriter:
             _tighten_dtypes(self.root, self._manifest)
             _optimize_indices(self.root, self._manifest)
 
+        _close_open_indices(self.root, self._manifest)
         _write_manifest(self.root / "plattli.json", self._manifest,
-                        run_rows=max(_indices_length(self.root, name, spec["indices"])
+                        run_rows=max(_indices_length(self.root, name, spec)
                                      for name, spec in self._manifest.items()))
 
         if zip:
@@ -797,7 +847,6 @@ class CompactingWriter:
                 col["indices"].append(step)
                 col["values"].append(value)
 
-        updated_specs = {}
         run_name = self.run_root.name
         for name, col in columns.items():
             dtype = self._manifest[name]["dtype"]
@@ -807,31 +856,34 @@ class CompactingWriter:
                 _append_indices(self.root / f"{name}.indices", col["indices"])
             else:
                 try:
-                    spec = _append_steps_to_indices_spec(indices_spec, col["indices"])
+                    old_spec = json.dumps(indices_spec, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+                    current_count = _stored_values_count(self.root, name, dtype, allow_missing=True)
+                    spec = _append_steps_to_indices_spec(
+                        indices_spec, col["indices"], count=current_count, open_tail=True
+                    )
+                    new_count = current_count + len(col["indices"])
                 except (ValueError, RuntimeError) as exc:
                     raise type(exc)(f"{exc} (metric {name}, run {run_name})") from exc
-                if _segments_too_many(spec):
+                if _segments_too_many(spec, total_count=new_count):
                     try:
-                        indices = _segments_to_array(spec)
+                        indices = _segments_to_array(spec, total_count=new_count)
                     except (ValueError, RuntimeError) as exc:
                         raise type(exc)(f"{exc} (metric {name}, run {run_name})") from exc
                     idx_path = self.root / f"{name}.indices"
                     idx_path.parent.mkdir(parents=True, exist_ok=True)
                     with idx_path.open("wb") as fh:
                         indices.tofile(fh)
-                    updated_specs[name] = "indices"
-                else:
-                    updated_specs[name] = spec
+                    with self._hot_lock:
+                        self._manifest[name]["indices"] = "indices"
+                        _write_manifest(self.root / "plattli.json", self._manifest)
+                elif json.dumps(spec, ensure_ascii=False, sort_keys=True, separators=(",", ":")) != old_spec:
+                    with self._hot_lock:
+                        self._manifest[name]["indices"] = spec
+                        _write_manifest(self.root / "plattli.json", self._manifest)
             if dtype == JSONL_DTYPE:
                 _append_jsonl(self.root / f"{name}.jsonl", col["values"])
             else:
                 _append_numeric(self.root / f"{name}.{dtype}", col["values"], dtype)
-
-        with self._hot_lock:
-            if updated_specs:
-                for name, spec in updated_specs.items():
-                    self._manifest[name]["indices"] = spec
-                _write_manifest(self.root / "plattli.json", self._manifest)
 
 
 def _find_arange_params(array):

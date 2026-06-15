@@ -11,6 +11,23 @@ from plattli.writer import _zip_path_for_root
 
 
 class TestReader(unittest.TestCase):
+    def test_reader_open_tail_indices(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_root = Path(tmp) / "run"
+            plattli_root = run_root / "plattli"
+            plattli_root.mkdir(parents=True)
+            (plattli_root / "plattli.json").write_text(
+                json.dumps({"loss": {"indices": [{"start": 0, "step": 2}], "dtype": "f32"}}),
+                encoding="utf-8",
+            )
+            np.asarray([1.0, 2.0, 3.0], dtype=np.float32).tofile(plattli_root / "loss.f32")
+
+            with plattli.Reader(run_root) as r:
+                self.assertEqual(r.metric_indices("loss").tolist(), [0, 2, 4])
+                self.assertEqual(r.metric_indices("loss", start=1, stop=3).tolist(), [2])
+                self.assertTrue(np.allclose(r.metric_values("loss", start=1, stop=3), [2.0]))
+                self.assertEqual(r.approx_max_rows(), 3)
+
     def test_reader_piecewise_indices(self):
         with tempfile.TemporaryDirectory() as tmp:
             run_root = Path(tmp) / "run"
