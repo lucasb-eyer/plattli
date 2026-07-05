@@ -91,9 +91,13 @@ Benchmark (2000 steps x 8 metrics, local disk, per-step `write`+`end_step` laten
 - [ ] **jsonl slices re-parse the whole file per chunk**: `_read_value_slice` calls
   `_columnar_values(...)[offset:offset+count]` (reader.py:240) and `_values_count`
   parses it all again. Cache the parsed list per metric on the Reader.
-- [ ] **Any `hot.jsonl` disables the optimized selector path entirely**
+- [x] **Any `hot.jsonl` disables the optimized selector path entirely**
   (`_selector_chunks`, reader.py:351) — live runs, exactly the dashboard-polling case,
-  always fall back to full-read-and-mask. Chunk the columnar part, filter only the hot tail.
+  always fell back to full-read-and-mask. Fixed: `_metric_select` chunks the columnar
+  part as before and filters only the in-memory hot tail (mask for step/value selectors,
+  boundary split for position), then concatenates. Falls back to full-read only for
+  value selectors on non-monotonic metrics, as before. Measured on 2M rows + hot tail:
+  position slice 9.1ms -> 0.06ms, step slice 10.3ms -> 2.6ms, value slice 10.1ms -> 0.16ms.
 - [ ] **No tail fast path**: `metric("loss", idx=-1)` reads the whole column, and
   `_position_slice` rejects negative `istart`/`istop` (reader.py:146), so "last N rows"
   needs a `rows()` round-trip first. Tail reads are the most common dashboard query;

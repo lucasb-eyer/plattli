@@ -3,6 +3,7 @@ import tempfile
 import unittest
 import zipfile
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 
@@ -168,6 +169,38 @@ class TestReader(unittest.TestCase):
                 step, value = r.metric("loss", idx=-1)
                 self.assertEqual(step, 99)
                 self.assertEqual(value, np.float32(99.0))
+
+    def test_selectors_with_hot_use_fast_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_root = Path(tmp) / "run"
+            plattli_root = run_root / "plattli"
+            w = plattli.CompactingWriter(run_root, hotsize=2)
+            for i in range(7):
+                w.write(loss=float(i))
+                w.end_step()
+                if w._compact_future:
+                    w._compact_future.result()
+            # Some rows are compacted to columnar, the rest still live in the hot log.
+            self.assertTrue((plattli_root / "hot.jsonl").exists())
+            self.assertTrue((plattli_root / "loss.f32").exists())
+
+            with plattli.Reader(run_root) as r:
+                with mock.patch.object(r, "_metric_full", side_effect=AssertionError("fell back to full read")):
+                    idx, values = r.metric("loss", start=2, stop=5)
+                    self.assertEqual(idx.tolist(), [2, 3, 4, 5])
+                    self.assertTrue(np.allclose(values, [2, 3, 4, 5]))
+                    idx, values = r.metric("loss", istart=1, istop=6)
+                    self.assertEqual(idx.tolist(), [1, 2, 3, 4, 5])
+                    self.assertTrue(np.allclose(values, [1, 2, 3, 4, 5]))
+                    idx, values = r.metric("loss", vstart=3.0, vstop=5.0)  # loss is monotonic inc
+                    self.assertEqual(idx.tolist(), [3, 4, 5])
+                    self.assertEqual(r.metric_indices("loss", start=4).tolist(), [4, 5, 6])
+                    self.assertEqual(r.metric_values("loss", istart=5).tolist(), [5.0, 6.0])
+                    idx, values = r.metric("loss", istart=3, istop=4)
+                    self.assertEqual((idx.tolist(), values.tolist()), ([3], [3.0]))
+                    idx, values = r.metric("loss", start=10, stop=20)
+                    self.assertEqual(idx.tolist(), [])
+                    self.assertEqual(values.tolist(), [])
 
     def test_reader_rows_hot_only(self):
         with tempfile.TemporaryDirectory() as tmp:

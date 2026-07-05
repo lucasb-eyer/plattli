@@ -351,18 +351,55 @@ class Reader:
                 right = count if vstart is None else first_true(lambda value: value < vstart)
         return [(left, right)] if left < right else []
 
-    def _selector_chunks(self, name, spec, start, stop, istart, istop, vstart, vstop):
-        kind = self._selector_kind(start, stop, istart, istop, vstart, vstop)
-        if kind is None:
-            return None
-        if spec is None or self._ensure_hot():
-            return None
+    def _metric_select(self, name, start, stop, istart, istop, vstart, vstop, want_indices=True, want_values=True):
+        """Selector read as (indices, values): chunked columnar read plus in-memory hot tail.
+
+        Returns None when the selector cannot be resolved to chunks (non-monotonic value
+        selector); the caller then falls back to a full read + filter."""
+        spec = self._metric_spec(name, allow_hot=True)
+        hot_steps, hot_values = self._hot_tail(name, spec)
         count = self._metric_count(name, spec)
+        kind = self._selector_kind(start, stop, istart, istop, vstart, vstop)
         if kind == "position":
-            return self._position_slice(count, istart, istop)
-        if kind == "step":
-            return self._step_chunks_for_spec(name, spec.get("indices"), start, stop, count)
-        return self._monotonic_value_chunks(name, spec, vstart, vstop, count)
+            hot_keep = slice(0, 0)
+            chunks = []
+            for lo, hi in self._position_slice(count + len(hot_values), istart, istop):
+                if lo < count:
+                    chunks.append((lo, min(hi, count)))
+                hot_keep = slice(max(lo - count, 0), max(hi - count, 0))
+        elif kind == "step":
+            chunks = self._step_chunks_for_spec(name, spec.get("indices"), start, stop, count) if spec is not None else []
+            hot_keep = np.ones(len(hot_steps), dtype=bool)
+            if start is not None:
+                hot_keep &= hot_steps >= start
+            if stop is not None:
+                hot_keep &= hot_steps <= stop
+        else:
+            if spec is None:
+                return None
+            chunks = self._monotonic_value_chunks(name, spec, vstart, vstop, count)
+            if chunks is None:
+                return None
+            hot_arr = np.asarray(hot_values, dtype=DTYPE_TO_NUMPY[spec["dtype"]])
+            hot_keep = np.ones(len(hot_arr), dtype=bool)
+            if vstart is not None:
+                hot_keep &= hot_arr >= vstart
+            if vstop is not None:
+                hot_keep &= hot_arr <= vstop
+
+        indices = values = None
+        if want_indices:
+            col = self._columnar_indices_chunks(name, spec, chunks) if spec is not None else np.asarray([], dtype=np.uint32)
+            indices = self._concat([col, hot_steps[hot_keep]], np.uint32)
+        if want_values:
+            np_dtype = object if spec is None or spec.get("dtype") == JSONL_DTYPE else DTYPE_TO_NUMPY[spec["dtype"]]
+            col = self._columnar_values_chunks(name, spec, chunks) if spec is not None else np.asarray([], dtype=np_dtype)
+            if isinstance(hot_keep, slice):
+                hot_sel = hot_values[hot_keep]
+            else:
+                hot_sel = [value for value, keep in zip(hot_values, hot_keep) if keep]
+            values = self._concat([col, np.asarray(hot_sel, dtype=np_dtype)], np_dtype)
+        return indices, values
 
     def _apply_selector(self, indices, values, start, stop, istart, istop, vstart, vstop):
         kind = self._selector_kind(start, stop, istart, istop, vstart, vstop)
@@ -737,6 +774,16 @@ class Reader:
             return np.asarray([], dtype=DTYPE_TO_NUMPY[dtype])
         return np.frombuffer(data, dtype=DTYPE_TO_NUMPY[dtype])
 
+    def _hot_tail(self, name, spec):
+        """Hot rows for this metric beyond the columnar data, as (steps, values list)."""
+        if not self._ensure_hot():
+            return np.asarray([], dtype=np.uint32), []
+        last_step = None
+        if spec is not None:
+            # Cheap: stat + tail peek, not a full indices read.
+            _, last_step = self._columnar_count_and_last_step(name, spec)
+        return self._hot_for_metric(name, last_step)
+
     def _hot_for_metric(self, name, last_step):
         self._ensure_hot()
         col = self._hot_columns.get(name)
@@ -764,13 +811,7 @@ class Reader:
     def _metric_values_full(self, name):
         spec = self._metric_spec(name, allow_hot=True)
         columnar = self._columnar_values(name, spec)
-        if not self._ensure_hot():
-            return columnar
-        last_step = None
-        if spec is not None:
-            # Cheap: stat + tail peek, not a full indices read.
-            _, last_step = self._columnar_count_and_last_step(name, spec)
-        _, hot_values = self._hot_for_metric(name, last_step)
+        _, hot_values = self._hot_tail(name, spec)
         if not hot_values:
             return columnar
         if spec is None or spec.get("dtype") == JSONL_DTYPE:
@@ -790,37 +831,33 @@ class Reader:
     def metric_indices(self, name, start=None, stop=None, istart=None, istop=None, vstart=None, vstop=None):
         if self._selector_kind(start, stop, istart, istop, vstart, vstop) is None:
             return self._metric_indices_full(name)
-        spec = self._metric_spec(name, allow_hot=True)
-        chunks = self._selector_chunks(name, spec, start, stop, istart, istop, vstart, vstop)
-        if chunks is not None:
-            return self._columnar_indices_chunks(name, spec, chunks)
-        indices, values = self._metric_full(name)
-        return self._apply_selector(indices, values, start, stop, istart, istop, vstart, vstop)[0]
+        selected = self._metric_select(name, start, stop, istart, istop, vstart, vstop, want_values=False)
+        if selected is None:
+            indices, values = self._metric_full(name)
+            return self._apply_selector(indices, values, start, stop, istart, istop, vstart, vstop)[0]
+        return selected[0]
 
     def metric_values(self, name, start=None, stop=None, istart=None, istop=None, vstart=None, vstop=None):
         if self._selector_kind(start, stop, istart, istop, vstart, vstop) is None:
             return self._metric_values_full(name)
-        spec = self._metric_spec(name, allow_hot=True)
-        chunks = self._selector_chunks(name, spec, start, stop, istart, istop, vstart, vstop)
-        if chunks is not None:
-            return self._columnar_values_chunks(name, spec, chunks)
-        indices, values = self._metric_full(name)
-        return self._apply_selector(indices, values, start, stop, istart, istop, vstart, vstop)[1]
+        selected = self._metric_select(name, start, stop, istart, istop, vstart, vstop, want_indices=False)
+        if selected is None:
+            indices, values = self._metric_full(name)
+            return self._apply_selector(indices, values, start, stop, istart, istop, vstart, vstop)[1]
+        return selected[1]
 
     def metric(self, name, idx=None, start=None, stop=None, istart=None, istop=None, vstart=None, vstop=None):
         if self._selector_kind(start, stop, istart, istop, vstart, vstop) is None:
             indices, values = self._metric_full(name)
         else:
-            spec = self._metric_spec(name, allow_hot=True)
-            chunks = self._selector_chunks(name, spec, start, stop, istart, istop, vstart, vstop)
-            if chunks is None:
+            selected = self._metric_select(name, start, stop, istart, istop, vstart, vstop)
+            if selected is None:
                 indices, values = self._apply_selector(
                     *self._metric_full(name),
                     start, stop, istart, istop, vstart, vstop,
                 )
             else:
-                indices = self._columnar_indices_chunks(name, spec, chunks)
-                values = self._columnar_values_chunks(name, spec, chunks)
+                indices, values = selected
         if idx is None:
             return indices, values
         return indices[idx], values[idx]
