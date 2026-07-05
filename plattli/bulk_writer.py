@@ -41,6 +41,8 @@ class PlattliBulkWriter:
                 raise ValueError(f"metric name 'step' is reserved in run {self.run_root.name}")
             if name in self._step_metrics:
                 raise RuntimeError(f"metric already written in step {self.step} for {name} in run {self.run_root.name}")
+            if hasattr(value, "__array__") and np.asarray(value).shape != ():
+                raise ValueError(f"only scalar values are supported for {name} in run {self.run_root.name} (shape {np.asarray(value).shape})")
             bucket = self._columns.get(name)
             if bucket is None:
                 bucket = _ColumnBuffer()
@@ -118,10 +120,15 @@ class PlattliBulkWriter:
                 run_rows = indices.size
 
             if optimize:
-                values = np.asarray(column.v)
+                try:
+                    values = np.asarray(column.v)
+                except ValueError:  # Ragged lists are jsonl values, not a column of scalars.
+                    values = np.asarray([], dtype=object)
+                if values.ndim != 1:  # Equal-length lists stack into a 2d array; they are jsonl values too.
+                    values = np.asarray([], dtype=object)
                 if values.dtype.kind == "f" and all(isinstance(v, float) for v in column.v):
                     values = values.astype(np.float32, copy=False)
-                tightened = _tight_dtype(values)
+                tightened = _tight_dtype(values) if values.size else None
                 if tightened is not None:
                     dtype_tag = f"{tightened.dtype.kind}{tightened.dtype.itemsize * 8}"
                     manifest[name] = {"indices": indices_spec, "dtype": dtype_tag}

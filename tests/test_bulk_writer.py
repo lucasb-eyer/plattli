@@ -92,6 +92,29 @@ class TestPlattliBulkWriter(unittest.TestCase):
                 self.assertIn("note.indices", zf.namelist())
                 self.assertIn("note.jsonl", zf.namelist())
 
+    def test_non_scalar_array_raises(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            w = plattli.PlattliBulkWriter(Path(tmp) / "run")
+            with self.assertRaises(ValueError):
+                w.write(loss=np.asarray([1.0, 2.0]))
+
+    def test_list_values_stay_jsonl(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_root = Path(tmp) / "run"
+            plattli_root = run_root / "plattli"
+            w = plattli.PlattliBulkWriter(run_root)
+            w.write(even=[1.0, 2.0], ragged=[1])
+            w.end_step()
+            w.write(even=[3.0, 4.0], ragged=[2, 3])
+            w.end_step()
+            w.finish(zip=False)  # optimize=True must not flatten lists into a numeric column.
+
+            manifest = json.loads((plattli_root / "plattli.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["even"]["dtype"], "jsonl")
+            self.assertEqual(manifest["ragged"]["dtype"], "jsonl")
+            self.assertEqual(_read_jsonl(plattli_root / "even.jsonl"), [[1.0, 2.0], [3.0, 4.0]])
+            self.assertEqual(_read_jsonl(plattli_root / "ragged.jsonl"), [[1], [2, 3]])
+
     def test_monotonic_metadata(self):
         with tempfile.TemporaryDirectory() as tmp:
             run_root = Path(tmp) / "run"

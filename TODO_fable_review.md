@@ -29,9 +29,11 @@ amplification, and the headline read use case (step-aligned sets of columns) has
 - [ ] **Non-atomic jsonl truncation on resume** (writer.py:153). `_truncate_to_step`
   rewrites jsonl with plain `write_text`; crash mid-resume tears the file. Manifest
   correctly uses `_replace_text_checked`; jsonl should too.
-- [ ] **`PlattliBulkWriter` never validates scalars** (bulk_writer.py:121). A list value
+- [x] **`PlattliBulkWriter` never validates scalars** (bulk_writer.py:121). A list value
   becomes a flattened 2-D array whose length no longer matches the indices — corrupt
-  output, no error. `DirectWriter` checks this; bulk should fail fast too.
+  output, no error. Fixed: non-scalar array-likes now raise at `write()` (matching
+  `DirectWriter`), and the tighten path in `finish()` only fires for 1-d numeric columns,
+  so list values (even/ragged) flow to jsonl like they do in `DirectWriter`.
 
 ## Write-path performance
 
