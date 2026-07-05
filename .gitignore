@@ -11,6 +11,7 @@ plattli/_version.py
 # Virtualenvs
 .venv/
 venv/
+venv314t/
 
 # Test/coverage
 .pytest_cache/

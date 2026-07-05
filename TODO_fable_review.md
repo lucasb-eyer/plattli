@@ -24,11 +24,14 @@ amplification, and the headline read use case (step-aligned sets of columns) has
   `finish` calls raise loudly; recovery = recreate the writer, which heals partial
   compaction on disk via the existing `_truncate_to_step(min_hot_step)` resume path.
   Applied to both `CompactingWriter` and `DirectWriter` (same partial-append hazard).
-- [ ] **Manifest mutations happen outside `_hot_lock`** (writer.py:628, 633 vs 876-882).
-  `write()` inserts specs / flips `monotonic` unlocked while the compaction thread
-  serializes the same dict under the lock. Stress test could not trigger a crash — safe
-  today only because GIL + C json encoder make `{**manifest}`/`json.dumps` atomic. Breaks
-  under free-threaded Python; the lock protects the file write, not the data.
+- [x] **Manifest mutations happen outside `_hot_lock`** (writer.py:628, 633 vs 876-882).
+  `write()` inserted specs / flipped `monotonic` unlocked while the compaction thread
+  serialized the same dict under the lock; the compaction thread also mutated segment
+  lists in place outside the lock. Reproduced on free-threaded 3.14t (RuntimeError:
+  dictionary changed size during iteration, with widened iteration windows). Fixed:
+  `write()` mutates the manifest under `_hot_lock`, and `_compact_rows` snapshots
+  dtype/spec under the lock and mutates a copy of the segments, swapping it in under the
+  lock. Verified: stress clean on 3.14t, full suite passes on GIL and free-threaded builds.
 - [ ] **Non-atomic jsonl truncation on resume** (writer.py:153). `_truncate_to_step`
   rewrites jsonl with plain `write_text`; crash mid-resume tears the file. Manifest
   correctly uses `_replace_text_checked`; jsonl should too.

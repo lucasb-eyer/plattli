@@ -633,25 +633,25 @@ class CompactingWriter:
             raise ValueError(f"step out of uint32 range for run {self.run_root.name}: {self.step}")
 
         new_metric = False
-        for name, value in metrics.items():
-            if name == "step":
-                raise ValueError(f"metric name 'step' is reserved in run {self.run_root.name}")
-            if name in self._step_metrics:
-                raise RuntimeError(f"metric already written in step {self.step} for {name} in run {self.run_root.name}")
-            if name not in self._manifest:
-                dtype = _resolve_dtype(value, name=name, run_name=self.run_root.name)
-                (self.root / name).parent.mkdir(parents=True, exist_ok=True)
-                self._manifest[name] = {"indices": [], "dtype": dtype}
-                new_metric = True
-            else:
-                dtype = self._manifest[name]["dtype"]
-            value = _coerce_stored_value(value, dtype, name, self.run_root.name)
-            new_metric = _track_monotonic_value(self._manifest, self._monotonic, name, value) or new_metric
-            self._current_row[name] = value
-            self._step_metrics.add(name)
+        with self._hot_lock:  # The compaction thread reads and serializes the manifest.
+            for name, value in metrics.items():
+                if name == "step":
+                    raise ValueError(f"metric name 'step' is reserved in run {self.run_root.name}")
+                if name in self._step_metrics:
+                    raise RuntimeError(f"metric already written in step {self.step} for {name} in run {self.run_root.name}")
+                if name not in self._manifest:
+                    dtype = _resolve_dtype(value, name=name, run_name=self.run_root.name)
+                    (self.root / name).parent.mkdir(parents=True, exist_ok=True)
+                    self._manifest[name] = {"indices": [], "dtype": dtype}
+                    new_metric = True
+                else:
+                    dtype = self._manifest[name]["dtype"]
+                value = _coerce_stored_value(value, dtype, name, self.run_root.name)
+                new_metric = _track_monotonic_value(self._manifest, self._monotonic, name, value) or new_metric
+                self._current_row[name] = value
+                self._step_metrics.add(name)
 
-        if new_metric:
-            with self._hot_lock:
+            if new_metric:
                 _write_manifest(self.root / "plattli.json", self._manifest)
         if flush:
             self._flush_hot()
@@ -865,9 +865,14 @@ class CompactingWriter:
 
         run_name = self.run_root.name
         for name, col in columns.items():
-            dtype = self._manifest[name]["dtype"]
+            with self._hot_lock:
+                dtype = self._manifest[name]["dtype"]
+                indices_spec = self._manifest[name]["indices"]
+                if indices_spec != "indices":
+                    # The append helpers mutate segments in place; work on a copy so the
+                    # live manifest only ever changes under the lock.
+                    indices_spec = [dict(seg) for seg in _segments_from_spec(indices_spec)]
             (self.root / name).parent.mkdir(parents=True, exist_ok=True)
-            indices_spec = self._manifest[name]["indices"]
             if indices_spec == "indices":
                 _append_indices(self.root / f"{name}.indices", col["indices"])
             else:
