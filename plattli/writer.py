@@ -692,7 +692,6 @@ class CompactingWriter:
         hot_path = self.root / HOT_FILENAME
         if not hot_path.exists():
             return
-        step_row = None
         new_metric = False
         rewrite_hot = False
         min_hot_step = None
@@ -707,16 +706,13 @@ class CompactingWriter:
                     break
                 raise
             row_step = int(row["step"])
-            if row_step >= self.step:
+            if row_step >= self.step:  # Resuming at step N nukes N and everything beyond.
                 rewrite_hot = True
                 continue
             if min_hot_step is None or row_step < min_hot_step:
                 min_hot_step = row_step
-            if row_step == self.step:
-                step_row = row
-            else:
-                self._hot_index[row_step] = len(self._hot_rows)
-                self._hot_rows.append(row)
+            self._hot_index[row_step] = len(self._hot_rows)
+            self._hot_rows.append(row)
             for name, value in row.items():
                 if name == "step":
                     continue
@@ -725,11 +721,6 @@ class CompactingWriter:
                     (self.root / name).parent.mkdir(parents=True, exist_ok=True)
                     self._manifest[name] = {"indices": [], "dtype": dtype}
                     new_metric = True
-        if step_row is not None:
-            self._hot_index[self.step] = len(self._hot_rows)
-            self._hot_rows.append(step_row)
-            self._current_row = {k: v for k, v in step_row.items() if k != "step"}
-            self._step_metrics = set(self._current_row.keys())
         if rewrite_hot:
             self._write_hot_file()
         if min_hot_step is not None:

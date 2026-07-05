@@ -25,7 +25,7 @@ Make live writes fast on Lustre without losing column-friendly reads. Keep the e
   - `DirectWriter(...)` => direct columnar writes (no hot file).
   - `CompactingWriter(..., hotsize=...)` => hot mode + background compaction.
   - `CompactingWriter.write(**metrics, flush=False)`; `write({}, flush=True)` flushes without incrementing.
-- **Crash recovery**: on init, if `hot.jsonl` exists, load it into memory. If the last hot row matches the current `step`, treat it as the current in-progress row.
+- **Crash recovery**: on init, if `hot.jsonl` exists, load it into memory. Rows at or beyond the resume `step` are discarded: resuming at step N truncates N and everything beyond, and writing starts with a fresh step N.
 - **Reader merge**: read columnar first, then merge hot rows that have `step > last_columnar_step` for that metric.
 
 ## Incremental changes
