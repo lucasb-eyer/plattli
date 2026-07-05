@@ -141,16 +141,14 @@ def _truncate_to_step(root, manifest, step, allow_missing):
                 if allow_missing:
                     continue
                 raise FileNotFoundError(f"missing values file for {name} in run {run_name}")
-            if keep <= 0:
-                path.write_text("", encoding="utf-8")
-                continue
-            lines = []
-            with path.open("r", encoding="utf-8") as fh:
-                for line in fh:
-                    if len(lines) >= keep:
+            offset = 0
+            with path.open("rb") as fh:  # Truncate in place (atomic), like the numeric branch.
+                for count, line in enumerate(fh):
+                    if count >= keep:
                         break
-                    lines.append(line.rstrip("\n"))
-            path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+                    offset += len(line)
+            with path.open("r+b") as fh:
+                fh.truncate(offset)
         else:
             value_path = root / f"{name}.{dtype}"
             if not value_path.exists():

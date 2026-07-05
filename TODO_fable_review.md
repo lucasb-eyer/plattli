@@ -32,9 +32,10 @@ amplification, and the headline read use case (step-aligned sets of columns) has
   `write()` mutates the manifest under `_hot_lock`, and `_compact_rows` snapshots
   dtype/spec under the lock and mutates a copy of the segments, swapping it in under the
   lock. Verified: stress clean on 3.14t, full suite passes on GIL and free-threaded builds.
-- [ ] **Non-atomic jsonl truncation on resume** (writer.py:153). `_truncate_to_step`
-  rewrites jsonl with plain `write_text`; crash mid-resume tears the file. Manifest
-  correctly uses `_replace_text_checked`; jsonl should too.
+- [x] **Non-atomic jsonl truncation on resume** (writer.py:153). `_truncate_to_step`
+  rewrote jsonl with plain `write_text`; crash mid-resume could tear the file. Fixed:
+  jsonl now finds the byte offset of the first dropped line and truncates in place with
+  `ftruncate`, exactly like the numeric branch (atomic, no rewrite).
 - [x] **`PlattliBulkWriter` never validates scalars** (bulk_writer.py:121). A list value
   becomes a flattened 2-D array whose length no longer matches the indices — corrupt
   output, no error. Fixed: non-scalar array-likes now raise at `write()` (matching
