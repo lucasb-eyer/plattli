@@ -429,6 +429,7 @@ class DirectWriter:
         self._futures = []
         self._step_metrics = set()
         self._monotonic = {}
+        self._broken = None
 
         if (self.root / "plattli.json").exists():
             self._manifest = json.loads((self.root / "plattli.json").read_text(encoding="utf-8"))
@@ -444,6 +445,7 @@ class DirectWriter:
         self.set_config(config)
 
     def write(self, **metrics):
+        self._check_broken()
         self._drain_errors()
         if not metrics:
             return
@@ -470,13 +472,18 @@ class DirectWriter:
             if self._executor:
                 self._futures.append(self._executor.submit(self._write_entry, name, dtype, value, self.step, write_indices))
             else:
-                self._write_entry(name, dtype, value, self.step, write_indices)
+                try:
+                    self._write_entry(name, dtype, value, self.step, write_indices)
+                except Exception as err:
+                    self._broken = err
+                    raise
             self._step_metrics.add(name)
 
         if new_metric:
             _write_manifest(self.root / "plattli.json", self._manifest)
 
     def end_step(self):
+        self._check_broken()
         wait(self._futures)
         self._drain_errors()
         self._flush_step_indices()
@@ -484,6 +491,7 @@ class DirectWriter:
         self.step += 1
 
     def finish(self, optimize=True, zip=True):
+        self._check_broken()
         if not self._manifest:
             return
 
@@ -541,10 +549,16 @@ class DirectWriter:
         for f in self._futures:
             if f.done():
                 if (err := f.exception()) is not None:
+                    self._broken = err
                     raise err
             else:
                 remaining.append(f)
         self._futures = remaining
+
+    def _check_broken(self):
+        if self._broken is not None:
+            raise RuntimeError(f"writer for run {self.run_root.name} is broken after an earlier write error;"
+                               " the on-disk state may be partial, recreate the writer to resume") from self._broken
 
 
 class CompactingWriter:
@@ -571,6 +585,7 @@ class CompactingWriter:
         self._compact_steps = set()
         self._step_metrics = set()
         self._monotonic = {}
+        self._broken = None
 
         self._hot_rows = []
         self._hot_index = {}
@@ -597,6 +612,7 @@ class CompactingWriter:
         self._close_hot_file()
 
     def write(self, metrics=None, flush=False, **kwargs):
+        self._check_broken()
         self._drain_errors()
         if metrics is None:
             metrics = {}
@@ -641,6 +657,7 @@ class CompactingWriter:
             self._flush_hot()
 
     def end_step(self):
+        self._check_broken()
         if self._current_row or self.step in self._hot_index:
             self._flush_hot()
         self._step_metrics.clear()
@@ -648,6 +665,7 @@ class CompactingWriter:
         self.step += 1
 
     def finish(self, optimize=True, zip=True):
+        self._check_broken()
         if not self._manifest:
             return
 
@@ -738,7 +756,13 @@ class CompactingWriter:
                 with self._hot_lock:
                     self._compact_future = None
                     self._compact_steps = set()
+                self._broken = err
                 raise err
+
+    def _check_broken(self):
+        if self._broken is not None:
+            raise RuntimeError(f"writer for run {self.run_root.name} is broken after an earlier compaction error;"
+                               " the on-disk state may be partial, recreate the writer to resume") from self._broken
 
     def _flush_hot(self):
         append_row = None
@@ -808,6 +832,7 @@ class CompactingWriter:
         if (err := future.exception()) is not None:
             self._compact_future = None
             self._compact_steps = set()
+            self._broken = err
             raise err
         if self._compact_steps:
             steps = self._compact_steps

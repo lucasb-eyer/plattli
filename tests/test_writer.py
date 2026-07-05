@@ -2,6 +2,7 @@ import json
 import tempfile
 import unittest
 import zipfile
+from concurrent.futures import wait
 from pathlib import Path
 from unittest import mock
 
@@ -35,6 +36,44 @@ class TestDirectWriter(unittest.TestCase):
             with mock.patch("pathlib.Path.replace", fake_replace):
                 with self.assertRaises(RuntimeError):
                     _replace_text_checked(path, '{"ok":1}', "manifest")
+
+    def test_direct_write_error_poisons_writer(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_root = Path(tmp) / "run"
+            w = plattli.DirectWriter(run_root)
+            w.write(loss=1.0)
+            w.end_step()
+            values_path = run_root / "plattli" / "loss.f32"
+            values_path.unlink()
+            values_path.mkdir()  # Make the background append fail.
+            w.write(loss=2.0)
+            with self.assertRaises(IsADirectoryError):
+                w.end_step()
+            with self.assertRaises(RuntimeError):
+                w.write(loss=3.0)
+            with self.assertRaises(RuntimeError):
+                w.end_step()
+            with self.assertRaises(RuntimeError):
+                w.finish()
+
+    def test_compacting_compaction_error_poisons_writer(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_root = Path(tmp) / "run"
+            w = plattli.CompactingWriter(run_root, hotsize=1)
+            w.write(loss=1.0)
+            w.end_step()
+            (run_root / "plattli" / "loss.f32").mkdir()  # Make compaction fail.
+            w.write(loss=2.0)
+            w.end_step()  # Triggers compaction of step 0 in the background.
+            wait([w._compact_future])
+            with self.assertRaises(IsADirectoryError):
+                w.write(loss=3.0)
+            with self.assertRaises(RuntimeError):
+                w.write(loss=4.0)
+            with self.assertRaises(RuntimeError):
+                w.end_step()
+            with self.assertRaises(RuntimeError):
+                w.finish()
 
     def test_compacting_hot_append_reuses_open_handle(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -16,11 +16,14 @@ amplification, and the headline read use case (step-aligned sets of columns) has
   the `_current_row`/`_step_metrics` restoration below it unreachable. Decision: keep the
   simple no-special-case semantics — resuming at step N nukes N and everything beyond,
   writing starts with a fresh step N. Dead code deleted, v2_plan.md amended.
-- [ ] **In-process duplicate rows after a compaction error** (writer.py:742-750, 836-886).
+- [x] **In-process duplicate rows after a compaction error** (writer.py:742-750, 836-886).
   `_compact_rows` appends metric-by-metric; on partial failure `_drain_errors` raises and
   clears `_compact_steps` but rows stay in `_hot_rows`. If the caller catches and keeps
-  writing, the next compaction re-appends already-written values. The on-disk resume path
-  heals this via `_truncate_to_step(min_hot_step)`; the same-process path doesn't.
+  writing, the next compaction re-appends already-written values. Fixed by poisoning the
+  writer: after any background write/compaction error, all further `write`/`end_step`/
+  `finish` calls raise loudly; recovery = recreate the writer, which heals partial
+  compaction on disk via the existing `_truncate_to_step(min_hot_step)` resume path.
+  Applied to both `CompactingWriter` and `DirectWriter` (same partial-append hazard).
 - [ ] **Manifest mutations happen outside `_hot_lock`** (writer.py:628, 633 vs 876-882).
   `write()` inserts specs / flips `monotonic` unlocked while the compaction thread
   serializes the same dict under the lock. Stress test could not trigger a crash — safe
