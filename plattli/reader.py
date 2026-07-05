@@ -122,6 +122,16 @@ class Reader:
             return self._zip.read(name)
         return (self.root / name).read_bytes()
 
+    def _read_zip_slice(self, name, offset, size):
+        # Members are ZIP_STORED, so seeking is O(1); never read more than asked for.
+        with self._zip.open(name) as fh:
+            if offset:
+                fh.seek(offset)
+            return fh.read(size)
+
+    def _zip_member_size(self, name):
+        return self._zip.getinfo(name).file_size
+
     def _trim_size(self, size, unit):
         if size <= 0:
             return 0
@@ -153,11 +163,11 @@ class Reader:
 
     def _read_indices_file(self, name, count):
         if self.kind == "zip":
-            data = self._read_bytes(f"{name}.indices")
+            data = self._read_zip_slice(f"{name}.indices", 0, count * 4)
             data = data[:self._trim_size(len(data), 4)]
             if not data:
                 return np.asarray([], dtype=np.uint32)
-            return np.frombuffer(data[:count * 4], dtype=np.uint32)
+            return np.frombuffer(data, dtype=np.uint32)
         path = self.root / f"{name}.indices"
         if not path.exists():
             if self._ensure_hot():
@@ -212,8 +222,7 @@ class Reader:
         if count <= 0:
             return np.asarray([], dtype=np.uint32)
         if self.kind == "zip":
-            data = self._read_bytes(f"{name}.indices")
-            data = data[offset * 4:(offset + count) * 4]
+            data = self._read_zip_slice(f"{name}.indices", offset * 4, count * 4)
         else:
             path = self.root / f"{name}.indices"
             if not path.exists():
@@ -243,8 +252,7 @@ class Reader:
         target = DTYPE_TO_NUMPY[dtype]
         itemsize = np.dtype(target).itemsize
         if self.kind == "zip":
-            data = self._read_bytes(f"{name}.{dtype}")
-            data = data[offset * itemsize:(offset + count) * itemsize]
+            data = self._read_zip_slice(f"{name}.{dtype}", offset * itemsize, count * itemsize)
         else:
             path = self.root / f"{name}.{dtype}"
             if not path.exists():
@@ -415,12 +423,11 @@ class Reader:
                 raise type(exc)(f"{exc} (metric {name}, run {self._run_name})") from exc
         if indices_spec == "indices":
             if self.kind == "zip":
-                data = self._read_bytes(f"{name}.indices")
-                valid = self._trim_size(len(data), 4)
+                valid = self._trim_size(self._zip_member_size(f"{name}.indices"), 4)
                 count = valid // 4
                 if count == 0:
                     return 0, None
-                last = int(np.frombuffer(data[valid - 4:valid], dtype=np.uint32)[0])
+                last = int(np.frombuffer(self._read_zip_slice(f"{name}.indices", valid - 4, 4), dtype=np.uint32)[0])
                 return count, last
             path = self.root / f"{name}.indices"
             if not path.exists():
@@ -446,9 +453,7 @@ class Reader:
             raise ValueError(f"unsupported dtype for {name} in run {self._run_name}: {dtype}")
         itemsize = np.dtype(DTYPE_TO_NUMPY[dtype]).itemsize
         if self.kind == "zip":
-            data = self._read_bytes(f"{name}.{dtype}")
-            valid = self._trim_size(len(data), itemsize)
-            return valid // itemsize
+            return self._trim_size(self._zip_member_size(f"{name}.{dtype}"), itemsize) // itemsize
         path = self.root / f"{name}.{dtype}"
         if not path.exists():
             if self._ensure_hot():
@@ -618,12 +623,11 @@ class Reader:
             raise RuntimeError(f"indices spec shorter than expected for {name} in run {self._run_name}")
         if indices_spec == "indices":
             if self.kind == "zip":
-                data = self._read_bytes(f"{name}.indices")
-                valid = self._trim_size(len(data), 4)
+                valid = self._trim_size(self._zip_member_size(f"{name}.indices"), 4)
                 offset = idx * 4
                 if offset + 4 > valid:
                     return count, indices_last
-                last_step = int(np.frombuffer(data[offset:offset + 4], dtype=np.uint32)[0])
+                last_step = int(np.frombuffer(self._read_zip_slice(f"{name}.indices", offset, 4), dtype=np.uint32)[0])
                 return count, last_step
             path = self.root / f"{name}.indices"
             if not path.exists():
@@ -664,13 +668,11 @@ class Reader:
             return indices
         if indices_spec == "indices":
             if self.kind == "zip":
-                data = self._read_bytes(f"{name}.indices")
-                valid = self._trim_size(len(data), 4)
-                max_count = valid // 4
-                count = min(count, max_count)
+                valid = self._trim_size(self._zip_member_size(f"{name}.indices"), 4)
+                count = min(count, valid // 4)
                 if count <= 0:
                     return np.asarray([], dtype=np.uint32)
-                return np.frombuffer(data[:count * 4], dtype=np.uint32)
+                return np.frombuffer(self._read_zip_slice(f"{name}.indices", 0, count * 4), dtype=np.uint32)
             path = self.root / f"{name}.indices"
             if not path.exists():
                 if self._ensure_hot():
@@ -718,13 +720,11 @@ class Reader:
             return np.asarray([], dtype=DTYPE_TO_NUMPY[dtype])
         itemsize = np.dtype(DTYPE_TO_NUMPY[dtype]).itemsize
         if self.kind == "zip":
-            data = self._read_bytes(f"{name}.{dtype}")
-            valid = self._trim_size(len(data), itemsize)
-            max_count = valid // itemsize
-            count = min(count, max_count)
+            valid = self._trim_size(self._zip_member_size(f"{name}.{dtype}"), itemsize)
+            count = min(count, valid // itemsize)
             if count <= 0:
                 return np.asarray([], dtype=DTYPE_TO_NUMPY[dtype])
-            return np.frombuffer(data[:count * itemsize], dtype=DTYPE_TO_NUMPY[dtype])
+            return np.frombuffer(self._read_zip_slice(f"{name}.{dtype}", 0, count * itemsize), dtype=DTYPE_TO_NUMPY[dtype])
         path = self.root / f"{name}.{dtype}"
         if not path.exists():
             if self._ensure_hot():
@@ -764,11 +764,12 @@ class Reader:
     def _metric_values_full(self, name):
         spec = self._metric_spec(name, allow_hot=True)
         columnar = self._columnar_values(name, spec)
+        if not self._ensure_hot():
+            return columnar
         last_step = None
         if spec is not None:
-            indices = self._columnar_indices(name, spec)
-            if indices.size:
-                last_step = int(indices[-1])
+            # Cheap: stat + tail peek, not a full indices read.
+            _, last_step = self._columnar_count_and_last_step(name, spec)
         _, hot_values = self._hot_for_metric(name, last_step)
         if not hot_values:
             return columnar

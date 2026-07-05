@@ -149,6 +149,26 @@ class TestReader(unittest.TestCase):
                 self.assertEqual(r.metric_indices("loss").tolist(), steps)
                 self.assertTrue(np.allclose(r.metric_values("loss"), np.asarray(steps, dtype=np.float32)))
 
+    def test_zip_slice_reads(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_root = Path(tmp) / "run"
+            w = plattli.DirectWriter(run_root, write_threads=0)
+            for i in range(100):
+                w.write(loss=float(i))
+                w.end_step()
+            w.finish(optimize=False, zip=True)  # Keep .indices files so zip seek-slicing is exercised.
+
+            with plattli.Reader(run_root) as r:
+                idx, values = r.metric("loss", istart=40, istop=45)
+                self.assertEqual(idx.tolist(), [40, 41, 42, 43, 44])
+                self.assertTrue(np.allclose(values, [40, 41, 42, 43, 44]))
+                idx, values = r.metric("loss", start=90, stop=94)
+                self.assertEqual(idx.tolist(), [90, 91, 92, 93, 94])
+                self.assertTrue(np.allclose(values, [90, 91, 92, 93, 94]))
+                step, value = r.metric("loss", idx=-1)
+                self.assertEqual(step, 99)
+                self.assertEqual(value, np.float32(99.0))
+
     def test_reader_rows_hot_only(self):
         with tempfile.TemporaryDirectory() as tmp:
             run_root = Path(tmp) / "run"

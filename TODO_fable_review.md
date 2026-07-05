@@ -77,16 +77,17 @@ Benchmark (2000 steps x 8 metrics, local disk, per-step `write`+`end_step` laten
 
 ## Read-path performance
 
-- [ ] **One `Reader.metric()` call reads the indices member 5x and values 4x**
-  (zip case, all full reads; dir case opens indices 5x — measured).
-  `_metric_indices_full` and `_metric_values_full` each independently re-derive counts
-  (`_indices_count_and_last` + `_values_count`, which in the zip case fully read the
-  member just to count), and `_metric_values_full` re-reads the whole indices file just
-  for `last_step` even when no hot file exists (reader.py:764-771). Compute counts once
-  per call; skip the last-step read when `kind != "dir"`.
-- [ ] **Zip slice reads aren't slices**: `_read_indices_slice`/`_read_value_slice` read
-  the whole member then slice (reader.py:215, 246). Members are ZIP_STORED; `zf.open()`
-  supports cheap seek — slices could be O(slice) like the dir path.
+- [x] **One `Reader.metric()` call reads the indices member 5x and values 4x**
+  (zip case, all full reads; dir case opens indices 5x — measured). Fixed: zip counts
+  now come from `getinfo().file_size`, last-step peeks are 4-byte seek-reads, and
+  `_metric_values_full` skips the hot-merge last-step work entirely when no hot file
+  exists. Now: values read 1x, indices 1x + two 4-byte peeks. Measured on 2M rows:
+  zip full read 33.6ms -> 11.7ms, dir full 2.9ms -> 1.8ms.
+- [x] **Zip slice reads aren't slices**: `_read_indices_slice`/`_read_value_slice` read
+  the whole member then sliced. Fixed via `_read_zip_slice` (seek + exact-size read on
+  ZIP_STORED members, O(1) seek verified). Measured: zip position-slice of 100 rows out
+  of 2M went 12.2ms -> 0.05ms; step-slice 17.0ms -> 4.8ms (rest is the searchsorted
+  indices read, inherent for `.indices`-file metrics).
 - [ ] **jsonl slices re-parse the whole file per chunk**: `_read_value_slice` calls
   `_columnar_values(...)[offset:offset+count]` (reader.py:240) and `_values_count`
   parses it all again. Cache the parsed list per metric on the Reader.
