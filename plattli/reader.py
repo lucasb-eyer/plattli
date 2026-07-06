@@ -11,7 +11,7 @@ from ._indices import (
     _segments_to_array,
     _segments_with_counts,
 )
-from .writer import DTYPE_TO_NUMPY, HOT_FILENAME, JSONL_DTYPE
+from .writer import DTYPE_TO_NUMPY, HOT_COMPACTING_FILENAME, HOT_FILENAME, JSONL_DTYPE
 
 def is_run(path):
     kind, _, zf = _resolve_plattli(path)
@@ -536,23 +536,28 @@ class Reader:
         if self._hot_columns is not None:
             return self._hot_has_file
         self._hot_columns = {}
+        self._hot_has_file = False
         if self.kind != "dir":
-            self._hot_has_file = False
             return False
-        hot_path = self.root / HOT_FILENAME
-        self._hot_has_file = hot_path.exists()
-        if not self._hot_has_file:
-            return False
-        data = hot_path.read_bytes()
-        lines = data.splitlines()
-        for idx, line in enumerate(lines):
+        rows = {}
+        for filename in (HOT_COMPACTING_FILENAME, HOT_FILENAME):
+            hot_path = self.root / filename
+            if not hot_path.exists():
+                continue
             try:
-                row = json.loads(line)
-            except (json.JSONDecodeError, UnicodeDecodeError):
-                if idx == len(lines) - 1:
-                    break
-                raise
-            step = int(row["step"])
+                lines = hot_path.read_bytes().splitlines()
+            except FileNotFoundError:
+                continue  # A completed compaction may unlink its transient file here.
+            self._hot_has_file = True
+            for idx, line in enumerate(lines):
+                try:
+                    row = json.loads(line)
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    if idx == len(lines) - 1:
+                        break
+                    raise
+                rows[int(row["step"])] = row  # On overlap, the active hot file wins.
+        for step, row in rows.items():
             for name, value in row.items():
                 if name == "step":
                     continue
@@ -562,7 +567,7 @@ class Reader:
                     self._hot_columns[name] = col
                 col["indices"].append(step)
                 col["values"].append(value)
-        return True
+        return self._hot_has_file
 
     def _metric_spec(self, name, allow_hot=False):
         self._ensure_manifest()

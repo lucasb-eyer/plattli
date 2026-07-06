@@ -37,6 +37,7 @@ DTYPE_TO_NUMPY = {
 
 JSONL_DTYPE = "jsonl"
 HOT_FILENAME = "hot.jsonl"
+HOT_COMPACTING_FILENAME = "hot.compacting.jsonl"
 
 
 def _zip_path_for_root(root):
@@ -580,7 +581,6 @@ class CompactingWriter:
         self._manifest = {}
         self._compact_executor = ThreadPoolExecutor(max_workers=1)
         self._compact_future = None
-        self._compact_steps = set()
         self._step_metrics = set()
         self._monotonic = {}
         self._broken = None
@@ -706,27 +706,33 @@ class CompactingWriter:
 
     def _load_hot_rows(self):
         hot_path = self.root / HOT_FILENAME
-        if not hot_path.exists():
+        compacting_path = self.root / HOT_COMPACTING_FILENAME
+        rewrite_hot = compacting_path.exists()  # Consolidate a leftover rotation into one file.
+        if not hot_path.exists() and not rewrite_hot:
             return
         new_metric = False
-        rewrite_hot = False
         min_hot_step = None
-        data = hot_path.read_bytes()
-        lines = data.splitlines()
-        for idx, line in enumerate(lines):
-            try:
-                row = json.loads(line)
-            except (json.JSONDecodeError, UnicodeDecodeError):
-                if idx == len(lines) - 1:
-                    rewrite_hot = True
-                    break
-                raise
-            row_step = int(row["step"])
-            if row_step >= self.step:  # Resuming at step N nukes N and everything beyond.
-                rewrite_hot = True
+        rows = {}
+        for path in (compacting_path, hot_path):
+            if not path.exists():
                 continue
-            if min_hot_step is None or row_step < min_hot_step:
-                min_hot_step = row_step
+            lines = path.read_bytes().splitlines()
+            for idx, line in enumerate(lines):
+                try:
+                    row = json.loads(line)
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    if idx == len(lines) - 1:
+                        rewrite_hot = True
+                        break
+                    raise
+                row_step = int(row["step"])
+                if row_step >= self.step:  # Resuming at step N nukes N and everything beyond.
+                    rewrite_hot = True
+                    continue
+                rows[row_step] = row  # On overlap, the active hot file wins.
+                if min_hot_step is None or row_step < min_hot_step:
+                    min_hot_step = row_step
+        for row_step, row in rows.items():
             self._hot_index[row_step] = len(self._hot_rows)
             self._hot_rows.append(row)
             for name, value in row.items():
@@ -739,6 +745,8 @@ class CompactingWriter:
                     new_metric = True
         if rewrite_hot:
             self._write_hot_file()
+        if compacting_path.exists():
+            compacting_path.unlink()
         if min_hot_step is not None:
             _truncate_to_step(self.root, self._manifest, min_hot_step, allow_missing=True)
             new_metric = False
@@ -753,7 +761,6 @@ class CompactingWriter:
             if (err := self._compact_future.exception()) is not None:
                 with self._hot_lock:
                     self._compact_future = None
-                    self._compact_steps = set()
                 self._broken = err
                 raise err
 
@@ -763,24 +770,39 @@ class CompactingWriter:
                                " the on-disk state may be partial, recreate the writer to resume") from self._broken
 
     def _flush_hot(self):
-        append_row = None
-        rewrite = False
         with self._hot_lock:
+            self._maybe_finalize_compaction_locked()
+            if self._compact_future is None and (batch := self._rotate_hot_locked()):
+                self._compact_future = self._compact_executor.submit(self._compact_batch, batch)
             if self._current_row:
                 mode, append_row = self._upsert_hot_row(self.step, self._current_row)
-                rewrite = mode == "rewrite"
-            if self._maybe_finalize_compaction_locked():
-                rewrite = True
-                append_row = None
-            if rewrite:
-                self._write_hot_file()
-            elif append_row is not None:
-                self._append_hot_row(append_row)
-            if self._compact_future is None:
-                batch = self._compact_batch_locked()
-                if batch:
-                    self._compact_steps = {int(row["step"]) for row in batch}
-                    self._compact_future = self._compact_executor.submit(self._compact_rows, batch)
+                if mode == "rewrite":
+                    self._write_hot_file()
+                elif append_row is not None:
+                    self._append_hot_row(append_row)
+
+    def _rotate_hot_locked(self):
+        batch = [row for row in self._hot_rows if row["step"] < self.step]
+        if len(batch) < self.hotsize:
+            return []
+        batch.sort(key=lambda row: row["step"])
+        # Rotate instead of rewriting: rename is a cheap metadata op, and compaction can
+        # later just unlink the rotated file. A rewrite would fsync under the lock and
+        # stall the writing thread.
+        self._close_hot_file()
+        (self.root / HOT_FILENAME).rename(self.root / HOT_COMPACTING_FILENAME)
+        batch_steps = {row["step"] for row in batch}
+        self._hot_rows = [row for row in self._hot_rows if row["step"] not in batch_steps]
+        self._hot_index = {row["step"]: idx for idx, row in enumerate(self._hot_rows)}
+        if self._hot_rows:
+            # Rare (mid-step flush): non-batch rows were in the rotated file too; keep
+            # them durable in the fresh hot log before the rotated file goes away.
+            self._write_hot_file()
+        return batch
+
+    def _compact_batch(self, rows):
+        self._compact_rows(rows)
+        (self.root / HOT_COMPACTING_FILENAME).unlink()
 
     def _upsert_hot_row(self, step, row):
         payload = {"step": int(step)}
@@ -826,26 +848,11 @@ class CompactingWriter:
     def _maybe_finalize_compaction_locked(self):
         future = self._compact_future
         if future is None or not future.done():
-            return False
+            return
+        self._compact_future = None
         if (err := future.exception()) is not None:
-            self._compact_future = None
-            self._compact_steps = set()
             self._broken = err
             raise err
-        if self._compact_steps:
-            steps = self._compact_steps
-            self._hot_rows = [row for row in self._hot_rows if row["step"] not in steps]
-            self._hot_index = {row["step"]: idx for idx, row in enumerate(self._hot_rows)}
-            self._compact_steps = set()
-        self._compact_future = None
-        return True
-
-    def _compact_batch_locked(self):
-        completed = [row for row in self._hot_rows if row["step"] < self.step]
-        if len(completed) < self.hotsize:
-            return []
-        completed.sort(key=lambda row: row["step"])
-        return completed[:self.hotsize]
 
     def _compact_rows(self, rows):
         columns = {}

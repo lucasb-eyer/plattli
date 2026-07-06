@@ -75,6 +75,59 @@ class TestDirectWriter(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 w.finish()
 
+    def test_compacting_rotates_hot_log(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_root = Path(tmp) / "run"
+            plattli_root = run_root / "plattli"
+            w = plattli.CompactingWriter(run_root, hotsize=2)
+            for i in range(5):
+                w.write(loss=float(i))
+                w.end_step()
+                if w._compact_future:
+                    w._compact_future.result()
+            w.write(flush=True)
+
+            # Compacted batches are dropped by unlinking the rotated file, never rewritten.
+            self.assertFalse((plattli_root / "hot.compacting.jsonl").exists())
+            hot_steps = [row["step"] for row in _read_jsonl(plattli_root / "hot.jsonl")]
+            self.assertLess(len(hot_steps), 5)
+            with plattli.Reader(run_root) as r:
+                idx, values = r.metric("loss")
+                self.assertEqual(idx.tolist(), [0, 1, 2, 3, 4])
+                self.assertTrue(np.allclose(values, [0, 1, 2, 3, 4]))
+
+    def test_compacting_resume_with_leftover_rotation(self):
+        # Simulates a crash between rotation and the unlink of the rotated file.
+        with tempfile.TemporaryDirectory() as tmp:
+            run_root = Path(tmp) / "run"
+            plattli_root = run_root / "plattli"
+            plattli_root.mkdir(parents=True)
+            (plattli_root / "plattli.json").write_text(
+                json.dumps({"loss": {"indices": [], "dtype": "f32"}}), encoding="utf-8")
+            with (plattli_root / "hot.compacting.jsonl").open("w") as fh:
+                for i in range(3):
+                    fh.write(json.dumps({"step": i, "loss": float(i)}) + "\n")
+            with (plattli_root / "hot.jsonl").open("w") as fh:
+                for i in range(3, 5):
+                    fh.write(json.dumps({"step": i, "loss": float(i)}) + "\n")
+
+            # A reader merges both files.
+            with plattli.Reader(run_root) as r:
+                self.assertEqual(r.metric_indices("loss").tolist(), [0, 1, 2, 3, 4])
+
+            # Resume consolidates them into a single hot log.
+            w = plattli.CompactingWriter(run_root, step=5, hotsize=100)
+            self.assertFalse((plattli_root / "hot.compacting.jsonl").exists())
+            self.assertEqual([row["step"] for row in _read_jsonl(plattli_root / "hot.jsonl")], [0, 1, 2, 3, 4])
+            w.write(loss=5.0)
+            w.end_step()
+            w.finish(zip=False)
+
+            with plattli.Reader(run_root) as r:
+                idx, values = r.metric("loss")
+                self.assertEqual(idx.tolist(), [0, 1, 2, 3, 4, 5])
+                self.assertTrue(np.allclose(values, [0, 1, 2, 3, 4, 5]))
+
     def test_compacting_hot_append_reuses_open_handle(self):
         with tempfile.TemporaryDirectory() as tmp:
             run_root = Path(tmp) / "run"

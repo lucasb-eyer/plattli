@@ -185,6 +185,7 @@ run_dir/
     <metric>.indices
     <metric>.<dtype>   # or <metric>.jsonl
     hot.jsonl           # present during live logging if hotsize is enabled
+    hot.compacting.jsonl  # transient: rows being compacted right now; unlinked when done
   metrics.plattli
 ```
 

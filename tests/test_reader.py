@@ -400,6 +400,30 @@ class TestReader(unittest.TestCase):
                                             np.asarray([1.0, 2.0], dtype=np.float32)))
                 self.assertEqual(r.rows("loss"), 2)
 
+    def test_reader_tolerates_transient_hot_unlink(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_root = Path(tmp) / "run"
+            plattli_root = run_root / "plattli"
+            w = plattli.DirectWriter(run_root, write_threads=0)
+            w.write(loss=1.0)
+            w.end_step()
+            w.finish(optimize=False, zip=False)
+
+            transient = plattli_root / "hot.compacting.jsonl"
+            transient.write_text(json.dumps({"step": 0, "loss": 1.0}) + "\n", encoding="utf-8")
+            original_read_bytes = Path.read_bytes
+
+            def unlink_before_read(path):
+                if path == transient:
+                    transient.unlink()
+                return original_read_bytes(path)
+
+            with mock.patch.object(Path, "read_bytes", unlink_before_read):
+                with plattli.Reader(run_root) as r:
+                    indices, values = r.metric("loss")
+                    self.assertEqual(indices.tolist(), [0])
+                    self.assertTrue(np.allclose(values, [1.0]))
+
     def test_reader_missing_files_fail_loud(self):
         with tempfile.TemporaryDirectory() as tmp:
             run_root = Path(tmp) / "run"
