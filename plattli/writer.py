@@ -569,6 +569,15 @@ class DirectWriter:
         if self._finished:
             raise RuntimeError(f"writer for run {self.run_root.name} is already finished")
 
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        # Flush, don't finish: the run stays resumable, like dropping the writer.
+        if self._broken is None:
+            wait(self._futures)
+            self._drain_errors()
+
     def _write_entry(self, name, dtype, value, step, write_indices):
         if dtype == JSONL_DTYPE:
             _append_jsonl(self.root / f"{name}.jsonl", [value])
@@ -664,6 +673,19 @@ class CompactingWriter:
 
     def __del__(self):
         # Some callers intentionally drop unfinished writers to resume later.
+        self._close_hot_file()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        # Flush, don't finish: the run stays resumable, like dropping the writer.
+        if self._broken is None and not self._finished:
+            self._flush_hot()
+            if self._compact_future is not None:
+                wait([self._compact_future])
+                with self._hot_lock:
+                    self._maybe_finalize_compaction_locked()
         self._close_hot_file()
 
     def write(self, *args, flush=False, **kwargs):

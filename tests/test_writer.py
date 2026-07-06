@@ -38,6 +38,59 @@ class TestDirectWriter(unittest.TestCase):
                 with self.assertRaises(RuntimeError):
                     _replace_text_checked(path, '{"ok":1}', "manifest")
 
+    def test_context_manager_flushes_without_finishing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_root = Path(tmp) / "run"
+            plattli_root = run_root / "plattli"
+            with plattli.DirectWriter(run_root) as w:
+                w.write(loss=1.0)
+                w.end_step()
+                w.write(loss=2.0)
+            self.assertFalse((run_root / "metrics.plattli").exists())  # Not finished.
+            self.assertTrue(np.allclose(np.fromfile(plattli_root / "loss.f32", dtype=np.float32), [1.0, 2.0]))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            run_root = Path(tmp) / "run"
+            plattli_root = run_root / "plattli"
+            with plattli.CompactingWriter(run_root, hotsize=100) as w:
+                w.write(loss=1.0)
+                w.end_step()
+                w.write(loss=2.0)  # In-progress row must be flushed on exit.
+            self.assertTrue(w._hot_fh is None or w._hot_fh.closed)
+            with plattli.Reader(run_root) as r:
+                idx, values = r.metric("loss")
+                self.assertEqual(idx.tolist(), [0, 1])
+                self.assertTrue(np.allclose(values, [1.0, 2.0]))
+            # And the run is resumable.
+            w = plattli.CompactingWriter(run_root, step=2, hotsize=100)
+            w.write(loss=3.0)
+            w.end_step()
+            w.finish(optimize=False, zip=False)
+            with plattli.Reader(run_root) as r:
+                self.assertEqual(r.metric_indices("loss").tolist(), [0, 1, 2])
+
+        with tempfile.TemporaryDirectory() as tmp:
+            run_root = Path(tmp) / "run"
+            with plattli.CompactingWriter(run_root, hotsize=1) as w:
+                orig = w._compact_rows
+                def slow_compact(rows):
+                    time.sleep(0.2)
+                    orig(rows)
+                w._compact_rows = slow_compact
+                w.write(loss=0.0)
+                w.end_step()
+                w.write(loss=1.0)
+                w.end_step()
+            self.assertTrue(w._compact_future is None or w._compact_future.done())
+
+            w = plattli.CompactingWriter(run_root, step=2, hotsize=100)
+            w.write(loss=2.0)
+            w.end_step()
+            w.finish(optimize=False, zip=False)
+            with plattli.Reader(run_root) as r:
+                self.assertEqual(r.metric_indices("loss").tolist(), [0, 1, 2])
+                self.assertTrue(np.allclose(r.metric_values("loss"), [0.0, 1.0, 2.0]))
+
     def test_finish_empty_run_and_post_finish_errors(self):
         with tempfile.TemporaryDirectory() as tmp:
             run_root = Path(tmp) / "run"

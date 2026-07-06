@@ -76,6 +76,8 @@ Note: this library is meant to be called from a single thread.
 `DirectWriter` uses threads internally to be non-blocking, and `CompactingWriter` compacts in the background.
 Calling `end_step` from a different thread would lead to silently inconsistent data.
 
+`DirectWriter` and `CompactingWriter` also work as context managers: `__exit__` flushes pending work, it does not `finish()` the run, so it stays resumable.
+
 ### DirectWriter(outdir, step=0, write_threads=16, config="config.json", allow_resume_finalized=False)
 - Prepares the writer to write under `outdir/plattli`, creating the dir and writing the config there.
 - If `outdir/plattli/plattli.json` already exists, all metric files are truncated to `step` so you
