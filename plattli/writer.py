@@ -1,6 +1,7 @@
 import json
 import os
 import threading
+import time
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, wait
 from datetime import datetime, timezone
@@ -51,14 +52,18 @@ def _run_name_for_root(root):
     return root.name
 
 
-def _write_manifest(path, manifest, run_rows=None):
+def _manifest_payload(manifest, run_rows=None):
     payload = {
         **manifest,
         "when_exported": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
     }
     if run_rows is not None:
         payload["run_rows"] = run_rows
-    _replace_text_checked(path, json.dumps(payload, ensure_ascii=False), "manifest")
+    return json.dumps(payload, ensure_ascii=False)
+
+
+def _write_manifest(path, manifest, run_rows=None):
+    _replace_text_checked(path, _manifest_payload(manifest, run_rows), "manifest")
 
 
 def _replace_text_checked(path, payload, label):
@@ -590,6 +595,11 @@ class CompactingWriter:
         self._current_row = {}
         self._hot_lock = threading.Lock()
         self._hot_fh = None
+        self._stored_counts = {}
+        self._manifest_dirty = False
+        self._manifest_version = 0
+        self._manifest_disk_version = 0
+        self._manifest_io_lock = threading.Lock()
 
         if (self.root / "plattli.json").exists():
             self._manifest = json.loads((self.root / "plattli.json").read_text(encoding="utf-8"))
@@ -631,6 +641,7 @@ class CompactingWriter:
             raise ValueError(f"step out of uint32 range for run {self.run_root.name}: {self.step}")
 
         new_metric = False
+        pending = None
         with self._hot_lock:  # The compaction thread reads and serializes the manifest.
             for name, value in metrics.items():
                 if name == "step":
@@ -645,12 +656,17 @@ class CompactingWriter:
                 else:
                     dtype = self._manifest[name]["dtype"]
                 value = _coerce_stored_value(value, dtype, name, self.run_root.name)
-                new_metric = _track_monotonic_value(self._manifest, self._monotonic, name, value) or new_metric
+                if _track_monotonic_value(self._manifest, self._monotonic, name, value):
+                    # Safe to defer: flags are persisted by the next compaction before any
+                    # values land in columnar files, and recomputed from data on resume.
+                    self._manifest_dirty = True
                 self._current_row[name] = value
                 self._step_metrics.add(name)
 
             if new_metric:
-                _write_manifest(self.root / "plattli.json", self._manifest)
+                pending = self._serialize_manifest_locked()
+        if pending:
+            self._persist_manifest(*pending)
         if flush:
             self._flush_hot()
 
@@ -769,6 +785,19 @@ class CompactingWriter:
             raise RuntimeError(f"writer for run {self.run_root.name} is broken after an earlier compaction error;"
                                " the on-disk state may be partial, recreate the writer to resume") from self._broken
 
+    def _serialize_manifest_locked(self):
+        self._manifest_version += 1
+        self._manifest_dirty = False
+        return self._manifest_version, _manifest_payload(self._manifest)
+
+    def _persist_manifest(self, version, payload):
+        # The fsyncs happen here, outside _hot_lock, so they never stall the other thread.
+        with self._manifest_io_lock:
+            if version <= self._manifest_disk_version:
+                return  # A newer serialization already landed.
+            _replace_text_checked(self.root / "plattli.json", payload, "manifest")
+            self._manifest_disk_version = version
+
     def _flush_hot(self):
         with self._hot_lock:
             self._maybe_finalize_compaction_locked()
@@ -782,17 +811,20 @@ class CompactingWriter:
                     self._append_hot_row(append_row)
 
     def _rotate_hot_locked(self):
-        batch = [row for row in self._hot_rows if row["step"] < self.step]
-        if len(batch) < self.hotsize:
+        # _hot_rows is in step order and only its tail can hold the in-progress step, so
+        # the completed batch is a prefix slice; keep this O(1)-ish, it runs every step.
+        k = len(self._hot_rows)
+        while k and self._hot_rows[k - 1]["step"] >= self.step:
+            k -= 1
+        if k < self.hotsize:
             return []
-        batch.sort(key=lambda row: row["step"])
         # Rotate instead of rewriting: rename is a cheap metadata op, and compaction can
         # later just unlink the rotated file. A rewrite would fsync under the lock and
         # stall the writing thread.
         self._close_hot_file()
         (self.root / HOT_FILENAME).rename(self.root / HOT_COMPACTING_FILENAME)
-        batch_steps = {row["step"] for row in batch}
-        self._hot_rows = [row for row in self._hot_rows if row["step"] not in batch_steps]
+        batch = self._hot_rows[:k]
+        self._hot_rows = self._hot_rows[k:]
         self._hot_index = {row["step"]: idx for idx, row in enumerate(self._hot_rows)}
         if self._hot_rows:
             # Rare (mid-step flush): non-batch rows were in the rotated file too; keep
@@ -856,7 +888,9 @@ class CompactingWriter:
 
     def _compact_rows(self, rows):
         columns = {}
-        for row in rows:
+        for i, row in enumerate(rows):
+            if i % 1024 == 1023:
+                time.sleep(0)  # Yield the GIL so big batches don't starve the writing thread.
             step = int(row["step"])
             for name, value in row.items():
                 if name == "step":
@@ -869,47 +903,69 @@ class CompactingWriter:
                 col["values"].append(value)
 
         run_name = self.run_root.name
-        for name, col in columns.items():
-            with self._hot_lock:
+        with self._hot_lock:
+            metas = {}
+            for name in columns:
                 dtype = self._manifest[name]["dtype"]
                 indices_spec = self._manifest[name]["indices"]
                 if indices_spec != "indices":
                     # The append helpers mutate segments in place; work on a copy so the
                     # live manifest only ever changes under the lock.
                     indices_spec = [dict(seg) for seg in _segments_from_spec(indices_spec)]
+                metas[name] = (dtype, indices_spec)
+
+        # Extend indices (files or specs) first. Values are appended only after the
+        # manifest is persisted, so on-disk specs are never behind the value files:
+        # with open-tail segments, "manifest ahead of values" is always resolvable.
+        spec_updates = {}
+        new_counts = {}
+        for name, col in columns.items():
+            dtype, indices_spec = metas[name]
             (self.root / name).parent.mkdir(parents=True, exist_ok=True)
             if indices_spec == "indices":
                 _append_indices(self.root / f"{name}.indices", col["indices"])
-            else:
-                try:
-                    old_spec = json.dumps(indices_spec, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+                continue
+            try:
+                old_spec = json.dumps(indices_spec, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+                current_count = self._stored_counts.get(name)
+                if current_count is None:
                     current_count = _stored_values_count(self.root, name, dtype, allow_missing=True)
-                    spec = _append_steps_to_indices_spec(
-                        indices_spec, col["indices"], count=current_count, open_tail=True
-                    )
-                    new_count = current_count + len(col["indices"])
+                spec = _append_steps_to_indices_spec(
+                    indices_spec, col["indices"], count=current_count, open_tail=True
+                )
+                new_counts[name] = current_count + len(col["indices"])
+            except (ValueError, RuntimeError) as exc:
+                raise type(exc)(f"{exc} (metric {name}, run {run_name})") from exc
+            if _segments_too_many(spec, total_count=new_counts[name]):
+                try:
+                    indices = _segments_to_array(spec, total_count=new_counts[name])
                 except (ValueError, RuntimeError) as exc:
                     raise type(exc)(f"{exc} (metric {name}, run {run_name})") from exc
-                if _segments_too_many(spec, total_count=new_count):
-                    try:
-                        indices = _segments_to_array(spec, total_count=new_count)
-                    except (ValueError, RuntimeError) as exc:
-                        raise type(exc)(f"{exc} (metric {name}, run {run_name})") from exc
-                    idx_path = self.root / f"{name}.indices"
-                    idx_path.parent.mkdir(parents=True, exist_ok=True)
-                    with idx_path.open("wb") as fh:
-                        indices.tofile(fh)
-                    with self._hot_lock:
-                        self._manifest[name]["indices"] = "indices"
-                        _write_manifest(self.root / "plattli.json", self._manifest)
-                elif json.dumps(spec, ensure_ascii=False, sort_keys=True, separators=(",", ":")) != old_spec:
-                    with self._hot_lock:
-                        self._manifest[name]["indices"] = spec
-                        _write_manifest(self.root / "plattli.json", self._manifest)
+                idx_path = self.root / f"{name}.indices"
+                with idx_path.open("wb") as fh:
+                    indices.tofile(fh)
+                spec_updates[name] = "indices"
+            elif json.dumps(spec, ensure_ascii=False, sort_keys=True, separators=(",", ":")) != old_spec:
+                spec_updates[name] = spec
+
+        # One coalesced manifest write per batch; serialize under the lock, fsync outside.
+        pending = None
+        with self._hot_lock:
+            for name, spec in spec_updates.items():
+                self._manifest[name]["indices"] = spec
+            if spec_updates or self._manifest_dirty:
+                pending = self._serialize_manifest_locked()
+        if pending:
+            self._persist_manifest(*pending)
+
+        for name, col in columns.items():
+            dtype, _ = metas[name]
             if dtype == JSONL_DTYPE:
                 _append_jsonl(self.root / f"{name}.jsonl", col["values"])
             else:
                 _append_numeric(self.root / f"{name}.{dtype}", col["values"], dtype)
+            if name in new_counts:
+                self._stored_counts[name] = new_counts[name]
 
 
 def _find_arange_params(array):

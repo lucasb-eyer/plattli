@@ -59,18 +59,30 @@ Benchmark (2000 steps x 8 metrics, local disk, per-step `write`+`end_step` laten
   "writes are non-blocking". Better shape: one dedicated writer thread with an ordered
   queue (ordering without blocking `end_step`) + cached open fds per metric (same trick
   as the hot log, commit 75c5f5e).
-- [ ] **New metrics / monotonic flips rewrite the whole manifest with 2 fsyncs on the
-  user thread** (writer.py:477, 637-639). Quadratic in metric count: a 3000-metric probe
-  did not finish in 2 minutes. Consider deferring manifest writes to the background thread.
-- [ ] **Post-compaction hot rewrite runs on the user thread** with fsyncs via
-  `_replace_text_checked` (writer.py:759-763) — the 880µs max spike above, every
-  `hotsize` steps; milliseconds on Lustre. Move to the compaction thread.
+- [x] **New metrics / monotonic flips rewrite the whole manifest with 2 fsyncs on the
+  user thread** (CompactingWriter). Fixed: monotonic-flip persistence is deferred to the
+  next compaction (written before the values land, so on-disk flags are never behind the
+  columnar data; recomputed from data on resume). New-metric writes stay eager (they
+  preserve explicit dtypes) but fsync outside `_hot_lock`. Compaction writes the manifest
+  once per batch (was: once per changed metric) with serialization under the lock and
+  file IO outside it, version-guarded. DirectWriter (batch-only use) left as-is.
+- [x] **Post-compaction hot rewrite runs on the user thread** with fsyncs — one blocked
+  step per compaction, ms on slow FS (measured: moving it to the worker did NOT help
+  while the worker held `_hot_lock` during fsyncs). Fixed with hot log rotation: rename
+  `hot.jsonl` -> `hot.compacting.jsonl` at batch time (cheap metadata op), compaction
+  unlinks the rotated file when done; no rewrite, no lock-held fsyncs. Readers merge
+  both files, resume consolidates them. Measured with simulated 2ms fsyncs, 6000 steps:
+  user steps blocked >2ms went 38 -> 1-2 (the remainder is the one-time eager new-metric
+  manifest write). Trade-off: in a no-compute tight loop (70k steps/s), p99.9 rises
+  ~0.2ms -> ~1ms from GIL contention with larger batches; realistic paced writing is
+  equal or better everywhere.
 - [ ] **`_refresh_monotonic_metadata` iterates every stored value in a Python loop on
   resume** (writer.py:332). Vectorize with `np.diff` sign checks; a 1M-row x 20-metric
   resume is seconds of pure Python otherwise.
-- [ ] **jsonl metrics compact quadratically**: `_compact_rows` calls
-  `_stored_values_count`, which json-parses the entire file, once per batch
-  (writer.py:860 -> 224-233). Track the count in memory.
+- [x] **jsonl metrics compact quadratically**: `_compact_rows` called
+  `_stored_values_count`, which json-parses the entire file, once per batch. Fixed:
+  stored counts are kept in memory (`_stored_counts`, lazily initialized from disk once,
+  updated after each append; only touched by the compaction worker and finish).
 - [ ] **No backpressure**: if compaction falls behind, `_hot_rows` grows unboundedly and
   each hot rewrite gets bigger.
 - [ ] Minor: `_compact_batch_locked` scans + sorts all hot rows every `end_step`.

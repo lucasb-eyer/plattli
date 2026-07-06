@@ -549,10 +549,15 @@ class TestDirectWriter(unittest.TestCase):
             self.assertEqual(manifest["loss"]["monotonic"], "inc")
 
             w.end_step()
-            w.write(loss=1.0)
+            w.write(loss=1.0)  # Breaks monotonicity.
+            # Persistence is deferred: the columnar data stays monotonic until the next
+            # compaction, which writes the cleared flag before appending the values.
+            manifest = json.loads((plattli_root / "plattli.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["loss"]["monotonic"], "inc")
+            w.end_step()
+            w.finish(optimize=False, zip=False)
             manifest = json.loads((plattli_root / "plattli.json").read_text(encoding="utf-8"))
             self.assertNotIn("monotonic", manifest["loss"])
-            w.finish(optimize=False, zip=False)
 
     def test_hot_file_removed_when_empty(self):
         with tempfile.TemporaryDirectory() as tmp:
