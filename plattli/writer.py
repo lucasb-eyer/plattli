@@ -1,7 +1,6 @@
 import json
 import os
 import threading
-import time
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, wait
 from datetime import datetime, timezone
@@ -888,9 +887,7 @@ class CompactingWriter:
 
     def _compact_rows(self, rows):
         columns = {}
-        for i, row in enumerate(rows):
-            if i % 1024 == 1023:
-                time.sleep(0)  # Yield the GIL so big batches don't starve the writing thread.
+        for row in rows:
             step = int(row["step"])
             for name, value in row.items():
                 if name == "step":

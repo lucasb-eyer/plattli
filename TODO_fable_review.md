@@ -52,13 +52,13 @@ Benchmark (2000 steps x 8 metrics, local disk, per-step `write`+`end_step` laten
 | DirectWriter, write_threads=0       |  134µs |  291µs |  711µs |
 | CompactingWriter, hotsize=200       | 12.9µs | 22.8µs |  880µs |
 
-- [ ] **Default DirectWriter thread pool is 13x slower than synchronous** (verified).
-  One executor task per metric per step, each opening+closing two files
-  (`_write_entry`, writer.py:514), then `end_step` blocks on all futures (writer.py:480)
-  — full submission overhead and you still wait. Also contradicts the README's
-  "writes are non-blocking". Better shape: one dedicated writer thread with an ordered
-  queue (ordering without blocking `end_step`) + cached open fds per metric (same trick
-  as the hot log, commit 75c5f5e).
+- [x] **Default DirectWriter thread pool is 13x slower than synchronous** — WONTFIX,
+  and a lesson in local-only benchmarking: on real NFS (2026-07-06 validation), threads=16
+  is 3.6x FASTER than synchronous (71s vs 255s for 30 steps x 8 metrics) because the
+  parallelism hides per-file close-flush latency. The local 13x slowdown (1.8ms/step)
+  is acceptable for the batch-import use case DirectWriter serves in production.
+  Keeping the default and the simple design; live logging on network FS is
+  CompactingWriter's job (DirectWriter measures ~2.4s/step on NFS, unusable by design).
 - [x] **New metrics / monotonic flips rewrite the whole manifest with 2 fsyncs on the
   user thread** (CompactingWriter). Fixed: monotonic-flip persistence is deferred to the
   next compaction (written before the values land, so on-disk flags are never behind the
@@ -75,7 +75,19 @@ Benchmark (2000 steps x 8 metrics, local disk, per-step `write`+`end_step` laten
   user steps blocked >2ms went 38 -> 1-2 (the remainder is the one-time eager new-metric
   manifest write). Trade-off: in a no-compute tight loop (70k steps/s), p99.9 rises
   ~0.2ms -> ~1ms from GIL contention with larger batches; realistic paced writing is
-  equal or better everywhere.
+  equal or better everywhere. (A speculative GIL-yield in the batch loop was tried and
+  removed again: its benefit was within noise.)
+  **Validated on real network FS (2026-07-06)**, 1200 steps, hotsize 200: user steps
+  stalled >10ms went 9 -> 3 on NFS (2.16s -> 0.83s total blocked) and 10 -> 2 on SSHFS
+  (2.47s -> 0.71s). See the follow-up item below for the remaining stalls.
+- [x] **Rotation still pays rename + create + close-flush on the user thread**, ~275ms
+  per compaction at ~30ms server RTT (the local benches missed this: on these mounts
+  create is ~95ms, rename ~36ms, close flushes ~30ms, while appends/stats are ~free).
+  WONTFIX: at realistic cluster RTTs (0.1-1ms) this is single-digit ms once per hotsize
+  steps — negligible. The considered fix (generation-numbered hot files with a
+  pre-created spare handle) would add a third naming scheme, spare-handle lifecycle, and
+  more crash states to the recovery path for that marginal win. Revisit only if real
+  production traces show rotation stalls that matter.
 - [ ] **`_refresh_monotonic_metadata` iterates every stored value in a Python loop on
   resume** (writer.py:332). Vectorize with `np.diff` sign checks; a 1M-row x 20-metric
   resume is seconds of pure Python otherwise.
@@ -134,6 +146,18 @@ Benchmark (2000 steps x 8 metrics, local disk, per-step `write`+`end_step` laten
   every consumer. Add e.g. `r.table(["loss", "acc"], on="loss", start=..., stop=...)`
   returning steps + aligned value arrays; it can also share count/index work across
   columns (fixes the amplification for the multi-column case too).
+
+## Network-FS validation (2026-07-06, NFS + SSHFS mounts, ~30ms server RTT)
+
+Re-ran the headline benchmarks on real network filesystems to check the local-only
+numbers. Reader work holds up: NFS (warm cache) zip full 31 -> 11ms, zip 100-row slice
+11 -> 0.4ms, idx=-1 30 -> 0.1ms; SSHFS (every open remote) tail read 13.8s -> 1.0s,
+zip slice 10.1s -> 2.2s; full-column reads are throughput-bound and unchanged. Write
+path: see the rotation/manifest items above (real ~3x stall reduction, one flaw found).
+Two local-only conclusions were corrected: the DirectWriter default-flip idea (threads
+win 3.6x on NFS) and the GIL-yield tweak (removed, benefit within noise). The op-cost
+profile on these mounts: create ~95-125ms, rename ~36-92ms, unlink ~35-62ms, fsync
+~32-64ms, appends/stats ~free (client-cached; SSHFS opens always remote, ~62ms).
 - [ ] **`write()` signatures diverge**: `CompactingWriter.write(metrics=None, flush=False,
   **kw)` vs `DirectWriter.write(**kw)` only. Slash-named metrics (`detail/thing0`,
   advertised in the README) reach DirectWriter only via `**{...}` unpacking. Give
