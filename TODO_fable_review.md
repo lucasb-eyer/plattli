@@ -88,9 +88,12 @@ Benchmark (2000 steps x 8 metrics, local disk, per-step `write`+`end_step` laten
   ZIP_STORED members, O(1) seek verified). Measured: zip position-slice of 100 rows out
   of 2M went 12.2ms -> 0.05ms; step-slice 17.0ms -> 4.8ms (rest is the searchsorted
   indices read, inherent for `.indices`-file metrics).
-- [ ] **jsonl slices re-parse the whole file per chunk**: `_read_value_slice` calls
-  `_columnar_values(...)[offset:offset+count]` (reader.py:240) and `_values_count`
-  parses it all again. Cache the parsed list per metric on the Reader.
+- [x] **jsonl slices re-parse the whole file per chunk**: `_read_value_slice` called
+  `_columnar_values(...)[offset:offset+count]` and `_values_count` parsed it all again.
+  Fixed: parsed jsonl is cached per metric for the Reader's lifetime (same semantics as
+  the manifest/hot caches), and slice reads slice the cached list before building the
+  object array. Measured on 200k jsonl rows: 100-row slice 461ms -> 0.03ms, idx=-1
+  474ms -> 0.02ms, rows() 228ms -> 0.01ms.
 - [x] **Any `hot.jsonl` disables the optimized selector path entirely**
   (`_selector_chunks`, reader.py:351) — live runs, exactly the dashboard-polling case,
   always fell back to full-read-and-mask. Fixed: `_metric_select` chunks the columnar

@@ -98,6 +98,7 @@ class Reader:
         self._hot_columns = None
         self._hot_has_file = None
         self._rows_cache = {}
+        self._jsonl_cache = {}
         if self.kind == "zip":
             self._zip = zipfile.ZipFile(self.root)
 
@@ -248,7 +249,8 @@ class Reader:
                 raise ValueError(f"unsupported dtype for {name} in run {self._run_name}: {dtype}")
             return np.asarray([], dtype=DTYPE_TO_NUMPY[dtype])
         if dtype == JSONL_DTYPE:
-            return self._columnar_values(name, spec)[offset:offset + count]
+            # offset+count never exceeds the metric count, so slice the cached list directly.
+            return np.asarray(self._read_jsonl_values(name)[offset:offset + count], dtype=object)
         if dtype not in DTYPE_TO_NUMPY:
             raise ValueError(f"unsupported dtype for {name} in run {self._run_name}: {dtype}")
         target = DTYPE_TO_NUMPY[dtype]
@@ -428,6 +430,13 @@ class Reader:
         return indices[mask], values[mask]
 
     def _read_jsonl_values(self, name):
+        if (values := self._jsonl_cache.get(name)) is not None:
+            return values
+        values = self._parse_jsonl_values(name)
+        self._jsonl_cache[name] = values
+        return values
+
+    def _parse_jsonl_values(self, name):
         if self.kind == "zip":
             data = self._read_bytes(f"{name}.jsonl")
         else:
