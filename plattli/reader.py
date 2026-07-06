@@ -102,6 +102,19 @@ class Reader:
         self._rows_cache = {}
         self._jsonl_cache = {}
 
+    def refresh(self):
+        """Drop cached metadata (manifest, config, hot rows, row counts, parsed jsonl)
+        so subsequent reads pick up data written since. Zip readers are immutable
+        snapshots, so refreshing them is unnecessary."""
+        self._manifest = None
+        self._config = None
+        self._run_rows = None
+        self._when_exported = None
+        self._hot_columns = None
+        self._hot_has_file = None
+        self._rows_cache = {}
+        self._jsonl_cache = {}
+
     def close(self):
         if self._zip is not None:
             self._zip.close()

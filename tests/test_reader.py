@@ -170,6 +170,31 @@ class TestReader(unittest.TestCase):
                 self.assertEqual(step, 99)
                 self.assertEqual(value, np.float32(99.0))
 
+    def test_refresh_picks_up_live_writes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_root = Path(tmp) / "run"
+            w = plattli.CompactingWriter(run_root, hotsize=100)
+            w.write(loss=1.0)
+            w.end_step()
+
+            with plattli.Reader(run_root) as r:
+                self.assertEqual(r.metrics(), ["loss"])
+                self.assertEqual(r.rows("loss"), 1)
+
+                w.write(loss=2.0, acc=0.5)
+                w.end_step()
+
+                # Cached metadata is stale until refresh.
+                self.assertEqual(r.metrics(), ["loss"])
+                self.assertEqual(r.rows("loss"), 1)
+
+                r.refresh()
+                self.assertEqual(r.metrics(), ["acc", "loss"])
+                self.assertEqual(r.rows("loss"), 2)
+                self.assertEqual(r.metric_values("loss").tolist(), [1.0, 2.0])
+                step, value = r.metric("acc", idx=-1)
+                self.assertEqual((step, value), (1, 0.5))
+
     def test_tail_reads_fast_path(self):
         with tempfile.TemporaryDirectory() as tmp:
             for zip in (False, True):

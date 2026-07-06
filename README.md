@@ -148,6 +148,7 @@ with Reader("/experiments/123456") as r:
 - Some useful metadata: `config()` returns the attached config dict; `when_exported()` is a timestamp, `rows(name)` is the exact row count (not last step!) in the given metric,
   but because `rows(name)` can be a bit expensive for in-progress runs, `approx_max_rows(faster=True)` is a fast likely-correct estimate of the row count of the most-frequent metric.
 - While the data format is simple, the reader code is a bit more complex because it tolerates corrupt tails, such that it's fine to read plattli's while they are being written.
+- Metadata (manifest, config, hot rows, row counts, jsonl values) is cached on first use, while raw data files are read fresh on every call. On a long-lived `Reader` of a live run, call `refresh()` to drop the caches and pick up new metrics and hot rows. Zip readers are immutable snapshots.
 
 ### Advanced API topics
 

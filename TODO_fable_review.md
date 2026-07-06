@@ -106,9 +106,11 @@ Benchmark (2000 steps x 8 metrics, local disk, per-step `write`+`end_step` laten
   resolve Python-slice-style against the total count (columnar + hot), and an integer
   `idx` with no other selector seek-reads just that one row. Measured on 2M rows:
   idx=-1 and last-100 reads went ~12ms -> 0.03-0.07ms on zip, dir, and live+hot runs.
-- [ ] **Inconsistent caching for live runs**: manifest + hot columns are cached forever,
-  data files read fresh — a long-lived Reader sees new columnar rows but a stale hot tail
-  and metric list. Document Readers as one-shot or add `refresh()`.
+- [x] **Inconsistent caching for live runs**: manifest + hot columns are cached forever,
+  data files read fresh — a long-lived Reader saw new columnar rows but a stale hot tail
+  and metric list. Fixed: added `Reader.refresh()` which drops all cached metadata
+  (manifest, config, hot rows, row counts, parsed jsonl); documented the caching policy
+  in the README. Zip readers are immutable snapshots.
 - [x] Minor: `_is_plattli_zip` opened the zip (central directory read) via
   `zipfile.is_zipfile` + `ZipFile`, then `Reader.__init__` opened it again — three scans.
   Fixed: `_resolve_plattli` returns the already-open ZipFile and the Reader adopts it.
