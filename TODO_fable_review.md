@@ -164,10 +164,12 @@ Benchmark (2000 steps x 8 metrics, local disk, per-step `write`+`end_step` laten
   **kw)` vs `DirectWriter.write(**kw)` only. Fixed: all three writers accept
   `write(metrics_dict, **kwargs)` via a shared `_merge_metrics` helper (dict+kwargs
   merge with duplicate detection). Slash-named metrics now work as plain dict keys.
-- [ ] **Post-`finish()` misuse raises `TypeError: 'NoneType' object is not callable`**
-  (writer.py:509) instead of a real error; `finish()` on a run with zero writes silently
-  does nothing, leaving a dir with config but no `plattli.json` that `is_run()` rejects.
-  Both deserve loud, clear failures.
+- [x] **Post-`finish()` misuse raises `TypeError: 'NoneType' object is not callable`**
+  instead of a real error; `finish()` on a run with zero writes silently did nothing,
+  leaving a dir with config but no `plattli.json` that `is_run()` rejects. Fixed: all
+  writers keep a `_finished` flag and any post-finish call raises a clear RuntimeError;
+  finishing an empty run now writes an empty manifest (run_rows=0) and zips normally, so
+  the result is a valid empty run instead of an invalid directory.
 - [ ] **`PlattliBulkWriter`** is the odd name out next to `DirectWriter`/`CompactingWriter`
   and silently overwrites an existing `metrics.plattli`.
 - [ ] Writers support `del w` but not `with` — add a context manager (`__exit__` ->

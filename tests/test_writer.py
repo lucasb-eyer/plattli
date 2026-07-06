@@ -38,6 +38,30 @@ class TestDirectWriter(unittest.TestCase):
                 with self.assertRaises(RuntimeError):
                     _replace_text_checked(path, '{"ok":1}', "manifest")
 
+    def test_finish_empty_run_and_post_finish_errors(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_root = Path(tmp) / "run"
+            w = plattli.DirectWriter(run_root, write_threads=0)
+            w.finish()  # No writes: still produces a valid (empty) finalized run.
+            self.assertTrue(plattli.is_run(run_root))
+            with plattli.Reader(run_root) as r:
+                self.assertEqual(r.metrics(), [])
+                self.assertEqual(r.approx_max_rows(), 0)
+            for call in (lambda: w.write(loss=1.0), w.end_step, w.finish, lambda: w.set_config({})):
+                with self.assertRaises(RuntimeError):
+                    call()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            run_root = Path(tmp) / "run"
+            w = plattli.CompactingWriter(run_root, hotsize=10)
+            w.write(loss=1.0)
+            w.end_step()
+            w.finish(zip=False)
+            with self.assertRaises(RuntimeError):
+                w.write(loss=2.0)
+            with self.assertRaises(RuntimeError):
+                w.finish()
+
     def test_write_accepts_dict_form(self):
         with tempfile.TemporaryDirectory() as tmp:
             run_root = Path(tmp) / "run"

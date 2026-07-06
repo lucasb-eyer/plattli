@@ -473,6 +473,7 @@ class DirectWriter:
         self._step_metrics = set()
         self._monotonic = {}
         self._broken = None
+        self._finished = False
 
         if (self.root / "plattli.json").exists():
             self._manifest = json.loads((self.root / "plattli.json").read_text(encoding="utf-8"))
@@ -488,6 +489,7 @@ class DirectWriter:
         self.set_config(config)
 
     def write(self, *args, **kwargs):
+        self._check_finished()
         self._check_broken()
         self._drain_errors()
         metrics = _merge_metrics(args, kwargs, self.run_root.name)
@@ -527,6 +529,7 @@ class DirectWriter:
             _write_manifest(self.root / "plattli.json", self._manifest)
 
     def end_step(self):
+        self._check_finished()
         self._check_broken()
         wait(self._futures)
         self._drain_errors()
@@ -535,10 +538,8 @@ class DirectWriter:
         self.step += 1
 
     def finish(self, optimize=True, zip=True):
+        self._check_finished()
         self._check_broken()
-        if not self._manifest:
-            return
-
         wait(self._futures)
         self._drain_errors()
         self._flush_step_indices()
@@ -550,18 +551,23 @@ class DirectWriter:
 
         _close_open_indices(self.root, self._manifest)
         _write_manifest(self.root / "plattli.json", self._manifest,
-                        run_rows=max(_indices_length(self.root, name, spec)
-                                     for name, spec in self._manifest.items()))
+                        run_rows=max((_indices_length(self.root, name, spec)
+                                      for name, spec in self._manifest.items()), default=0))
 
         if zip:
             _zip_output(self.run_root, self.root)
         if self._executor:
             self._executor.shutdown(wait=True)
             self._executor = None
-        self.write = self.end_step = self.set_config = None
+        self._finished = True
 
     def set_config(self, config):
+        self._check_finished()
         _write_config(self.run_root, self.root / "config.json", config)
+
+    def _check_finished(self):
+        if self._finished:
+            raise RuntimeError(f"writer for run {self.run_root.name} is already finished")
 
     def _write_entry(self, name, dtype, value, step, write_indices):
         if dtype == JSONL_DTYPE:
@@ -629,6 +635,7 @@ class CompactingWriter:
         self._step_metrics = set()
         self._monotonic = {}
         self._broken = None
+        self._finished = False
 
         self._hot_rows = []
         self._hot_index = {}
@@ -660,6 +667,7 @@ class CompactingWriter:
         self._close_hot_file()
 
     def write(self, *args, flush=False, **kwargs):
+        self._check_finished()
         self._check_broken()
         self._drain_errors()
         metrics = _merge_metrics(args, kwargs, self.run_root.name)
@@ -703,6 +711,7 @@ class CompactingWriter:
             self._flush_hot()
 
     def end_step(self):
+        self._check_finished()
         self._check_broken()
         if self._current_row or self.step in self._hot_index:
             self._flush_hot()
@@ -711,10 +720,8 @@ class CompactingWriter:
         self.step += 1
 
     def finish(self, optimize=True, zip=True):
+        self._check_finished()
         self._check_broken()
-        if not self._manifest:
-            return
-
         if self._compact_future:
             wait([self._compact_future])
             with self._hot_lock:
@@ -739,18 +746,23 @@ class CompactingWriter:
 
         _close_open_indices(self.root, self._manifest)
         _write_manifest(self.root / "plattli.json", self._manifest,
-                        run_rows=max(_indices_length(self.root, name, spec)
-                                     for name, spec in self._manifest.items()))
+                        run_rows=max((_indices_length(self.root, name, spec)
+                                      for name, spec in self._manifest.items()), default=0))
 
         if zip:
             _zip_output(self.run_root, self.root)
         if self._compact_executor:
             self._compact_executor.shutdown(wait=True)
             self._compact_executor = None
-        self.write = self.end_step = self.set_config = None
+        self._finished = True
 
     def set_config(self, config):
+        self._check_finished()
         _write_config(self.run_root, self.root / "config.json", config)
+
+    def _check_finished(self):
+        if self._finished:
+            raise RuntimeError(f"writer for run {self.run_root.name} is already finished")
 
     def _load_hot_rows(self):
         hot_path = self.root / HOT_FILENAME

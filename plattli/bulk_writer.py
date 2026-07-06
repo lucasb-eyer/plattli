@@ -30,11 +30,18 @@ class PlattliBulkWriter:
         self._columns = {}
         self._step_metrics = set()
         self._config = config
+        self._finished = False
 
     def set_config(self, config):
+        self._check_finished()
         self._config = config
 
+    def _check_finished(self):
+        if self._finished:
+            raise RuntimeError(f"writer for run {self.run_root.name} is already finished")
+
     def write(self, *args, **kwargs):
+        self._check_finished()
         assert 0 <= self.step <= 0xFFFFFFFF, f"step out of uint32 range for run {self.run_root.name}: {self.step}"
         metrics = _merge_metrics(args, kwargs, self.run_root.name)
         for name, value in metrics.items():
@@ -53,13 +60,12 @@ class PlattliBulkWriter:
             self._step_metrics.add(name)
 
     def end_step(self):
+        self._check_finished()
         self._step_metrics.clear()
         self.step += 1
 
     def finish(self, optimize=True, zip=True):
-        if not self._columns:
-            return
-
+        self._check_finished()
         if zip:
             zip_path = _zip_path_for_root(self.run_root)
             tmp_path = zip_path.with_name(zip_path.name + ".tmp")
@@ -155,4 +161,4 @@ class PlattliBulkWriter:
         manifest["run_rows"] = run_rows
         write_bytes("plattli.json", json.dumps(manifest, ensure_ascii=False).encode("utf-8"))
         close()
-        self.write = self.end_step = self.set_config = None
+        self._finished = True
