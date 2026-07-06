@@ -875,6 +875,43 @@ class Reader:
             return self._apply_selector(indices, values, start, stop, istart, istop, vstart, vstop)[1]
         return selected[1]
 
+    def table(self, names, on="step", start=None, stop=None, istart=None, istop=None, vstart=None, vstop=None):
+        """Read several metrics step-aligned: (steps, {name: values}), all equal length,
+        keeping only steps present in every requested metric.
+
+        Selectors select rows of the `on` column. With the default on="step" that is the
+        aligned table itself (vstart/vstop are not meaningful there); with a metric name,
+        vstart/vstop select by that metric's values and the other columns follow."""
+        if not names:
+            raise ValueError(f"table() needs at least one metric name in run {self._run_name}")
+        kind = self._selector_kind(start, stop, istart, istop, vstart, vstop)
+        if on == "step":
+            if kind == "value":
+                raise ValueError("vstart/vstop need a metric as the `on` column")
+            # Step ranges push down to every column; positions apply to the joined table.
+            sel = {"start": start, "stop": stop} if kind == "step" else {}
+            columns = {name: self.metric(name, **sel) for name in names}
+            steps = None
+            for idx, _ in columns.values():
+                steps = idx if steps is None else np.intersect1d(steps, idx, assume_unique=True)
+            if kind == "position":
+                chunks = self._position_slice(len(steps), istart, istop)
+                lo, hi = chunks[0] if chunks else (0, 0)
+                steps = steps[lo:hi]
+        else:
+            steps, on_values = self.metric(on, start=start, stop=stop, istart=istart, istop=istop, vstart=vstart, vstop=vstop)
+            columns = {}
+            for name in names:
+                if name == on:
+                    columns[name] = (steps, on_values)
+                elif len(steps):  # Other columns only need the selected step window.
+                    columns[name] = self.metric(name, start=int(steps[0]), stop=int(steps[-1]))
+                else:
+                    columns[name] = self.metric(name, istart=0, istop=0)
+            for idx, _ in columns.values():
+                steps = np.intersect1d(steps, idx, assume_unique=True)
+        return steps, {name: vals[np.searchsorted(idx, steps)] for name, (idx, vals) in columns.items()}
+
     def metric(self, name, idx=None, start=None, stop=None, istart=None, istop=None, vstart=None, vstop=None):
         if self._selector_kind(start, stop, istart, istop, vstart, vstop) is None:
             if isinstance(idx, (int, np.integer)) and not isinstance(idx, bool):

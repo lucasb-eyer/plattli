@@ -150,11 +150,16 @@ Benchmark (2000 steps x 8 metrics, local disk, per-step `write`+`end_step` laten
 
 ## API design
 
-- [ ] **The stated core read use case has no API**: "read whole sets of columns
+- [x] **The stated core read use case has no API**: "read whole sets of columns
   step-aligned on one column" currently means N x `r.metric(name)` + manual alignment in
-  every consumer. Add e.g. `r.table(["loss", "acc"], on="loss", start=..., stop=...)`
-  returning steps + aligned value arrays; it can also share count/index work across
-  columns (fixes the amplification for the multi-column case too).
+  every consumer. Added `r.table(names, on="step", **selectors)` -> (steps, {name:
+  values}): inner join on steps, selectors select rows of the `on` column (value ranges
+  via a metric `on`), and non-`on` columns are only read within the selected step window
+  (range pushdown). Design shaped by the real consumer (flattlibrettli's `_xys_arrays`
+  path, which hand-rolls this in three tiers and falls back to full reads + intersect1d).
+  If an outer/left join is ever needed: `join=`/`fill=` kwargs, not a bool. Measured:
+  zoomed window on 2M rows with mixed cadence, 23.3ms (manual full-read+intersect) ->
+  0.34ms.
 - [ ] **`write()` signatures diverge**: `CompactingWriter.write(metrics=None, flush=False,
   **kw)` vs `DirectWriter.write(**kw)` only. Slash-named metrics (`detail/thing0`,
   advertised in the README) reach DirectWriter only via `**{...}` unpacking. Give

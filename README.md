@@ -151,6 +151,25 @@ with Reader("/experiments/123456") as r:
 - While the data format is simple, the reader code is a bit more complex because it tolerates corrupt tails, such that it's fine to read plattli's while they are being written.
 - Metadata (manifest, config, hot rows, row counts, jsonl values) is cached on first use, while raw data files are read fresh on every call. On a long-lived `Reader` of a live run, call `refresh()` to drop the caches and pick up new metrics and hot rows. Zip readers are immutable snapshots.
 
+### Aligned reads: table()
+
+`table(names, on="step", **selectors)` reads several metrics step-aligned, keeping only
+steps present in every requested metric (inner join on steps). It returns
+`(steps, {name: values})` with all arrays of equal length.
+
+Selectors (see below) select rows of the `on` column: with the default `on="step"` they
+apply to the aligned table itself, while `on="some_metric"` selects that metric's rows —
+including by value via `vstart`/`vstop` — and the other columns follow. Columns other
+than `on` are only read within the selected step window, so zoomed reads stay cheap even
+when metrics were logged at different cadences.
+
+```python
+with Reader("/experiments/123456") as r:
+    steps, cols = r.table(["loss", "accuracy"])                    # aligned full read
+    steps, cols = r.table(["walltime", "loss"], on="walltime", vstart=10.0, vstop=20.0)
+    x, y = cols["walltime"], cols["loss"]
+```
+
 ### Advanced API topics
 
 #### Range selectors

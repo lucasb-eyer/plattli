@@ -170,6 +170,75 @@ class TestReader(unittest.TestCase):
                 self.assertEqual(step, 99)
                 self.assertEqual(value, np.float32(99.0))
 
+    def test_table_aligns_mixed_cadence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_root = Path(tmp) / "run"
+            w = plattli.DirectWriter(run_root, write_threads=0)
+            for i in range(12):
+                metrics = {"loss": float(i), "wall": 2.0 * i}
+                if i % 3 == 0:
+                    metrics["acc"] = i / 12
+                w.write(**metrics)
+                w.end_step()
+            w.finish(optimize=False, zip=False)
+
+            with plattli.Reader(run_root) as r:
+                steps, cols = r.table(["loss", "acc"])
+                self.assertEqual(steps.tolist(), [0, 3, 6, 9])
+                self.assertTrue(np.allclose(cols["loss"], [0, 3, 6, 9]))
+                self.assertTrue(np.allclose(cols["acc"], [0, 0.25, 0.5, 0.75]))
+
+                steps, cols = r.table(["loss", "acc"], start=3, stop=8)
+                self.assertEqual(steps.tolist(), [3, 6])
+
+                steps, cols = r.table(["loss", "acc"], istart=-2)
+                self.assertEqual(steps.tolist(), [6, 9])
+
+                # Selectors on a metric `on` column: select by wall value, others follow.
+                steps, cols = r.table(["wall", "loss"], on="wall", vstart=4.0, vstop=10.0)
+                self.assertEqual(steps.tolist(), [2, 3, 4, 5])
+                self.assertTrue(np.allclose(cols["wall"], [4, 6, 8, 10]))
+                self.assertTrue(np.allclose(cols["loss"], [2, 3, 4, 5]))
+
+                steps, cols = r.table(["acc"], on="wall", vstart=4.0, vstop=19.0)
+                self.assertEqual(steps.tolist(), [3, 6, 9])
+
+                steps, cols = r.table(["loss", "acc"], start=100, stop=200)
+                self.assertEqual(steps.tolist(), [])
+                self.assertEqual(len(cols["loss"]), 0)
+                self.assertEqual(cols["loss"].dtype, np.float32)
+
+                with self.assertRaises(ValueError):
+                    r.table(["loss"], vstart=1.0)
+                with self.assertRaises(ValueError):
+                    r.table([])
+                with self.assertRaises(KeyError):
+                    r.table(["loss", "nope"])
+
+    def test_table_live_and_zip(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_root = Path(tmp) / "run"
+            w = plattli.CompactingWriter(run_root, hotsize=2)
+            for i in range(7):
+                metrics = {"loss": float(i)}
+                if i % 2 == 0:
+                    metrics["acc"] = float(i)
+                w.write(metrics)
+                w.end_step()
+                if w._compact_future:
+                    w._compact_future.result()
+
+            with plattli.Reader(run_root) as r:  # Mixed columnar + hot.
+                steps, cols = r.table(["loss", "acc"])
+                self.assertEqual(steps.tolist(), [0, 2, 4, 6])
+                self.assertTrue(np.allclose(cols["acc"], [0, 2, 4, 6]))
+
+            w.finish(zip=True)
+            with plattli.Reader(run_root) as r:
+                steps, cols = r.table(["loss", "acc"], start=2, stop=5)
+                self.assertEqual(steps.tolist(), [2, 4])
+                self.assertTrue(np.allclose(cols["loss"], [2, 4]))
+
     def test_refresh_picks_up_live_writes(self):
         with tempfile.TemporaryDirectory() as tmp:
             run_root = Path(tmp) / "run"
