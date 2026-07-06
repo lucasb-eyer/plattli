@@ -14,7 +14,10 @@ from ._indices import (
 from .writer import DTYPE_TO_NUMPY, HOT_FILENAME, JSONL_DTYPE
 
 def is_run(path):
-    return _resolve_plattli(path)[0] is not None
+    kind, _, zf = _resolve_plattli(path)
+    if zf is not None:
+        zf.close()
+    return kind is not None
 
 def resolve_run_dir(path):
     target = Path(path).expanduser()
@@ -31,43 +34,42 @@ def is_run_dir(path):
     return resolve_run_dir(path) is not None
 
 
-def _is_plattli_zip(path):
-    if not path or not path.is_file():
-        return False
-    if not zipfile.is_zipfile(path):
-        return False
+def _open_plattli_zip(path):
+    """Returns an open ZipFile if path is a plattli zip, else None."""
+    if not path.is_file():
+        return None
     try:
-        with zipfile.ZipFile(path) as zf:
-            zf.getinfo("plattli.json")
-    except Exception:
-        return False
-    return True
+        zf = zipfile.ZipFile(path)
+    except (zipfile.BadZipFile, OSError):
+        return None
+    try:
+        zf.getinfo("plattli.json")
+    except KeyError:
+        zf.close()
+        return None
+    return zf
 
 
 def _resolve_plattli(path):
     target = Path(path).expanduser()
 
     if target.is_file():
-        if _is_plattli_zip(target):
-            return "zip", target.resolve()
-        return None, None
+        if (zf := _open_plattli_zip(target)) is not None:
+            return "zip", target.resolve(), zf
+        return None, None, None
 
     if not target.is_dir():
-        return None, None
+        return None, None, None
 
     zip_path = target / "metrics.plattli"
-    if _is_plattli_zip(zip_path):
-        return "zip", zip_path.resolve()
-    dir_path = target / "plattli"
-    direct_ok = (target / "plattli.json").is_file()
-    dir_ok = (dir_path / "plattli.json").is_file()
+    if (zf := _open_plattli_zip(zip_path)) is not None:
+        return "zip", zip_path.resolve(), zf
+    if (target / "plattli.json").is_file():
+        return "dir", target.resolve(), None
+    if (target / "plattli" / "plattli.json").is_file():
+        return "dir", (target / "plattli").resolve(), None
 
-    if direct_ok:
-        return "dir", target.resolve()
-    if dir_ok:
-        return "dir", dir_path.resolve()
-
-    return None, None
+    return None, None, None
 
 
 def _run_name_for_root(root):
@@ -84,13 +86,13 @@ def _run_name_for_root(root):
 
 class Reader:
     def __init__(self, path):
-        kind, root = _resolve_plattli(path)
+        kind, root, zf = _resolve_plattli(path)
         if kind is None:
             raise FileNotFoundError(f"not a plattli run: {path}")
         self.kind = kind
         self.root = root
         self._run_name = _run_name_for_root(root)
-        self._zip = None
+        self._zip = zf
         self._manifest = None
         self._config = None
         self._run_rows = None
@@ -99,8 +101,6 @@ class Reader:
         self._hot_has_file = None
         self._rows_cache = {}
         self._jsonl_cache = {}
-        if self.kind == "zip":
-            self._zip = zipfile.ZipFile(self.root)
 
     def close(self):
         if self._zip is not None:

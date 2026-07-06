@@ -109,8 +109,9 @@ Benchmark (2000 steps x 8 metrics, local disk, per-step `write`+`end_step` laten
 - [ ] **Inconsistent caching for live runs**: manifest + hot columns are cached forever,
   data files read fresh — a long-lived Reader sees new columnar rows but a stale hot tail
   and metric list. Document Readers as one-shot or add `refresh()`.
-- [ ] Minor: `_is_plattli_zip` opens the zip (central directory read), then `Reader.__init__`
-  opens it again.
+- [x] Minor: `_is_plattli_zip` opened the zip (central directory read) via
+  `zipfile.is_zipfile` + `ZipFile`, then `Reader.__init__` opened it again — three scans.
+  Fixed: `_resolve_plattli` returns the already-open ZipFile and the Reader adopts it.
 
 ## API design
 
