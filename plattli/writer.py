@@ -823,6 +823,14 @@ class CompactingWriter:
 
     def _flush_hot(self):
         with self._hot_lock:
+            future = self._compact_future
+            backlogged = future is not None and len(self._hot_rows) >= 10 * self.hotsize
+        if backlogged:
+            # Backpressure: the filesystem cannot keep up with the write rate. Block on
+            # the in-flight batch (outside the lock, the worker needs it) so memory stays
+            # bounded; slow beats OOM. Normal operation never enters this branch.
+            wait([future])
+        with self._hot_lock:
             self._maybe_finalize_compaction_locked()
             if self._compact_future is None and (batch := self._rotate_hot_locked()):
                 self._compact_future = self._compact_executor.submit(self._compact_batch, batch)

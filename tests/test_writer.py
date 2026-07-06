@@ -1,5 +1,6 @@
 import json
 import tempfile
+import time
 import unittest
 import zipfile
 from concurrent.futures import wait
@@ -96,6 +97,28 @@ class TestDirectWriter(unittest.TestCase):
                                  (b.broken, b.direction, b.seen), (prefix, case))
                 if not a.broken and a.seen:
                     self.assertEqual(a.last, b.last, (prefix, case))
+
+    def test_backpressure_bounds_hot_backlog(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_root = Path(tmp) / "run"
+            w = plattli.CompactingWriter(run_root, hotsize=1)
+            orig = w._compact_rows
+            def slow_compact(rows):
+                time.sleep(0.2)
+                orig(rows)
+            w._compact_rows = slow_compact
+
+            peak = 0
+            for i in range(25):
+                w.write(loss=float(i))
+                w.end_step()
+                peak = max(peak, len(w._hot_rows))
+            # Without backpressure the backlog would reach ~24 while compaction sleeps.
+            self.assertLessEqual(peak, 10 * w.hotsize + 2)
+            w.finish(optimize=False, zip=False)
+
+            with plattli.Reader(run_root) as r:
+                self.assertEqual(r.metric_indices("loss").tolist(), list(range(25)))
 
     def test_compacting_rotates_hot_log(self):
         with tempfile.TemporaryDirectory() as tmp:

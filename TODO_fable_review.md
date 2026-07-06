@@ -98,8 +98,12 @@ Benchmark (2000 steps x 8 metrics, local disk, per-step `write`+`end_step` laten
   `_stored_values_count`, which json-parses the entire file, once per batch. Fixed:
   stored counts are kept in memory (`_stored_counts`, lazily initialized from disk once,
   updated after each append; only touched by the compaction worker and finish).
-- [ ] **No backpressure**: if compaction falls behind, `_hot_rows` grows unboundedly and
-  each hot rewrite gets bigger.
+- [x] **No backpressure**: if compaction falls behind, `_hot_rows` grows unboundedly and
+  batches get bigger. Fixed with a bounded backlog: once `_hot_rows` reaches 10x
+  `hotsize` while a batch is in flight, `end_step` waits for that batch (outside the
+  lock) before continuing — memory stays bounded and logging degrades to filesystem
+  speed instead of OOM-crashing. Normal operation never enters the branch (one integer
+  comparison per flush). Documented in the README.
 - [x] Minor: `_compact_batch_locked` scans + sorts all hot rows every `end_step`.
   Fixed as a side effect of the rotation work: `_compact_batch_locked` is gone, batch
   selection is an O(1) tail-walk over `_hot_rows` (step-ordered, prefix = completed).
@@ -151,18 +155,6 @@ Benchmark (2000 steps x 8 metrics, local disk, per-step `write`+`end_step` laten
   every consumer. Add e.g. `r.table(["loss", "acc"], on="loss", start=..., stop=...)`
   returning steps + aligned value arrays; it can also share count/index work across
   columns (fixes the amplification for the multi-column case too).
-
-## Network-FS validation (2026-07-06, NFS + SSHFS mounts, ~30ms server RTT)
-
-Re-ran the headline benchmarks on real network filesystems to check the local-only
-numbers. Reader work holds up: NFS (warm cache) zip full 31 -> 11ms, zip 100-row slice
-11 -> 0.4ms, idx=-1 30 -> 0.1ms; SSHFS (every open remote) tail read 13.8s -> 1.0s,
-zip slice 10.1s -> 2.2s; full-column reads are throughput-bound and unchanged. Write
-path: see the rotation/manifest items above (real ~3x stall reduction, one flaw found).
-Two local-only conclusions were corrected: the DirectWriter default-flip idea (threads
-win 3.6x on NFS) and the GIL-yield tweak (removed, benefit within noise). The op-cost
-profile on these mounts: create ~95-125ms, rename ~36-92ms, unlink ~35-62ms, fsync
-~32-64ms, appends/stats ~free (client-cached; SSHFS opens always remote, ~62ms).
 - [ ] **`write()` signatures diverge**: `CompactingWriter.write(metrics=None, flush=False,
   **kw)` vs `DirectWriter.write(**kw)` only. Slash-named metrics (`detail/thing0`,
   advertised in the README) reach DirectWriter only via `**{...}` unpacking. Give
@@ -181,9 +173,20 @@ profile on these mounts: create ~95-125ms, rename ~36-92ms, unlink ~35-62ms, fsy
   `w.step` is writable and jsonl2plattli assigns it, but step jumps are undocumented and
   unguarded on the other writers.
 
-## Suggested order
+## Network-FS validation (2026-07-06, NFS + SSHFS mounts, ~30ms server RTT)
 
-1. Dead-code/resume decision (semantics call for the owner).
-2. Reader amplification + tail fast path (big win, small diff).
-3. DirectWriter threading rework (big win, medium diff).
-4. Everything else opportunistically.
+Re-ran the headline benchmarks on real network filesystems to check the local-only
+numbers. Reader work holds up: NFS (warm cache) zip full 31 -> 11ms, zip 100-row slice
+11 -> 0.4ms, idx=-1 30 -> 0.1ms; SSHFS (every open remote) tail read 13.8s -> 1.0s,
+zip slice 10.1s -> 2.2s; full-column reads are throughput-bound and unchanged. Write
+path: see the rotation/manifest items above (real ~3x stall reduction, one flaw found).
+Two local-only conclusions were corrected: the DirectWriter default-flip idea (threads
+win 3.6x on NFS) and the GIL-yield tweak (removed, benefit within noise). The op-cost
+profile on these mounts: create ~95-125ms, rename ~36-92ms, unlink ~35-62ms, fsync
+~32-64ms, appends/stats ~free (client-cached; SSHFS opens always remote, ~62ms).
+
+## Status
+
+All bug and performance items are resolved (fixed, validated, or explicitly wontfixed
+with rationale). Remaining work is the API design section above, headlined by the
+aligned multi-column read (`r.table`).
