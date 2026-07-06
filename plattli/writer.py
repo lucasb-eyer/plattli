@@ -257,6 +257,22 @@ def _close_open_indices(root, manifest):
     return changed
 
 
+def _merge_metrics(args, kwargs, run_name):
+    if len(args) > 1:
+        raise TypeError(f"write accepts at most one positional metrics dict in run {run_name}")
+    metrics = args[0] if args else None
+    if metrics is None:
+        metrics = {}
+    if not isinstance(metrics, dict):
+        raise TypeError(f"metrics must be a dict in run {run_name} (got {type(metrics).__name__})")
+    if kwargs:
+        overlap = metrics.keys() & kwargs.keys()
+        if overlap:
+            raise ValueError(f"duplicate metric names in run {run_name}: {sorted(overlap)}")
+        metrics = {**metrics, **kwargs}
+    return metrics
+
+
 def _coerce_stored_value(value, dtype, name, run_name):
     if hasattr(value, "__array__"):
         value = np.asarray(value)
@@ -471,9 +487,10 @@ class DirectWriter:
 
         self.set_config(config)
 
-    def write(self, **metrics):
+    def write(self, *args, **kwargs):
         self._check_broken()
         self._drain_errors()
+        metrics = _merge_metrics(args, kwargs, self.run_root.name)
         if not metrics:
             return
 
@@ -642,18 +659,10 @@ class CompactingWriter:
         # Some callers intentionally drop unfinished writers to resume later.
         self._close_hot_file()
 
-    def write(self, metrics=None, flush=False, **kwargs):
+    def write(self, *args, flush=False, **kwargs):
         self._check_broken()
         self._drain_errors()
-        if metrics is None:
-            metrics = {}
-        if not isinstance(metrics, dict):
-            raise TypeError(f"metrics must be a dict in run {self.run_root.name} (got {type(metrics).__name__})")
-        if kwargs:
-            overlap = metrics.keys() & kwargs.keys()
-            if overlap:
-                raise ValueError(f"duplicate metric names in run {self.run_root.name}: {sorted(overlap)}")
-            metrics = {**metrics, **kwargs}
+        metrics = _merge_metrics(args, kwargs, self.run_root.name)
         if not metrics and flush:
             self._flush_hot()
             return

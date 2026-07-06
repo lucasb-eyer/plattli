@@ -38,6 +38,32 @@ class TestDirectWriter(unittest.TestCase):
                 with self.assertRaises(RuntimeError):
                     _replace_text_checked(path, '{"ok":1}', "manifest")
 
+    def test_write_accepts_dict_form(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_root = Path(tmp) / "run"
+            plattli_root = run_root / "plattli"
+            w = plattli.DirectWriter(run_root, write_threads=0)
+            w.write({"detail/thing0": 1.0}, loss=2.0)
+            w.end_step()
+            with self.assertRaises(ValueError):
+                w.write({"loss": 1.0}, loss=2.0)  # duplicate between dict and kwargs
+            with self.assertRaises(TypeError):
+                w.write([("loss", 1.0)])
+            w.finish(optimize=False, zip=False)
+
+            self.assertTrue(np.allclose(np.fromfile(plattli_root / "detail/thing0.f32", dtype=np.float32), [1.0]))
+            self.assertTrue(np.allclose(np.fromfile(plattli_root / "loss.f32", dtype=np.float32), [2.0]))
+
+    def test_metrics_is_a_valid_keyword_metric(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_root = Path(tmp) / "run"
+            w = plattli.DirectWriter(run_root, write_threads=0)
+            w.write(metrics=1.0)
+            w.end_step()
+            w.finish(optimize=False, zip=False)
+
+            with plattli.Reader(run_root) as r:
+                self.assertEqual(r.metric_values("metrics").tolist(), [1.0])
     def test_direct_write_error_poisons_writer(self):
         with tempfile.TemporaryDirectory() as tmp:
             run_root = Path(tmp) / "run"
@@ -75,6 +101,17 @@ class TestDirectWriter(unittest.TestCase):
                 w.end_step()
             with self.assertRaises(RuntimeError):
                 w.finish()
+
+    def test_compacting_metrics_is_a_valid_keyword_metric(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_root = Path(tmp) / "run"
+            w = plattli.CompactingWriter(run_root, hotsize=10)
+            w.write(metrics=1.0)
+            w.end_step()
+            w.finish(optimize=False, zip=False)
+
+            with plattli.Reader(run_root) as r:
+                self.assertEqual(r.metric_values("metrics").tolist(), [1.0])
 
     def test_monotonic_add_array_matches_elementwise(self):
         from plattli.writer import _Monotonic

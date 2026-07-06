@@ -94,8 +94,8 @@ Calling `end_step` from a different thread would lead to silently inconsistent d
 - `config` follows the same rules as `DirectWriter`.
 - `allow_resume_finalized` follows the same rules as `DirectWriter`.
 
-### DirectWriter.write(**metrics)
-- Appends each metric at the current step.
+### DirectWriter.write(...)
+- Appends each metric at the current step (pass at most one dict or keyword metrics; the dict form is needed for slash-named metrics like `detail/thing0`).
 - Auto-dtype rules:
   - array-like scalars -> use their dtype if supported
   - bool -> `jsonl`
@@ -107,8 +107,8 @@ Calling `end_step` from a different thread would lead to silently inconsistent d
 - Only scalar values are supported (including 0-d array-likes).
 - Only standard dtypes are supported for now: no bf16, nvfp4, fp8; no complex/composite.
 
-### CompactingWriter.write(metrics=None, flush=False, **metrics)
-- Appends each metric at the current step (pass a dict or kwargs).
+### CompactingWriter.write(..., flush=False)
+- Appends each metric at the current step (pass at most one dict or keyword metrics).
 - `flush=True` forces a `hot.jsonl` rewrite without advancing the step (use `write(flush=True)` to flush only).
 - Uses the same auto-dtype rules and scalar restrictions as `DirectWriter.write`.
 

@@ -160,10 +160,10 @@ Benchmark (2000 steps x 8 metrics, local disk, per-step `write`+`end_step` laten
   If an outer/left join is ever needed: `join=`/`fill=` kwargs, not a bool. Measured:
   zoomed window on 2M rows with mixed cadence, 23.3ms (manual full-read+intersect) ->
   0.34ms.
-- [ ] **`write()` signatures diverge**: `CompactingWriter.write(metrics=None, flush=False,
-  **kw)` vs `DirectWriter.write(**kw)` only. Slash-named metrics (`detail/thing0`,
-  advertised in the README) reach DirectWriter only via `**{...}` unpacking. Give
-  DirectWriter the positional-dict form.
+- [x] **`write()` signatures diverge**: `CompactingWriter.write(metrics=None, flush=False,
+  **kw)` vs `DirectWriter.write(**kw)` only. Fixed: all three writers accept
+  `write(metrics_dict, **kwargs)` via a shared `_merge_metrics` helper (dict+kwargs
+  merge with duplicate detection). Slash-named metrics now work as plain dict keys.
 - [ ] **Post-`finish()` misuse raises `TypeError: 'NoneType' object is not callable`**
   (writer.py:509) instead of a real error; `finish()` on a run with zero writes silently
   does nothing, leaving a dir with config but no `plattli.json` that `is_run()` rejects.

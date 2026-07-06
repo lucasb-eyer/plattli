@@ -98,6 +98,17 @@ class TestPlattliBulkWriter(unittest.TestCase):
             with self.assertRaises(ValueError):
                 w.write(loss=np.asarray([1.0, 2.0]))
 
+    def test_metrics_is_a_valid_keyword_metric(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_root = Path(tmp) / "run"
+            w = plattli.BulkWriter(run_root)
+            w.write(metrics=1.0)
+            w.end_step()
+            w.finish(optimize=False, zip=False)
+
+            with plattli.Reader(run_root) as r:
+                self.assertEqual(r.metric_values("metrics").tolist(), [1.0])
+
     def test_list_values_stay_jsonl(self):
         with tempfile.TemporaryDirectory() as tmp:
             run_root = Path(tmp) / "run"
