@@ -88,16 +88,21 @@ Benchmark (2000 steps x 8 metrics, local disk, per-step `write`+`end_step` laten
   pre-created spare handle) would add a third naming scheme, spare-handle lifecycle, and
   more crash states to the recovery path for that marginal win. Revisit only if real
   production traces show rotation stalls that matter.
-- [ ] **`_refresh_monotonic_metadata` iterates every stored value in a Python loop on
-  resume** (writer.py:332). Vectorize with `np.diff` sign checks; a 1M-row x 20-metric
-  resume is seconds of pure Python otherwise.
+- [x] **`_refresh_monotonic_metadata` iterates every stored value in a Python loop on
+  resume**. Fixed: `_Monotonic.add_array` vectorizes with elementwise comparisons (not
+  `np.diff`, which would wrap around on unsigned dtypes) plus an explicit NaN check;
+  also used by the bulk writer's `_set_monotonic`. Equivalence to the elementwise path
+  is tested over tricky sequences. Measured: resume of 2M rows x 4 metrics
+  0.28s -> 0.04s, and that BEFORE number is the favorable early-broken case.
 - [x] **jsonl metrics compact quadratically**: `_compact_rows` called
   `_stored_values_count`, which json-parses the entire file, once per batch. Fixed:
   stored counts are kept in memory (`_stored_counts`, lazily initialized from disk once,
   updated after each append; only touched by the compaction worker and finish).
 - [ ] **No backpressure**: if compaction falls behind, `_hot_rows` grows unboundedly and
   each hot rewrite gets bigger.
-- [ ] Minor: `_compact_batch_locked` scans + sorts all hot rows every `end_step`.
+- [x] Minor: `_compact_batch_locked` scans + sorts all hot rows every `end_step`.
+  Fixed as a side effect of the rotation work: `_compact_batch_locked` is gone, batch
+  selection is an O(1) tail-walk over `_hot_rows` (step-ordered, prefix = completed).
 
 ## Read-path performance
 

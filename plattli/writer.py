@@ -301,6 +301,32 @@ class _Monotonic:
             self.direction = None
         self.last = value
 
+    def add_array(self, values):
+        if self.broken or values.size == 0:
+            return
+        self.add(values[0].item())
+        if self.broken or values.size == 1:
+            return
+        if (values != values).any():  # NaN anywhere breaks monotonicity.
+            self.broken = True
+            self.direction = None
+            return
+        inc = bool((values[1:] > values[:-1]).any())
+        dec = bool((values[1:] < values[:-1]).any())
+        if inc and dec:
+            self.broken = True
+            self.direction = None
+            return
+        if inc or dec:
+            direction = "inc" if inc else "dec"
+            if self.direction is None:
+                self.direction = direction
+            elif self.direction != direction:
+                self.broken = True
+                self.direction = None
+                return
+        self.last = values[-1].item()
+
     def apply(self, spec):
         direction = None if self.broken or not self.seen else self.direction or "inc"
         if direction is None:
@@ -316,8 +342,7 @@ class _Monotonic:
 
 def _set_monotonic(spec, values):
     state = _Monotonic(spec["dtype"])
-    for value in values:
-        state.add(value)
+    state.add_array(np.asarray(values))
     state.apply(spec)
 
 
@@ -332,8 +357,7 @@ def _refresh_monotonic_metadata(root, manifest, hot_rows=()):
         if dtype in DTYPE_TO_NUMPY:
             path = root / f"{name}.{dtype}"
             if path.exists():
-                for value in np.fromfile(path, dtype=DTYPE_TO_NUMPY[dtype]):
-                    state.add(value)
+                state.add_array(np.fromfile(path, dtype=DTYPE_TO_NUMPY[dtype]))
             for row in sorted_hot_rows:
                 if name in row:
                     state.add(_coerce_stored_value(row[name], dtype, name, run_name))

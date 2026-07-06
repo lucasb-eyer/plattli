@@ -75,6 +75,28 @@ class TestDirectWriter(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 w.finish()
 
+    def test_monotonic_add_array_matches_elementwise(self):
+        from plattli.writer import _Monotonic
+        nan = float("nan")
+        cases = [
+            [], [1.0], [nan], [1.0, 2.0, 3.0], [3.0, 2.0], [2.0, 2.0, 2.0],
+            [1.0, 2.0, 1.5], [1.0, nan, 2.0], [1.0, 2.0, 2.0, 3.0],
+            [5.0, 4.0, 4.0, 3.0], [1.0, 1.0, 2.0], [2.0, 1.0],
+        ]
+        for prefix in ([], [0.0], [10.0], [10.0, 9.0]):
+            for case in cases:
+                a = _Monotonic("f32")
+                b = _Monotonic("f32")
+                for value in prefix + case:
+                    a.add(value)
+                for value in prefix:
+                    b.add(value)
+                b.add_array(np.asarray(case, dtype=np.float32))
+                self.assertEqual((a.broken, a.direction, a.seen),
+                                 (b.broken, b.direction, b.seen), (prefix, case))
+                if not a.broken and a.seen:
+                    self.assertEqual(a.last, b.last, (prefix, case))
+
     def test_compacting_rotates_hot_log(self):
         with tempfile.TemporaryDirectory() as tmp:
             run_root = Path(tmp) / "run"
