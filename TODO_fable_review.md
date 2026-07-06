@@ -170,8 +170,10 @@ Benchmark (2000 steps x 8 metrics, local disk, per-step `write`+`end_step` laten
   writers keep a `_finished` flag and any post-finish call raises a clear RuntimeError;
   finishing an empty run now writes an empty manifest (run_rows=0) and zips normally, so
   the result is a valid empty run instead of an invalid directory.
-- [ ] **`PlattliBulkWriter`** is the odd name out next to `DirectWriter`/`CompactingWriter`
-  and silently overwrites an existing `metrics.plattli`.
+- [x] **`PlattliBulkWriter`** is the odd name out next to `DirectWriter`/`CompactingWriter`
+  and silently overwrites an existing `metrics.plattli`. Fixed: renamed to `BulkWriter`
+  (no compat alias) and its constructor refuses an existing `metrics.plattli` unless
+  `overwrite=True` (which jsonl2plattli passes for re-conversions).
 - [ ] Writers support `del w` but not `with` — add a context manager (`__exit__` ->
   flush, not finish); matches the crash-safe philosophy.
 - [ ] Naming nits: `hotsize=None`-then-raise instead of a required arg;

@@ -17,11 +17,18 @@ class _ColumnBuffer:
         self.v = []
 
 
-class PlattliBulkWriter:
-    def __init__(self, outdir, step=0, config="config.json"):
+class BulkWriter:
+    def __init__(self, outdir, step=0, config="config.json", overwrite=False):
         self.run_root = Path(outdir)
         if self.run_root.name == "plattli":
             raise ValueError(f"outdir should be a run directory, not the plattli folder: {outdir}")
+        if not overwrite:
+            zip_path = _zip_path_for_root(self.run_root)
+            if zip_path.exists():
+                raise RuntimeError(f"found existing {zip_path}; pass overwrite=True to replace it")
+            root = self.run_root / "plattli"
+            if root.exists():
+                raise RuntimeError(f"found existing {root}; pass overwrite=True to replace it")
         self.run_root.mkdir(parents=True, exist_ok=True)
         self.root = self.run_root / "plattli"
         self.step = int(step)

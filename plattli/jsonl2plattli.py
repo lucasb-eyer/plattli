@@ -7,7 +7,7 @@ from argparse import ArgumentParser
 from multiprocessing import Pool, cpu_count
 from pathlib import Path
 
-from .bulk_writer import PlattliBulkWriter
+from .bulk_writer import BulkWriter
 from .writer import _zip_path_for_root
 
 DEFAULT_SKIP_PATTERN = r"[pg]norm.*"
@@ -37,7 +37,7 @@ def convert_run(run_dir, dest, use_named_zip, skip_cols=None, allow_rewinds=Fals
             config = json.loads(config_path.read_text(encoding="utf-8"))
         else:
             config = {}
-    w = PlattliBulkWriter(dest, config=config)
+    w = BulkWriter(dest, config=config, overwrite=True)  # Re-conversion replaces the previous export.
     with metrics_path.open("r", encoding="utf-8") as fh:
         for lineno, line in enumerate(fh, 1):
             raw = json.loads(line)
