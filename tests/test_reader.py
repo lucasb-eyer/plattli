@@ -170,6 +170,46 @@ class TestReader(unittest.TestCase):
                 self.assertEqual(step, 99)
                 self.assertEqual(value, np.float32(99.0))
 
+    def test_tail_reads_fast_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for zip in (False, True):
+                run_root = Path(tmp) / f"run{zip}"
+                w = plattli.DirectWriter(run_root, write_threads=0)
+                for i in range(100):
+                    w.write(loss=float(i), note=f"n{i}")
+                    w.end_step()
+                w.finish(optimize=False, zip=zip)
+
+                with plattli.Reader(run_root) as r:
+                    with mock.patch.object(r, "_metric_full", side_effect=AssertionError("fell back to full read")):
+                        step, value = r.metric("loss", idx=-1)
+                        self.assertEqual((step, value), (99, np.float32(99.0)))
+                        step, value = r.metric("loss", idx=5)
+                        self.assertEqual((step, value), (5, np.float32(5.0)))
+                        step, value = r.metric("note", idx=-2)
+                        self.assertEqual((step, value), (98, "n98"))
+                        self.assertEqual(r.metric_values("loss", istart=-3).tolist(), [97.0, 98.0, 99.0])
+                        self.assertEqual(r.metric_indices("loss", istart=-5, istop=-3).tolist(), [95, 96])
+                        with self.assertRaises(IndexError):
+                            r.metric("loss", idx=100)
+                        with self.assertRaises(IndexError):
+                            r.metric("loss", idx=-101)
+
+    def test_tail_reads_with_hot(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_root = Path(tmp) / "run"
+            w = plattli.CompactingWriter(run_root, hotsize=2)
+            for i in range(7):
+                w.write(loss=float(i))
+                w.end_step()
+                if w._compact_future:
+                    w._compact_future.result()
+
+            with plattli.Reader(run_root) as r:
+                step, value = r.metric("loss", idx=-1)
+                self.assertEqual((step, value), (6, 6.0))
+                self.assertEqual(r.metric_values("loss", istart=-2).tolist(), [5.0, 6.0])
+
     def test_selectors_with_hot_use_fast_path(self):
         with tempfile.TemporaryDirectory() as tmp:
             run_root = Path(tmp) / "run"

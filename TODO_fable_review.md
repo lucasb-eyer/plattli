@@ -98,10 +98,11 @@ Benchmark (2000 steps x 8 metrics, local disk, per-step `write`+`end_step` laten
   boundary split for position), then concatenates. Falls back to full-read only for
   value selectors on non-monotonic metrics, as before. Measured on 2M rows + hot tail:
   position slice 9.1ms -> 0.06ms, step slice 10.3ms -> 2.6ms, value slice 10.1ms -> 0.16ms.
-- [ ] **No tail fast path**: `metric("loss", idx=-1)` reads the whole column, and
-  `_position_slice` rejects negative `istart`/`istop` (reader.py:146), so "last N rows"
-  needs a `rows()` round-trip first. Tail reads are the most common dashboard query;
-  support negative positions and resolve them from the counts already computed.
+- [x] **No tail fast path**: `metric("loss", idx=-1)` read the whole column, and
+  `_position_slice` rejected negative `istart`/`istop`. Fixed: negative positions now
+  resolve Python-slice-style against the total count (columnar + hot), and an integer
+  `idx` with no other selector seek-reads just that one row. Measured on 2M rows:
+  idx=-1 and last-100 reads went ~12ms -> 0.03-0.07ms on zip, dir, and live+hot runs.
 - [ ] **Inconsistent caching for live runs**: manifest + hot columns are cached forever,
   data files read fresh — a long-lived Reader sees new columnar rows but a stale hot tail
   and metric list. Document Readers as one-shot or add `refresh()`.

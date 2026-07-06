@@ -152,8 +152,10 @@ class Reader:
     def _position_slice(self, count, istart, istop):
         istart = 0 if istart is None else int(istart)
         istop = count if istop is None else int(istop)
-        if istart < 0 or istop < 0:
-            raise ValueError("istart/istop must be non-negative.")
+        if istart < 0:  # Negative positions count from the end, like Python slices.
+            istart = max(count + istart, 0)
+        if istop < 0:
+            istop = max(count + istop, 0)
         istart = min(istart, count)
         istop = min(max(istop, istart), count)
         return [(istart, istop)] if istart < istop else []
@@ -848,6 +850,12 @@ class Reader:
 
     def metric(self, name, idx=None, start=None, stop=None, istart=None, istop=None, vstart=None, vstop=None):
         if self._selector_kind(start, stop, istart, istop, vstart, vstop) is None:
+            if isinstance(idx, (int, np.integer)) and not isinstance(idx, bool):
+                # Fast path: seek-read just the one requested row instead of the whole column.
+                indices, values = self._metric_select(name, None, None, int(idx), None if idx == -1 else int(idx) + 1, None, None)
+                if len(indices) != 1:
+                    raise IndexError(f"index {idx} out of range for metric {name} in run {self._run_name}")
+                return indices[0], values[0]
             indices, values = self._metric_full(name)
         else:
             selected = self._metric_select(name, start, stop, istart, istop, vstart, vstop)
