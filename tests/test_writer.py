@@ -10,7 +10,7 @@ from unittest import mock
 import numpy as np
 
 import plattli
-from plattli.writer import _find_arange_params, _replace_text_checked, _zip_path_for_root
+from plattli.writer import _find_arange_params, _replace_text_checked, _write_manifest, _zip_path_for_root
 
 
 def _read_jsonl(path):
@@ -141,6 +141,31 @@ class TestDirectWriter(unittest.TestCase):
 
             with plattli.Reader(run_root) as r:
                 self.assertEqual(r.metric_values("metrics").tolist(), [1.0])
+
+    def test_direct_new_metric_discards_orphans_and_writes_before_manifest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_root = Path(tmp) / "run"
+            plattli_root = run_root / "plattli"
+            w = plattli.DirectWriter(run_root)
+            np.asarray([99.0], dtype=np.float32).tofile(plattli_root / "loss.f32")
+            np.asarray([99], dtype=np.uint32).tofile(plattli_root / "loss.indices")
+
+            def check_first_row_exists(path, manifest, run_rows=None):
+                self.assertTrue(np.allclose(np.fromfile(plattli_root / "loss.f32", dtype=np.float32), [1.0]))
+                self.assertEqual(np.fromfile(plattli_root / "loss.indices", dtype=np.uint32).tolist(), [3])
+                return _write_manifest(path, manifest, run_rows)
+
+            w.step = 3
+            with mock.patch("plattli.writer._write_manifest", check_first_row_exists):
+                w.write(loss=1.0)
+            w.end_step()
+            w.finish(optimize=False, zip=False)
+
+            with plattli.Reader(run_root) as r:
+                indices, values = r.metric("loss")
+                self.assertEqual(indices.tolist(), [3])
+                self.assertTrue(np.allclose(values, [1.0]))
+
     def test_direct_write_error_poisons_writer(self):
         with tempfile.TemporaryDirectory() as tmp:
             run_root = Path(tmp) / "run"

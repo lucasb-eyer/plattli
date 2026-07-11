@@ -505,7 +505,8 @@ class DirectWriter:
                 raise ValueError(f"metric name 'step' is reserved in run {self.run_root.name}")
             if name in self._step_metrics:
                 raise RuntimeError(f"metric already written in step {self.step} for {name} in run {self.run_root.name}")
-            if name not in self._manifest:
+            is_new = name not in self._manifest
+            if is_new:
                 dtype = _resolve_dtype(value, name=name, run_name=self.run_root.name)
                 (self.root / name).parent.mkdir(parents=True, exist_ok=True)
                 self._manifest[name] = {"indices": "indices", "dtype": dtype}
@@ -515,7 +516,17 @@ class DirectWriter:
             value = _coerce_stored_value(value, dtype, name, self.run_root.name)
             new_metric = _track_monotonic_value(self._manifest, self._monotonic, name, value) or new_metric
             write_indices = self._manifest[name]["indices"] == "indices"
-            if self._executor:
+            if is_new:
+                try:
+                    # Discard files orphaned by a crash before the metric reached the
+                    # manifest, then publish the first row synchronously.
+                    (self.root / f"{name}.{dtype}").write_bytes(b"")
+                    (self.root / f"{name}.indices").write_bytes(b"")
+                    self._write_entry(name, dtype, value, self.step, write_indices)
+                except Exception as err:
+                    self._broken = err
+                    raise
+            elif self._executor:
                 self._futures.append(self._executor.submit(self._write_entry, name, dtype, value, self.step, write_indices))
             else:
                 try:
@@ -526,7 +537,11 @@ class DirectWriter:
             self._step_metrics.add(name)
 
         if new_metric:
-            _write_manifest(self.root / "plattli.json", self._manifest)
+            try:
+                _write_manifest(self.root / "plattli.json", self._manifest)
+            except Exception as err:
+                self._broken = err
+                raise
 
     def end_step(self):
         self._check_finished()
