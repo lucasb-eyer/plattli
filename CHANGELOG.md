@@ -5,6 +5,7 @@ All notable changes to this project are documented in this file.
 ## 0.11.0 - 2026-07-11
 - Breaking API change: `PlattliBulkWriter` is now `BulkWriter`. Update imports and
   constructor calls; no compatibility alias is provided.
+- `CompactingWriter` now requires `hotsize` as a keyword argument.
 - Unified `write()` support across writers: pass one metrics dict, keyword metrics,
   or both (without duplicate names).
 - Added aligned multi-column reads with `Reader.table()` and live-run cache reset

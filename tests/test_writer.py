@@ -383,6 +383,11 @@ class TestDirectWriter(unittest.TestCase):
             with self.assertRaises(AssertionError):
                 plattli.DirectWriter(run_root, step=-1)
 
+    def test_compacting_hotsize_is_required(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(TypeError):
+                plattli.CompactingWriter(Path(tmp) / "run")
+
     def test_basic_write(self):
         with tempfile.TemporaryDirectory() as tmp:
             run_root = Path(tmp)

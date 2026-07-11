@@ -90,7 +90,7 @@ Calling `end_step` from a different thread would lead to silently inconsistent d
   to symlink `config.json` to (default: `"config.json"`).
 - If the target path does not exist, an empty config is written; pass `None` to force an empty config.
 
-### CompactingWriter(outdir, step=0, hotsize, config="config.json", allow_resume_finalized=False)
+### CompactingWriter(outdir, step=0, *, hotsize, config="config.json", allow_resume_finalized=False)
 - Hot mode: writes rows to `hot.jsonl` and compacts them into columnar files in the background.
 - `hotsize` must be > 0 and is the compaction trigger: once the hot log holds `hotsize` completed steps, all completed rows are compacted in one background batch.
 - Backpressure: writes normally never block on compaction; if the filesystem cannot keep up with the write rate, completed rows accumulate in memory (and in the hot log, so nothing is lost on crash) and batches get bigger. Once the backlog reaches 10x `hotsize`, `end_step` blocks until the in-flight batch lands, so memory stays bounded and logging degrades to filesystem speed instead of exhausting RAM.

@@ -686,7 +686,7 @@ class DirectWriter:
 
 
 class CompactingWriter:
-    def __init__(self, outdir, step=0, hotsize=None, config="config.json", allow_resume_finalized=False):
+    def __init__(self, outdir, step=0, *, hotsize, config="config.json", allow_resume_finalized=False):
         self.run_root = Path(outdir)
         if self.run_root.name == "plattli":
             raise ValueError(f"outdir should be a run directory, not the plattli folder: {outdir}")
@@ -697,8 +697,6 @@ class CompactingWriter:
         self.step = int(step)
         assert self.step >= 0, f"step must be >= 0 for run {self.run_root.name}: {self.step}"
 
-        if hotsize is None:
-            raise ValueError(f"hotsize is required for run {self.run_root.name}")
         self.hotsize = int(hotsize)
         if self.hotsize <= 0:
             raise ValueError(f"hotsize must be > 0 for run {self.run_root.name}: {self.hotsize}")
