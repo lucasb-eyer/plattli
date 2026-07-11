@@ -83,7 +83,8 @@ Calling `end_step` from a different thread would lead to silently inconsistent d
 - If `outdir/plattli/plattli.json` already exists, all metric files are truncated to `step` so you
   can resume a run and overwrite later data safely.
 - If `outdir/metrics.plattli` exists, the constructor refuses to proceed unless
-  `allow_resume_finalized=True`, which unzips into `outdir/plattli` and removes the zip.
+  `allow_resume_finalized=True`, which validates the archive paths, unzips into
+  `outdir/plattli`, and removes the zip.
 - `write_threads=0` disables background writes.
 - `config` is a dict written to `config.json`, or a string path (resolved relative to `outdir`)
   to symlink `config.json` to (default: `"config.json"`).
@@ -95,6 +96,11 @@ Calling `end_step` from a different thread would lead to silently inconsistent d
 - Backpressure: writes normally never block on compaction; if the filesystem cannot keep up with the write rate, completed rows accumulate in memory (and in the hot log, so nothing is lost on crash) and batches get bigger. Once the backlog reaches 10x `hotsize`, `end_step` blocks until the in-flight batch lands, so memory stays bounded and logging degrades to filesystem speed instead of exhausting RAM.
 - `config` follows the same rules as `DirectWriter`.
 - `allow_resume_finalized` follows the same rules as `DirectWriter`.
+
+### BulkWriter(outdir, step=0, config="config.json", overwrite=False)
+- Buffers a complete run in memory and writes the columnar export on `finish()`.
+- Refuses to replace an existing `outdir/plattli` directory or `outdir/metrics.plattli`
+  unless `overwrite=True`.
 
 ### DirectWriter.write(...)
 - Appends each metric at the current step (pass at most one dict or keyword metrics; the dict form is needed for slash-named metrics like `detail/thing0`).
@@ -254,4 +260,6 @@ One JSON value per line:
 ### Metric names and subfolders
 Metric names are used as file paths. A slash creates subfolders:
 `detail/thing0` -> `detail/thing0.f32`.
-The metric name `step` is reserved.
+Names must be non-empty relative paths. Absolute paths, backslashes, NULs, empty or
+`.`/`..` path components, and non-string names are rejected. The following names are
+reserved: `step`, `run_rows`, `when_exported`, `hot`, and `hot.compacting`.
