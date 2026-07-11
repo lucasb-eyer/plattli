@@ -6,7 +6,16 @@ from pathlib import Path
 import numpy as np
 
 from ._indices import _find_piecewise_params
-from .writer import DTYPE_TO_NUMPY, JSONL_DTYPE, _merge_metrics, _resolve_dtype, _set_monotonic, _tight_dtype, _zip_path_for_root
+from .writer import (
+    DTYPE_TO_NUMPY,
+    JSONL_DTYPE,
+    _merge_metrics,
+    _resolve_dtype,
+    _set_monotonic,
+    _tight_dtype,
+    _validate_metric_names,
+    _zip_path_for_root,
+)
 
 
 class _ColumnBuffer:
@@ -51,9 +60,8 @@ class BulkWriter:
         self._check_finished()
         assert 0 <= self.step <= 0xFFFFFFFF, f"step out of uint32 range for run {self.run_root.name}: {self.step}"
         metrics = _merge_metrics(args, kwargs, self.run_root.name)
+        _validate_metric_names(metrics, self.run_root.name)
         for name, value in metrics.items():
-            if name == "step":
-                raise ValueError(f"metric name 'step' is reserved in run {self.run_root.name}")
             if name in self._step_metrics:
                 raise RuntimeError(f"metric already written in step {self.step} for {name} in run {self.run_root.name}")
             if hasattr(value, "__array__") and np.asarray(value).shape != ():

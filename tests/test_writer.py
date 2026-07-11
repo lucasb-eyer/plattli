@@ -142,6 +142,49 @@ class TestDirectWriter(unittest.TestCase):
             with plattli.Reader(run_root) as r:
                 self.assertEqual(r.metric_values("metrics").tolist(), [1.0])
 
+    def test_metric_names_are_rejected_before_path_use(self):
+        invalid_names = (
+            None,
+            "",
+            ".",
+            "..",
+            "detail/../loss",
+            "/absolute",
+            r"C:\absolute",
+            r"detail\loss",
+            "step",
+            "run_rows",
+            "when_exported",
+            "hot",
+            "hot.compacting",
+        )
+        for make_writer in (
+            lambda root: plattli.DirectWriter(root, write_threads=0),
+            lambda root: plattli.CompactingWriter(root, hotsize=10),
+            lambda root: plattli.BulkWriter(root),
+        ):
+            with tempfile.TemporaryDirectory() as tmp:
+                run_root = Path(tmp) / "run"
+                writer = make_writer(run_root)
+                for name in invalid_names:
+                    with self.assertRaises((TypeError, ValueError)):
+                        writer.write({name: 1.0})
+                writer.finish(optimize=False, zip=False)
+
+    def test_finalized_resume_rejects_unsafe_archive_paths(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_root = Path(tmp) / "run"
+            run_root.mkdir()
+            zip_path = _zip_path_for_root(run_root)
+            with zipfile.ZipFile(zip_path, "w") as zf:
+                zf.writestr("plattli.json", "{}")
+                zf.writestr("../escaped.txt", "must not be extracted")
+
+            with self.assertRaises(RuntimeError):
+                plattli.DirectWriter(run_root, write_threads=0, allow_resume_finalized=True)
+            self.assertFalse((Path(tmp) / "escaped.txt").exists())
+            self.assertTrue(zip_path.exists())
+
     def test_direct_new_metric_discards_orphans_and_writes_before_manifest(self):
         with tempfile.TemporaryDirectory() as tmp:
             run_root = Path(tmp) / "run"

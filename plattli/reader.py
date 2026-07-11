@@ -11,7 +11,14 @@ from ._indices import (
     _segments_to_array,
     _segments_with_counts,
 )
-from .writer import DTYPE_TO_NUMPY, HOT_COMPACTING_FILENAME, HOT_FILENAME, JSONL_DTYPE
+from .writer import (
+    DTYPE_TO_NUMPY,
+    HOT_COMPACTING_FILENAME,
+    HOT_FILENAME,
+    JSONL_DTYPE,
+    _validate_metric_names,
+    _validate_metric_name,
+)
 
 def is_run(path):
     kind, _, zf = _resolve_plattli(path)
@@ -530,6 +537,7 @@ class Reader:
         manifest = json.loads(self._read_text("plattli.json"))
         self._run_rows = manifest.pop("run_rows", None)
         self._when_exported = manifest.pop("when_exported", None)
+        _validate_metric_names(manifest, self._run_name)
         self._manifest = manifest
 
     def _ensure_hot(self):
@@ -561,6 +569,7 @@ class Reader:
             for name, value in row.items():
                 if name == "step":
                     continue
+                _validate_metric_name(name, self._run_name)
                 col = self._hot_columns.get(name)
                 if col is None:
                     col = {"indices": [], "values": []}

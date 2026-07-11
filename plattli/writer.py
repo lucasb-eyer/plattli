@@ -4,7 +4,7 @@ import threading
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, wait
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from shutil import rmtree
 
 import numpy as np
@@ -38,6 +38,49 @@ DTYPE_TO_NUMPY = {
 JSONL_DTYPE = "jsonl"
 HOT_FILENAME = "hot.jsonl"
 HOT_COMPACTING_FILENAME = "hot.compacting.jsonl"
+_RESERVED_METRIC_NAMES = frozenset({"step", "run_rows", "when_exported", "hot", "hot.compacting"})
+
+
+def _validate_metric_name(name, run_name):
+    if not isinstance(name, str):
+        raise TypeError(f"metric names must be strings in run {run_name} (got {type(name).__name__})")
+    if not name or "\x00" in name or "\\" in name:
+        raise ValueError(f"invalid metric name {name!r} in run {run_name}")
+    if name in _RESERVED_METRIC_NAMES:
+        raise ValueError(f"metric name {name!r} is reserved in run {run_name}")
+    if PurePosixPath(name).is_absolute():
+        raise ValueError(f"absolute metric path {name!r} is not allowed in run {run_name}")
+    windows_name = PureWindowsPath(name)
+    if windows_name.is_absolute() or windows_name.drive:
+        raise ValueError(f"absolute metric path {name!r} is not allowed in run {run_name}")
+    if any(part in ("", ".", "..") for part in name.split("/")):
+        raise ValueError(f"invalid metric path {name!r} in run {run_name}")
+    return name
+
+
+def _validate_metric_names(names, run_name):
+    for name in names:
+        _validate_metric_name(name, run_name)
+
+
+def _archive_member_path(root, name, run_name):
+    if not isinstance(name, str) or not name or "\x00" in name or "\\" in name:
+        raise RuntimeError(f"invalid archive member {name!r} in run {run_name}")
+    member_name = name[:-1] if name.endswith("/") else name
+    if not member_name or PurePosixPath(member_name).is_absolute():
+        raise RuntimeError(f"unsafe archive member {name!r} in run {run_name}")
+    windows_name = PureWindowsPath(member_name)
+    if windows_name.is_absolute() or windows_name.drive:
+        raise RuntimeError(f"unsafe archive member {name!r} in run {run_name}")
+    if any(part in ("", ".", "..") for part in member_name.split("/")):
+        raise RuntimeError(f"unsafe archive member {name!r} in run {run_name}")
+    root = Path(root).resolve()
+    out_path = (root / member_name).resolve()
+    try:
+        out_path.relative_to(root)
+    except ValueError as exc:
+        raise RuntimeError(f"unsafe archive member {name!r} in run {run_name}") from exc
+    return out_path
 
 
 def _zip_path_for_root(root):
@@ -51,7 +94,8 @@ def _run_name_for_root(root):
     return root.name
 
 
-def _manifest_payload(manifest, run_rows=None):
+def _manifest_payload(manifest, run_rows=None, run_name=None):
+    _validate_metric_names(manifest, run_name or "manifest")
     payload = {
         **manifest,
         "when_exported": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
@@ -62,7 +106,8 @@ def _manifest_payload(manifest, run_rows=None):
 
 
 def _write_manifest(path, manifest, run_rows=None):
-    _replace_text_checked(path, _manifest_payload(manifest, run_rows), "manifest")
+    path = Path(path)
+    _replace_text_checked(path, _manifest_payload(manifest, run_rows, _run_name_for_root(path.parent)), "manifest")
 
 
 def _replace_text_checked(path, payload, label):
@@ -446,12 +491,15 @@ def _maybe_resume_finalized(run_root, root, allow_resume_finalized):
         root.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(zip_path) as zf:
         zf.getinfo("plattli.json")
-        for name in zf.namelist():
-            if name.endswith("/"):
+        members = []
+        for info in zf.infolist():
+            out_path = _archive_member_path(root, info.filename, run_name)
+            if info.filename.endswith("/"):
                 continue
-            out_path = root / name
+            members.append((info, out_path))
+        for info, out_path in members:
             out_path.parent.mkdir(parents=True, exist_ok=True)
-            out_path.write_bytes(zf.read(name))
+            out_path.write_bytes(zf.read(info))
     zip_path.unlink()
 
 
@@ -479,6 +527,7 @@ class DirectWriter:
             self._manifest = json.loads((self.root / "plattli.json").read_text(encoding="utf-8"))
             self._manifest.pop("when_exported", None)
             self._manifest.pop("run_rows", None)
+            _validate_metric_names(self._manifest, self.run_root.name)
             if self._manifest:
                 _truncate_to_step(self.root, self._manifest, self.step, allow_missing=False)
                 _force_indices_files(self.root, self._manifest)
@@ -493,6 +542,7 @@ class DirectWriter:
         self._check_broken()
         self._drain_errors()
         metrics = _merge_metrics(args, kwargs, self.run_root.name)
+        _validate_metric_names(metrics, self.run_root.name)
         if not metrics:
             return
 
@@ -676,6 +726,7 @@ class CompactingWriter:
             self._manifest = json.loads((self.root / "plattli.json").read_text(encoding="utf-8"))
             self._manifest.pop("when_exported", None)
             self._manifest.pop("run_rows", None)
+            _validate_metric_names(self._manifest, self.run_root.name)
             if self._manifest:
                 _truncate_to_step(self.root, self._manifest, self.step, allow_missing=True)
 
@@ -708,6 +759,7 @@ class CompactingWriter:
         self._check_broken()
         self._drain_errors()
         metrics = _merge_metrics(args, kwargs, self.run_root.name)
+        _validate_metric_names(metrics, self.run_root.name)
         if not metrics and flush:
             self._flush_hot()
             return
@@ -835,6 +887,7 @@ class CompactingWriter:
             for name, value in row.items():
                 if name == "step":
                     continue
+                _validate_metric_name(name, self.run_root.name)
                 if name not in self._manifest:
                     dtype = _resolve_dtype(value, name=name, run_name=self.run_root.name)
                     (self.root / name).parent.mkdir(parents=True, exist_ok=True)
