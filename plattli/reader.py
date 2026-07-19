@@ -900,13 +900,23 @@ class Reader:
             # Step ranges push down to every column; positions apply to the joined table.
             sel = {"start": start, "stop": stop} if kind == "step" else {}
             columns = {name: self.metric(name, **sel) for name in names}
-            steps = None
-            for idx, _ in columns.values():
-                steps = idx if steps is None else np.intersect1d(steps, idx, assume_unique=True)
+            column_values = iter(columns.values())
+            steps = next(column_values)[0]
+            # Equal-cadence columns need neither an intersection nor remapping.
+            same_indices = True
+            for idx, _ in column_values:
+                if idx is steps or (len(idx) == len(steps) and np.array_equal(idx, steps)):
+                    continue
+                same_indices = False
+                steps = np.intersect1d(steps, idx, assume_unique=True)
             if kind == "position":
                 chunks = self._position_slice(len(steps), istart, istop)
                 lo, hi = chunks[0] if chunks else (0, 0)
+                if same_indices:
+                    return steps[lo:hi], {name: vals[lo:hi] for name, (_, vals) in columns.items()}
                 steps = steps[lo:hi]
+            elif same_indices:
+                return steps, {name: vals[:len(steps)] for name, (_, vals) in columns.items()}
         else:
             steps, on_values = self.metric(on, start=start, stop=stop, istart=istart, istop=istop, vstart=vstart, vstop=vstop)
             columns = {}
@@ -917,9 +927,21 @@ class Reader:
                     columns[name] = self.metric(name, start=int(steps[0]), stop=int(steps[-1]))
                 else:
                     columns[name] = self.metric(name, istart=0, istop=0)
+            same_indices = True
             for idx, _ in columns.values():
+                if idx is steps or (len(idx) == len(steps) and np.array_equal(idx, steps)):
+                    continue
+                same_indices = False
                 steps = np.intersect1d(steps, idx, assume_unique=True)
-        return steps, {name: vals[np.searchsorted(idx, steps)] for name, (idx, vals) in columns.items()}
+            if same_indices:
+                return steps, {name: vals[:len(steps)] for name, (_, vals) in columns.items()}
+        # A live write can extend vals after idx was read, so direct reuse still trims
+        # the not-yet-indexed tail.
+        return steps, {
+            name: vals[:len(steps)] if idx is steps or (len(idx) == len(steps) and np.array_equal(idx, steps))
+            else vals[np.searchsorted(idx, steps)]
+            for name, (idx, vals) in columns.items()
+        }
 
     def metric(self, name, idx=None, start=None, stop=None, istart=None, istop=None, vstart=None, vstop=None):
         if self._selector_kind(start, stop, istart, istop, vstart, vstop) is None:

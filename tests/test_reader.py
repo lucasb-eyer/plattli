@@ -215,6 +215,91 @@ class TestReader(unittest.TestCase):
                 with self.assertRaises(KeyError):
                     r.table(["loss", "nope"])
 
+    def test_table_skips_alignment_for_equal_cadence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_root = Path(tmp) / "run"
+            w = plattli.DirectWriter(run_root, write_threads=0)
+            for i in range(6):
+                w.write(loss=10.0 + i, wall=100.0 + i)
+                w.end_step()
+            w.finish(optimize=True, zip=False)
+
+            # These are expensive on large columns. Equal index arrays can use their
+            # values directly, so guard the fast path without a timing-based test.
+            intersect1d = np.intersect1d
+            searchsorted = np.searchsorted
+            with (
+                mock.patch("plattli.reader.np.intersect1d", wraps=intersect1d) as intersect,
+                mock.patch("plattli.reader.np.searchsorted", wraps=searchsorted) as search,
+                plattli.Reader(run_root) as r,
+            ):
+                steps, cols = r.table(["loss"])
+                self.assertEqual(steps.tolist(), [0, 1, 2, 3, 4, 5])
+                self.assertTrue(np.allclose(cols["loss"], [10, 11, 12, 13, 14, 15]))
+
+                steps, cols = r.table(["loss", "wall"])
+                self.assertEqual(steps.tolist(), [0, 1, 2, 3, 4, 5])
+                self.assertTrue(np.allclose(cols["wall"], [100, 101, 102, 103, 104, 105]))
+
+                # Position selectors apply after the join, including negative bounds.
+                steps, cols = r.table(["loss", "wall"], istart=1, istop=-1)
+                self.assertEqual(steps.tolist(), [1, 2, 3, 4])
+                self.assertTrue(np.allclose(cols["loss"], [11, 12, 13, 14]))
+                self.assertTrue(np.allclose(cols["wall"], [101, 102, 103, 104]))
+
+                # The `on` column may be requested or used only as the row selector.
+                steps, cols = r.table(["wall", "loss"], on="wall", istart=1, istop=4)
+                self.assertEqual(steps.tolist(), [1, 2, 3])
+                self.assertTrue(np.allclose(cols["wall"], [101, 102, 103]))
+                self.assertTrue(np.allclose(cols["loss"], [11, 12, 13]))
+
+                steps, cols = r.table(["loss"], on="wall", istart=1, istop=4)
+                self.assertEqual(steps.tolist(), [1, 2, 3])
+                self.assertEqual(list(cols), ["loss"])
+                self.assertTrue(np.allclose(cols["loss"], [11, 12, 13]))
+
+                steps, cols = r.table(["loss"], start=100, stop=200)
+                self.assertEqual(steps.tolist(), [])
+                self.assertEqual(cols["loss"].tolist(), [])
+                self.assertEqual(steps.dtype, np.uint32)
+                self.assertEqual(cols["loss"].dtype, np.float32)
+
+                intersect.assert_not_called()
+                search.assert_not_called()
+
+    def test_table_equal_cadence_trims_racing_values(self):
+        # A live writer may append a value after metric() has read its indices.
+        # The alignment gather historically ignored that not-yet-indexed tail.
+        indices = np.asarray([0, 1], dtype=np.uint32)
+        r = object.__new__(plattli.Reader)
+        r._run_name = "mock-live-run"
+        r.metric = mock.Mock(side_effect=[
+            (indices, np.asarray([10.0, 11.0, 12.0], dtype=np.float32)),
+            (indices.copy(), np.asarray([20.0, 21.0, 22.0], dtype=np.float32)),
+        ])
+
+        steps, cols = r.table(["loss", "acc"])
+
+        self.assertEqual(steps.tolist(), [0, 1])
+        self.assertEqual(cols["loss"].tolist(), [10.0, 11.0])
+        self.assertEqual(cols["acc"].tolist(), [20.0, 21.0])
+        self.assertEqual(len(steps), len(cols["loss"]))
+        self.assertEqual(len(steps), len(cols["acc"]))
+
+    def test_table_aligns_equal_length_different_indices(self):
+        r = object.__new__(plattli.Reader)
+        r._run_name = "mock-run"
+        r.metric = mock.Mock(side_effect=[
+            (np.asarray([0, 1, 3], dtype=np.uint32), np.asarray([10.0, 11.0, 13.0], dtype=np.float32)),
+            (np.asarray([0, 2, 3], dtype=np.uint32), np.asarray([20.0, 22.0, 23.0], dtype=np.float32)),
+        ])
+
+        steps, cols = r.table(["loss", "acc"])
+
+        self.assertEqual(steps.tolist(), [0, 3])
+        self.assertEqual(cols["loss"].tolist(), [10.0, 13.0])
+        self.assertEqual(cols["acc"].tolist(), [20.0, 23.0])
+
     def test_table_live_and_zip(self):
         with tempfile.TemporaryDirectory() as tmp:
             run_root = Path(tmp) / "run"
