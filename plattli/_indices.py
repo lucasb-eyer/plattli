@@ -48,6 +48,7 @@ def _segments_with_counts(segments, total_count=None):
     total = 0
     last = None
     total_count = None if total_count is None else int(total_count)
+    has_open_tail = _segments_have_open_tail(segments)
     for idx, segment in enumerate(segments):
         start, step = _segment_start_step(segment)
         if last is not None and start <= last:
@@ -59,6 +60,11 @@ def _segments_with_counts(segments, total_count=None):
             if stop <= start:
                 raise ValueError(f"invalid segment range: {segment}")
             count = (stop - start + step - 1) // step
+            last = start + (count - 1) * step
+            if has_open_tail and total_count is not None:
+                # Live manifests land before their batch values, so the available
+                # prefix can temporarily end inside any advertised closed segment.
+                count = min(count, max(total_count - total, 0))
             is_open = False
         else:
             if idx != len(segments) - 1:
@@ -71,7 +77,7 @@ def _segments_with_counts(segments, total_count=None):
             is_open = True
         if count < 0:
             raise ValueError(f"invalid segment count: {segment}")
-        if count:
+        if count and is_open:
             last = start + (count - 1) * step
         yield start, count, step, is_open
         total += count

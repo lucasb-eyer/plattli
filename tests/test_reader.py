@@ -29,6 +29,26 @@ class TestReader(unittest.TestCase):
                 self.assertTrue(np.allclose(r.metric_values("loss", start=1, stop=3), [2.0]))
                 self.assertEqual(r.approx_max_rows(), 3)
 
+    def test_reader_open_tail_truncates_closed_segments_to_values(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_root = Path(tmp) / "run"
+            plattli_root = run_root / "plattli"
+            plattli_root.mkdir(parents=True)
+            (plattli_root / "plattli.json").write_text(
+                json.dumps({"loss": {"indices": [
+                    {"start": 0, "stop": 3, "step": 1},
+                    {"start": 10, "stop": 14, "step": 2},
+                    {"start": 20, "step": 1},
+                ], "dtype": "f32"}}),
+                encoding="utf-8",
+            )
+            np.asarray([0.0, 1.0, 2.0, 10.0], dtype=np.float32).tofile(plattli_root / "loss.f32")
+
+            with plattli.Reader(run_root) as r:
+                self.assertEqual(r.metric_indices("loss").tolist(), [0, 1, 2, 10])
+                self.assertEqual(r.rows("loss"), 4)
+                self.assertEqual(r.approx_max_rows(), 4)
+
     def test_reader_piecewise_indices(self):
         with tempfile.TemporaryDirectory() as tmp:
             run_root = Path(tmp) / "run"

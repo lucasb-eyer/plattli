@@ -1,5 +1,6 @@
 import json
 import tempfile
+import threading
 import time
 import unittest
 import zipfile
@@ -10,6 +11,7 @@ from unittest import mock
 import numpy as np
 
 import plattli
+import plattli.writer as writer_module
 from plattli.writer import _find_arange_params, _replace_text_checked, _write_manifest, _zip_path_for_root
 
 
@@ -748,6 +750,61 @@ class TestDirectWriter(unittest.TestCase):
             w.finish(optimize=False, zip=False)
             manifest = json.loads((plattli_root / "plattli.json").read_text(encoding="utf-8"))
             self.assertEqual(manifest["loss"]["indices"], [{"start": 0, "stop": 5, "step": 1}])
+
+    def test_reader_during_manifest_ahead_of_values(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_root = Path(tmp) / "run"
+            w = plattli.CompactingWriter(run_root, hotsize=3)
+            for step in [0, 1, 2]:
+                w.step = step
+                w.write(loss=float(step))
+                w.end_step()
+            w.write({}, flush=True)
+            w._compact_future.result()
+
+            append_started = threading.Event()
+            append_allowed = threading.Event()
+            original_append = writer_module._append_numeric
+
+            def pause_before_append(path, values, dtype):
+                append_started.set()
+                if not append_allowed.wait(5):
+                    raise TimeoutError("test did not release value append")
+                original_append(path, values, dtype)
+
+            with mock.patch("plattli.writer._append_numeric", pause_before_append):
+                for step in [4, 5, 7]:
+                    w.step = step
+                    w.write(loss=float(step))
+                    w.end_step()
+                w.write({}, flush=True)
+                try:
+                    self.assertTrue(append_started.wait(5))
+                    manifest = json.loads((run_root / "plattli/plattli.json").read_text(encoding="utf-8"))
+                    self.assertEqual(manifest["loss"]["indices"], [
+                        {"start": 0, "step": 1, "stop": 3},
+                        {"start": 4, "step": 1, "stop": 6},
+                        {"start": 7, "step": 1},
+                    ])
+                    self.assertTrue(np.allclose(
+                        np.fromfile(run_root / "plattli/loss.f32", dtype=np.float32),
+                        [0, 1, 2],
+                    ))
+                    with plattli.Reader(run_root) as r:
+                        indices, values = r.metric("loss")
+                        self.assertEqual(indices.tolist(), [0, 1, 2, 4, 5, 7])
+                        self.assertTrue(np.allclose(values, indices))
+                        self.assertEqual(r.rows("loss"), 6)
+                        self.assertEqual(r.approx_max_rows(), 3)
+                        self.assertEqual(r.approx_max_rows(faster=False), 6)
+                        indices, values = r.metric("loss", start=1, stop=5)
+                        self.assertEqual(indices.tolist(), [1, 2, 4, 5])
+                        self.assertTrue(np.allclose(values, indices))
+                finally:
+                    append_allowed.set()
+                    w._compact_future.result(timeout=5)
+
+            w.finish(optimize=False, zip=False)
 
     def test_monotonic_metadata_compacting(self):
         with tempfile.TemporaryDirectory() as tmp:
