@@ -394,6 +394,84 @@ class TestReader(unittest.TestCase):
                         with self.assertRaises(IndexError):
                             r.metric("loss", idx=-101)
 
+    def test_zip_reads_use_owned_4k_buffered_handle(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_root = Path(tmp) / "run"
+            w = plattli.DirectWriter(run_root, write_threads=0)
+            for i in range(100):
+                w.write(loss=float(i))
+                w.end_step()
+            w.finish(optimize=False, zip=True)
+
+            zip_path = run_root / "metrics.plattli"
+            original_open = Path.open
+            opened = []
+
+            def tracked_open(path, *args, **kwargs):
+                fh = original_open(path, *args, **kwargs)
+                if path == zip_path:
+                    opened.append((args, kwargs, fh))
+                return fh
+
+            with mock.patch.object(Path, "open", tracked_open):
+                with plattli.Reader(run_root) as r:
+                    fh = r._zip_fh
+                    self.assertIs(r._zip.fp, fh)
+                    self.assertEqual(r.metric("loss", idx=-1), (99, np.float32(99.0)))
+                    idx, values = r.metric("loss", istart=20, istop=25)
+                    self.assertEqual(idx.tolist(), [20, 21, 22, 23, 24])
+                    self.assertEqual(values.tolist(), [20.0, 21.0, 22.0, 23.0, 24.0])
+                    self.assertEqual(r.metric_values("loss").tolist(), [float(i) for i in range(100)])
+
+            self.assertEqual([(args, kwargs) for args, kwargs, _ in opened], [
+                (("rb",), {"buffering": 4096}),
+            ])
+            self.assertTrue(fh.closed)
+
+    def test_zip_constructor_failures_close_buffered_handles(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            invalid_zip = Path(tmp) / "invalid.plattli"
+            invalid_zip.write_bytes(b"not a zip")
+            missing_manifest = Path(tmp) / "missing-manifest.plattli"
+            with zipfile.ZipFile(missing_manifest, "w") as zf:
+                zf.writestr("other.json", "{}")
+
+            original_open = Path.open
+            opened = []
+
+            def tracked_open(path, *args, **kwargs):
+                fh = original_open(path, *args, **kwargs)
+                if path in (invalid_zip, missing_manifest):
+                    opened.append((args, kwargs, fh))
+                return fh
+
+            with mock.patch.object(Path, "open", tracked_open):
+                with self.assertRaises(FileNotFoundError):
+                    plattli.Reader(invalid_zip)
+                with self.assertRaises(FileNotFoundError):
+                    plattli.Reader(missing_manifest)
+
+            self.assertEqual([(args, kwargs) for args, kwargs, _ in opened], [
+                (("rb",), {"buffering": 4096}),
+                (("rb",), {"buffering": 4096}),
+            ])
+            self.assertTrue(all(fh.closed for _, _, fh in opened))
+
+    def test_repeated_zip_reader_construction_does_not_leak_handles(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_root = Path(tmp) / "run"
+            w = plattli.DirectWriter(run_root, write_threads=0)
+            w.write(loss=1.0)
+            w.end_step()
+            w.finish(optimize=False, zip=True)
+
+            handles = []
+            for _ in range(100):
+                with plattli.Reader(run_root) as r:
+                    handles.append(r._zip_fh)
+                    self.assertFalse(r._zip_fh.closed)
+            self.assertTrue(all(fh.closed for fh in handles))
+
     def test_tail_reads_with_hot(self):
         with tempfile.TemporaryDirectory() as tmp:
             run_root = Path(tmp) / "run"

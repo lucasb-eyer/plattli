@@ -21,9 +21,9 @@ from .writer import (
 )
 
 def is_run(path):
-    kind, _, zf = _resolve_plattli(path)
+    kind, _, zf, zip_fh = _resolve_plattli(path)
     if zf is not None:
-        zf.close()
+        _close_plattli_zip(zf, zip_fh)
     return kind is not None
 
 def resolve_run_dir(path):
@@ -42,41 +42,61 @@ def is_run_dir(path):
 
 
 def _open_plattli_zip(path):
-    """Returns an open ZipFile if path is a plattli zip, else None."""
+    """Returns an open (ZipFile, file handle) if path is a plattli zip, else None."""
     if not path.is_file():
         return None
     try:
-        zf = zipfile.ZipFile(path)
-    except (zipfile.BadZipFile, OSError):
+        fh = path.open("rb", buffering=4096)
+    except OSError:
         return None
+    try:
+        zf = zipfile.ZipFile(fh)
+    except (zipfile.BadZipFile, OSError):
+        fh.close()
+        return None
+    except BaseException:
+        fh.close()
+        raise
     try:
         zf.getinfo("plattli.json")
     except KeyError:
-        zf.close()
+        _close_plattli_zip(zf, fh)
         return None
-    return zf
+    except BaseException:
+        _close_plattli_zip(zf, fh)
+        raise
+    return zf, fh
+
+
+def _close_plattli_zip(zf, fh):
+    try:
+        zf.close()
+    finally:
+        fh.close()
 
 
 def _resolve_plattli(path):
     target = Path(path).expanduser()
 
     if target.is_file():
-        if (zf := _open_plattli_zip(target)) is not None:
-            return "zip", target.resolve(), zf
-        return None, None, None
+        if (archive := _open_plattli_zip(target)) is not None:
+            zf, fh = archive
+            return "zip", target.resolve(), zf, fh
+        return None, None, None, None
 
     if not target.is_dir():
-        return None, None, None
+        return None, None, None, None
 
     zip_path = target / "metrics.plattli"
-    if (zf := _open_plattli_zip(zip_path)) is not None:
-        return "zip", zip_path.resolve(), zf
+    if (archive := _open_plattli_zip(zip_path)) is not None:
+        zf, fh = archive
+        return "zip", zip_path.resolve(), zf, fh
     if (target / "plattli.json").is_file():
-        return "dir", target.resolve(), None
+        return "dir", target.resolve(), None, None
     if (target / "plattli" / "plattli.json").is_file():
-        return "dir", (target / "plattli").resolve(), None
+        return "dir", (target / "plattli").resolve(), None, None
 
-    return None, None, None
+    return None, None, None, None
 
 
 def _run_name_for_root(root):
@@ -93,21 +113,26 @@ def _run_name_for_root(root):
 
 class Reader:
     def __init__(self, path):
-        kind, root, zf = _resolve_plattli(path)
+        kind, root, zf, zip_fh = _resolve_plattli(path)
         if kind is None:
             raise FileNotFoundError(f"not a plattli run: {path}")
-        self.kind = kind
-        self.root = root
-        self._run_name = _run_name_for_root(root)
         self._zip = zf
-        self._manifest = None
-        self._config = None
-        self._run_rows = None
-        self._when_exported = None
-        self._hot_columns = None
-        self._hot_has_file = None
-        self._rows_cache = {}
-        self._jsonl_cache = {}
+        self._zip_fh = zip_fh
+        try:
+            self.kind = kind
+            self.root = root
+            self._run_name = _run_name_for_root(root)
+            self._manifest = None
+            self._config = None
+            self._run_rows = None
+            self._when_exported = None
+            self._hot_columns = None
+            self._hot_has_file = None
+            self._rows_cache = {}
+            self._jsonl_cache = {}
+        except BaseException:
+            self.close()
+            raise
 
     def refresh(self):
         """Drop cached metadata (manifest, config, hot rows, row counts, parsed jsonl)
@@ -124,8 +149,11 @@ class Reader:
 
     def close(self):
         if self._zip is not None:
-            self._zip.close()
+            zf = self._zip
+            fh = self._zip_fh
             self._zip = None
+            self._zip_fh = None
+            _close_plattli_zip(zf, fh)
 
     def __enter__(self):
         return self
