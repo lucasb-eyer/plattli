@@ -551,11 +551,12 @@ class Reader:
         if self.kind == "zip":
             return self._trim_size(self._zip_member_size(f"{name}.{dtype}"), itemsize) // itemsize
         path = self.root / f"{name}.{dtype}"
-        if not path.exists():
+        try:
+            size = path.stat().st_size
+        except FileNotFoundError:
             if self._ensure_hot():
                 return 0
             raise FileNotFoundError(f"missing values file for {name} in run {self._run_name}")
-        size = path.stat().st_size
         valid = self._trim_size(size, itemsize)
         return valid // itemsize
 
@@ -645,54 +646,89 @@ class Reader:
         self._rows_cache[name] = rows
         return rows
 
-    def approx_max_rows(self, faster=True):
+    def _probe_metric_count(self, name, spec):
+        if spec.get("indices") != "indices":
+            return self._values_count(name, spec)
+        if self.kind == "zip":
+            return self._trim_size(self._zip_member_size(f"{name}.indices"), 4) // 4
+        path = self.root / f"{name}.indices"
+        try:
+            size = path.stat().st_size
+        except FileNotFoundError:
+            if self._ensure_hot():
+                return 0
+            raise FileNotFoundError(f"missing indices file for {name} in run {self._run_name}")
+        return self._trim_size(size, 4) // 4
+
+    def approx_max_rows(self, nprobes=12):
+        """Estimate the largest metric row count with at most nprobes file probes.
+
+        Closed index specs and finalized run_rows need no probes. Open numeric and
+        explicit-index metrics share the budget across index-cadence groups. Hot rows
+        and open JSONL metrics are excluded.
+        """
+        if not isinstance(nprobes, (int, np.integer)) or isinstance(nprobes, bool):
+            raise TypeError("nprobes must be an integer")
+        if nprobes < 0:
+            raise ValueError("nprobes must be >= 0")
+        nprobes = int(nprobes)
         self._ensure_manifest()
         if self._run_rows is not None:
             return self._run_rows
 
         max_rows = 0
-        indices_metric = None
+        indices_candidates = []
+        cadence_groups = {}
         for name, spec in self._manifest.items():
             indices_spec = spec.get("indices")
             if isinstance(indices_spec, (list, dict)):
                 try:
                     segments = _segments_from_spec(indices_spec)
-                    total_count = self._values_count(name, spec) if _segments_have_open_tail(segments) else None
-                    count, _ = _segments_count_and_last(segments, total_count=total_count)
+                    if not _segments_have_open_tail(segments):
+                        count, _ = _segments_count_and_last(segments)
+                        max_rows = max(max_rows, count)
+                        continue
+                    closed_rows, _ = _segments_count_and_last(segments[:-1])
+                    _segments_count_and_last(segments, total_count=closed_rows)
                 except (ValueError, RuntimeError) as exc:
                     raise type(exc)(f"{exc} (metric {name}, run {self._run_name})") from exc
-                if count > max_rows:
-                    max_rows = count
-            elif indices_spec == "indices" and indices_metric is None:
-                indices_metric = name
+                if spec.get("dtype") == JSONL_DTYPE:
+                    continue
+                if spec.get("dtype") not in DTYPE_TO_NUMPY:
+                    raise ValueError(f"unsupported dtype for {name} in run {self._run_name}: {spec.get('dtype')}")
+                cadence_groups.setdefault(int(segments[-1]["step"]), []).append((
+                    (-closed_rows, int(segments[0]["start"])),
+                    name,
+                    spec,
+                ))
+            elif indices_spec == "indices":
+                indices_candidates.append(((0, 0), name, spec))
+            else:
+                raise RuntimeError(f"invalid indices spec for {name} in run {self._run_name}: {indices_spec}")
 
-        if not faster:
-            self._ensure_hot()
-            if self._hot_columns:
-                hot_metrics = sorted(self._hot_columns.items(),
-                                     key=lambda item: len(item[1]["indices"]),
-                                     reverse=True)
-                for name, _ in hot_metrics[:2]:
-                    rows = self.rows(name)
-                    if rows > max_rows:
-                        max_rows = rows
+        groups = []
+        if indices_candidates:
+            groups.append(indices_candidates)
+        groups.extend(cadence_groups[cadence] for cadence in sorted(cadence_groups))
+        for group in groups:
+            group.sort(key=lambda candidate: candidate[0])
 
-        if max_rows:
-            return max_rows
-        if indices_metric is None:
-            return 0
-        if self.kind == "zip":
-            info = self._zip.getinfo(f"{indices_metric}.indices")
-            valid = self._trim_size(info.file_size, 4)
-            return valid // 4
-        path = self.root / f"{indices_metric}.indices"
-        if not path.exists():
-            if self._ensure_hot():
-                return 0
-            raise FileNotFoundError(f"missing indices file for {indices_metric} in run {self._run_name}")
-        size = path.stat().st_size
-        valid = self._trim_size(size, 4)
-        return valid // 4
+        if sum(len(group) for group in groups) <= nprobes:
+            candidates = [candidate for group in groups for candidate in group]
+        else:
+            candidates = []
+            positions = [0] * len(groups)
+            while len(candidates) < nprobes:
+                for idx, group in enumerate(groups):
+                    if positions[idx] < len(group):
+                        candidates.append(group[positions[idx]])
+                        positions[idx] += 1
+                        if len(candidates) == nprobes:
+                            break
+
+        for _, name, spec in candidates:
+            max_rows = max(max_rows, self._probe_metric_count(name, spec))
+        return max_rows
 
     def metrics(self):
         self._ensure_manifest()

@@ -154,8 +154,8 @@ with Reader("/experiments/123456") as r:
 - List all available metric names with `metrics()`.
 - Read a metric with one of `metric(name, idx=None) -> (indices, values)`, `metric_indices(name)`, `metric_values(name)`, which return numpy arrays.
 - An integer `idx` (like `idx=-1` for the latest value) reads just that one row, without loading the whole column.
-- Some useful metadata: `config()` returns the attached config dict; `when_exported()` is a timestamp, `rows(name)` is the exact row count (not last step!) in the given metric,
-  but because `rows(name)` can be a bit expensive for in-progress runs, `approx_max_rows(faster=True)` is a fast likely-correct estimate of the row count of the most-frequent metric.
+- Some useful metadata: `config()` returns the attached config dict; `when_exported()` is a timestamp, and `rows(name)` is the exact row count (not last step!) in the given metric.
+- `approx_max_rows(nprobes=12)` cheaply estimates the row count of the most-frequent metric. Closed index specs and finalized `run_rows` metadata need no probes; otherwise it checks at most `nprobes` explicit-index or open numeric columns, distributed across their index cadences. The result becomes exact for stable columnar data when the budget covers every candidate, but may otherwise underestimate; hot rows and open JSONL columns are excluded.
 - While the data format is simple, the reader code is a bit more complex because it tolerates corrupt tails, such that it's fine to read plattli's while they are being written.
 - Metadata (manifest, config, hot rows, row counts, jsonl values) is cached on first use, while raw data files are read fresh on every call. On a long-lived `Reader` of a live run, call `refresh()` to drop the caches and pick up new metrics and hot rows. Zip readers are immutable snapshots.
 

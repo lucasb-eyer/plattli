@@ -805,8 +805,100 @@ class TestReader(unittest.TestCase):
                 w._compact_future.result()
             with plattli.Reader(run_root) as r:
                 self.assertEqual(r.approx_max_rows(), 2)
-                self.assertEqual(r.approx_max_rows(faster=False), 3)
             w.finish(optimize=False, zip=False)
+
+    def test_reader_approx_max_rows_stratifies_probes_by_cadence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            plattli_root = Path(tmp) / "run" / "plattli"
+            plattli_root.mkdir(parents=True)
+            manifest = {}
+            for i in range(2400):
+                manifest[f"slow_{i}"] = {"indices": {"start": 0, "step": 10}, "dtype": "f32"}
+            for i in range(90):
+                manifest[f"frequent_{i}"] = {"indices": {"start": 0, "step": 2}, "dtype": "f32"}
+            for i in range(10):
+                manifest[f"dense_{i}"] = {"indices": {"start": 0, "step": 1}, "dtype": "f32"}
+            for i in range(3):
+                manifest[f"explicit_{i}"] = {"indices": "indices", "dtype": "f32"}
+            (plattli_root / "plattli.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+            probed = []
+
+            def probe(name, spec):
+                if spec["indices"] == "indices":
+                    cadence = "indices"
+                else:
+                    cadence = spec["indices"]["step"]
+                probed.append(cadence)
+                return {"indices": 20, 1: 1000, 2: 500, 10: 100}[cadence]
+
+            with plattli.Reader(plattli_root) as r:
+                with mock.patch.object(r, "_probe_metric_count", side_effect=probe):
+                    self.assertEqual(r.approx_max_rows(nprobes=12), 1000)
+
+            self.assertEqual(len(probed), 12)
+            self.assertEqual({cadence: probed.count(cadence) for cadence in set(probed)}, {
+                "indices": 3,
+                1: 3,
+                2: 3,
+                10: 3,
+            })
+
+    def test_reader_approx_max_rows_probes_all_candidates_within_budget(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            plattli_root = Path(tmp) / "run" / "plattli"
+            plattli_root.mkdir(parents=True)
+            (plattli_root / "plattli.json").write_text(json.dumps({
+                "closed": {"indices": {"start": 0, "stop": 7, "step": 1}, "dtype": "f32"},
+                "explicit": {"indices": "indices", "dtype": "f32"},
+                "open": {"indices": {"start": 0, "step": 2}, "dtype": "f32"},
+                "open_jsonl": {"indices": {"start": 0, "step": 1}, "dtype": "jsonl"},
+            }), encoding="utf-8")
+
+            with plattli.Reader(plattli_root) as r:
+                with mock.patch.object(r, "_probe_metric_count", side_effect=lambda name, spec: {
+                    "explicit": 10,
+                    "open": 12,
+                }[name]) as probe:
+                    self.assertEqual(r.approx_max_rows(nprobes=2), 12)
+                    self.assertEqual({call.args[0] for call in probe.call_args_list}, {"explicit", "open"})
+                    probe.reset_mock()
+                    self.assertEqual(r.approx_max_rows(nprobes=3), 12)
+                    self.assertEqual({call.args[0] for call in probe.call_args_list}, {"explicit", "open"})
+                    probe.reset_mock()
+                    self.assertEqual(r.approx_max_rows(nprobes=0), 7)
+                    probe.assert_not_called()
+
+    def test_reader_approx_max_rows_prefers_history_within_cadence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            plattli_root = Path(tmp) / "run" / "plattli"
+            plattli_root.mkdir(parents=True)
+            (plattli_root / "plattli.json").write_text(json.dumps({
+                "new": {"indices": {"start": 100, "step": 1}, "dtype": "f32"},
+                "old": {"indices": [
+                    {"start": 0, "stop": 100, "step": 1},
+                    {"start": 100, "step": 1},
+                ], "dtype": "f32"},
+            }), encoding="utf-8")
+
+            with plattli.Reader(plattli_root) as r:
+                with mock.patch.object(r, "_probe_metric_count", return_value=101) as probe:
+                    self.assertEqual(r.approx_max_rows(nprobes=1), 101)
+                    self.assertEqual(probe.call_args.args[0], "old")
+
+    def test_reader_approx_max_rows_validates_probe_budget(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            plattli_root = Path(tmp) / "run" / "plattli"
+            plattli_root.mkdir(parents=True)
+            (plattli_root / "plattli.json").write_text("{}", encoding="utf-8")
+
+            with plattli.Reader(plattli_root) as r:
+                with self.assertRaises(TypeError):
+                    r.approx_max_rows(nprobes=True)
+                with self.assertRaises(TypeError):
+                    r.approx_max_rows(nprobes=1.5)
+                with self.assertRaises(ValueError):
+                    r.approx_max_rows(nprobes=-1)
 
     def test_reader_approx_max_rows_indices_fallback(self):
         with tempfile.TemporaryDirectory() as tmp:

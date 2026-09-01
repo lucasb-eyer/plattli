@@ -796,7 +796,6 @@ class TestDirectWriter(unittest.TestCase):
                         self.assertTrue(np.allclose(values, indices))
                         self.assertEqual(r.rows("loss"), 6)
                         self.assertEqual(r.approx_max_rows(), 3)
-                        self.assertEqual(r.approx_max_rows(faster=False), 6)
                         indices, values = r.metric("loss", start=1, stop=5)
                         self.assertEqual(indices.tolist(), [1, 2, 4, 5])
                         self.assertTrue(np.allclose(values, indices))
