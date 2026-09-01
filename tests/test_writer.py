@@ -692,8 +692,14 @@ class TestDirectWriter(unittest.TestCase):
                 plattli.CompactingWriter(run_root, hotsize=2)
 
             w = plattli.CompactingWriter(run_root, step=2, hotsize=2, allow_resume_finalized=True)
+            self.assertNotIn(
+                "run_rows",
+                json.loads((plattli_root / "plattli.json").read_text(encoding="utf-8")),
+            )
             w.write(loss=3.0)
             w.end_step()
+            with plattli.Reader(run_root) as r:
+                self.assertEqual(r.metric_values("loss").tolist(), [1.0, 2.0, 3.0])
             w.finish(optimize=False, zip=False)
 
             self.assertTrue(

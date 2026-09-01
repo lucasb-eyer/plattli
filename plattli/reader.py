@@ -581,9 +581,11 @@ class Reader:
     def _ensure_hot(self):
         if self._hot_columns is not None:
             return self._hot_has_file
+        self._ensure_manifest()
         self._hot_columns = {}
         self._hot_has_file = False
-        if self.kind != "dir":
+        # Writers remove their hot logs before publishing finalized row metadata.
+        if self.kind != "dir" or self._run_rows is not None:
             return False
         rows = {}
         for filename in (HOT_COMPACTING_FILENAME, HOT_FILENAME):

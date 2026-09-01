@@ -739,6 +739,10 @@ class TestReader(unittest.TestCase):
             w.end_step()
             w.finish(optimize=False, zip=False)
 
+            manifest_path = plattli_root / "plattli.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest.pop("run_rows")
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
             transient = plattli_root / "hot.compacting.jsonl"
             transient.write_text(json.dumps({"step": 0, "loss": 1.0}) + "\n", encoding="utf-8")
             original_read_bytes = Path.read_bytes
@@ -784,6 +788,10 @@ class TestReader(unittest.TestCase):
 
             with (plattli_root / "loss.indices").open("ab") as fh:
                 fh.write(np.asarray([100], dtype=np.uint32).tobytes())
+            manifest_path = plattli_root / "plattli.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest.pop("run_rows")
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
             (plattli_root / "hot.jsonl").write_text(
                 json.dumps({"step": 3, "loss": 9.0}) + "\n",
                 encoding="utf-8",
@@ -791,6 +799,18 @@ class TestReader(unittest.TestCase):
 
             with plattli.Reader(run_root) as r:
                 self.assertEqual(r.rows("loss"), 4)
+
+    def test_reader_finalized_run_skips_hot_file_probes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_root = Path(tmp) / "run"
+            w = plattli.DirectWriter(run_root, write_threads=0)
+            w.write(loss=1.0)
+            w.end_step()
+            w.finish(optimize=False, zip=False)
+
+            with plattli.Reader(run_root / "plattli", kind="dir") as r:
+                with mock.patch.object(Path, "read_bytes", side_effect=AssertionError("unexpected hot probe")):
+                    self.assertEqual(r.metric_values("loss").tolist(), [1.0])
 
     def test_reader_zip_indices_mismatch_and_metric(self):
         with tempfile.TemporaryDirectory() as tmp:

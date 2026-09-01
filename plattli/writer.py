@@ -526,14 +526,16 @@ class DirectWriter:
         if (self.root / "plattli.json").exists():
             self._manifest = json.loads((self.root / "plattli.json").read_text(encoding="utf-8"))
             self._manifest.pop("when_exported", None)
-            self._manifest.pop("run_rows", None)
+            rewrite_manifest = self._manifest.pop("run_rows", None) is not None
             _validate_metric_names(self._manifest, self.run_root.name)
             if self._manifest:
                 _truncate_to_step(self.root, self._manifest, self.step, allow_missing=False)
                 _force_indices_files(self.root, self._manifest)
                 self._monotonic, monotonic_changed = _refresh_monotonic_metadata(self.root, self._manifest)
                 if monotonic_changed:
-                    _write_manifest(self.root / "plattli.json", self._manifest)
+                    rewrite_manifest = True
+            if rewrite_manifest:
+                _write_manifest(self.root / "plattli.json", self._manifest)
 
         self.set_config(config)
 
@@ -720,10 +722,11 @@ class CompactingWriter:
         self._manifest_disk_version = 0
         self._manifest_io_lock = threading.Lock()
 
+        rewrite_manifest = False
         if (self.root / "plattli.json").exists():
             self._manifest = json.loads((self.root / "plattli.json").read_text(encoding="utf-8"))
             self._manifest.pop("when_exported", None)
-            self._manifest.pop("run_rows", None)
+            rewrite_manifest = self._manifest.pop("run_rows", None) is not None
             _validate_metric_names(self._manifest, self.run_root.name)
             if self._manifest:
                 _truncate_to_step(self.root, self._manifest, self.step, allow_missing=True)
@@ -732,7 +735,9 @@ class CompactingWriter:
         if self._manifest:
             self._monotonic, monotonic_changed = _refresh_monotonic_metadata(self.root, self._manifest, self._hot_rows)
             if monotonic_changed:
-                _write_manifest(self.root / "plattli.json", self._manifest)
+                rewrite_manifest = True
+        if rewrite_manifest:
+            _write_manifest(self.root / "plattli.json", self._manifest)
         self.set_config(config)
 
     def __del__(self):
