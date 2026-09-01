@@ -43,8 +43,6 @@ def is_run_dir(path):
 
 def _open_plattli_zip(path):
     """Returns an open (ZipFile, file handle) if path is a plattli zip, else None."""
-    if not path.is_file():
-        return None
     try:
         fh = path.open("rb", buffering=4096)
     except OSError:
@@ -78,23 +76,18 @@ def _close_plattli_zip(zf, fh):
 def _resolve_plattli(path):
     target = Path(path).expanduser()
 
-    if target.is_file():
-        if (archive := _open_plattli_zip(target)) is not None:
+    if target.is_dir():
+        zip_path = target / "metrics.plattli"
+        if (archive := _open_plattli_zip(zip_path)) is not None:
             zf, fh = archive
-            return "zip", target.resolve(), zf, fh
-        return None, None, None, None
-
-    if not target.is_dir():
-        return None, None, None, None
-
-    zip_path = target / "metrics.plattli"
-    if (archive := _open_plattli_zip(zip_path)) is not None:
+            return "zip", zip_path.resolve(), zf, fh
+        if (target / "plattli.json").is_file():
+            return "dir", target.resolve(), None, None
+        if (target / "plattli" / "plattli.json").is_file():
+            return "dir", (target / "plattli").resolve(), None, None
+    elif (archive := _open_plattli_zip(target)) is not None:
         zf, fh = archive
-        return "zip", zip_path.resolve(), zf, fh
-    if (target / "plattli.json").is_file():
-        return "dir", target.resolve(), None, None
-    if (target / "plattli" / "plattli.json").is_file():
-        return "dir", (target / "plattli").resolve(), None, None
+        return "zip", target.resolve(), zf, fh
 
     return None, None, None, None
 
@@ -231,12 +224,13 @@ class Reader:
                 return np.asarray([], dtype=np.uint32)
             return np.frombuffer(data, dtype=np.uint32)
         path = self.root / f"{name}.indices"
-        if not path.exists():
+        try:
+            with path.open("rb") as fh:
+                data = fh.read(count * 4)
+        except FileNotFoundError:
             if self._ensure_hot():
                 return np.asarray([], dtype=np.uint32)
             raise FileNotFoundError(f"missing indices file for {name} in run {self._run_name}")
-        with path.open("rb") as fh:
-            data = fh.read(count * 4)
         data = data[:self._trim_size(len(data), 4)]
         if not data:
             return np.asarray([], dtype=np.uint32)
@@ -287,13 +281,14 @@ class Reader:
             data = self._read_zip_slice(f"{name}.indices", offset * 4, count * 4)
         else:
             path = self.root / f"{name}.indices"
-            if not path.exists():
+            try:
+                with path.open("rb") as fh:
+                    fh.seek(offset * 4)
+                    data = fh.read(count * 4)
+            except FileNotFoundError:
                 if self._ensure_hot():
                     return np.asarray([], dtype=np.uint32)
                 raise FileNotFoundError(f"missing indices file for {name} in run {self._run_name}")
-            with path.open("rb") as fh:
-                fh.seek(offset * 4)
-                data = fh.read(count * 4)
         data = data[:self._trim_size(len(data), 4)]
         if not data:
             return np.asarray([], dtype=np.uint32)
@@ -318,13 +313,14 @@ class Reader:
             data = self._read_zip_slice(f"{name}.{dtype}", offset * itemsize, count * itemsize)
         else:
             path = self.root / f"{name}.{dtype}"
-            if not path.exists():
+            try:
+                with path.open("rb") as fh:
+                    fh.seek(offset * itemsize)
+                    data = fh.read(count * itemsize)
+            except FileNotFoundError:
                 if self._ensure_hot():
                     return np.asarray([], dtype=target)
                 raise FileNotFoundError(f"missing values file for {name} in run {self._run_name}")
-            with path.open("rb") as fh:
-                fh.seek(offset * itemsize)
-                data = fh.read(count * itemsize)
         data = data[:self._trim_size(len(data), itemsize)]
         if not data:
             return np.asarray([], dtype=target)
@@ -500,11 +496,12 @@ class Reader:
             data = self._read_bytes(f"{name}.jsonl")
         else:
             path = self.root / f"{name}.jsonl"
-            if not path.exists():
+            try:
+                data = path.read_bytes()
+            except FileNotFoundError:
                 if self._ensure_hot():
                     return []
                 raise FileNotFoundError(f"missing values file for {name} in run {self._run_name}")
-            data = path.read_bytes()
         if not data:
             return []
         lines = data.splitlines()
@@ -537,18 +534,19 @@ class Reader:
                 last = int(np.frombuffer(self._read_zip_slice(f"{name}.indices", valid - 4, 4), dtype=np.uint32)[0])
                 return count, last
             path = self.root / f"{name}.indices"
-            if not path.exists():
+            try:
+                with path.open("rb") as fh:
+                    fh.seek(0, 2)
+                    valid = self._trim_size(fh.tell(), 4)
+                    count = valid // 4
+                    if count == 0:
+                        return 0, None
+                    fh.seek(valid - 4)
+                    last = int(np.frombuffer(fh.read(4), dtype=np.uint32)[0])
+            except FileNotFoundError:
                 if self._ensure_hot():
                     return 0, None
                 raise FileNotFoundError(f"missing indices file for {name} in run {self._run_name}")
-            size = path.stat().st_size
-            valid = self._trim_size(size, 4)
-            count = valid // 4
-            if count == 0:
-                return 0, None
-            with path.open("rb") as fh:
-                fh.seek(valid - 4)
-                last = int(np.frombuffer(fh.read(4), dtype=np.uint32)[0])
             return count, last
         raise RuntimeError(f"invalid indices spec for {name} in run {self._run_name}: {indices_spec}")
 
@@ -590,8 +588,6 @@ class Reader:
         rows = {}
         for filename in (HOT_COMPACTING_FILENAME, HOT_FILENAME):
             hot_path = self.root / filename
-            if not hot_path.exists():
-                continue
             try:
                 lines = hot_path.read_bytes().splitlines()
             except FileNotFoundError:
@@ -780,18 +776,19 @@ class Reader:
                 last_step = int(np.frombuffer(self._read_zip_slice(f"{name}.indices", offset, 4), dtype=np.uint32)[0])
                 return count, last_step
             path = self.root / f"{name}.indices"
-            if not path.exists():
+            try:
+                with path.open("rb") as fh:
+                    fh.seek(0, 2)
+                    valid = self._trim_size(fh.tell(), 4)
+                    offset = idx * 4
+                    if offset + 4 > valid:
+                        return count, indices_last
+                    fh.seek(offset)
+                    last_step = int(np.frombuffer(fh.read(4), dtype=np.uint32)[0])
+            except FileNotFoundError:
                 if self._ensure_hot():
                     return 0, None
                 raise FileNotFoundError(f"missing indices file for {name} in run {self._run_name}")
-            size = path.stat().st_size
-            valid = self._trim_size(size, 4)
-            offset = idx * 4
-            if offset + 4 > valid:
-                return count, indices_last
-            with path.open("rb") as fh:
-                fh.seek(offset)
-                last_step = int(np.frombuffer(fh.read(4), dtype=np.uint32)[0])
             return count, last_step
         raise RuntimeError(f"invalid indices spec for {name} in run {self._run_name}: {indices_spec}")
 
@@ -824,18 +821,19 @@ class Reader:
                     return np.asarray([], dtype=np.uint32)
                 return np.frombuffer(self._read_zip_slice(f"{name}.indices", 0, count * 4), dtype=np.uint32)
             path = self.root / f"{name}.indices"
-            if not path.exists():
+            try:
+                with path.open("rb") as fh:
+                    fh.seek(0, 2)
+                    valid = self._trim_size(fh.tell(), 4)
+                    count = min(count, valid // 4)
+                    if count <= 0:
+                        return np.asarray([], dtype=np.uint32)
+                    fh.seek(0)
+                    data = fh.read(count * 4)
+            except FileNotFoundError:
                 if self._ensure_hot():
                     return np.asarray([], dtype=np.uint32)
                 raise FileNotFoundError(f"missing indices file for {name} in run {self._run_name}")
-            size = path.stat().st_size
-            valid = self._trim_size(size, 4)
-            max_count = valid // 4
-            count = min(count, max_count)
-            if count <= 0:
-                return np.asarray([], dtype=np.uint32)
-            with path.open("rb") as fh:
-                data = fh.read(count * 4)
             data = data[:self._trim_size(len(data), 4)]
             if not data:
                 return np.asarray([], dtype=np.uint32)
@@ -876,12 +874,13 @@ class Reader:
                 return np.asarray([], dtype=DTYPE_TO_NUMPY[dtype])
             return np.frombuffer(self._read_zip_slice(f"{name}.{dtype}", 0, count * itemsize), dtype=DTYPE_TO_NUMPY[dtype])
         path = self.root / f"{name}.{dtype}"
-        if not path.exists():
+        try:
+            with path.open("rb") as fh:
+                data = fh.read(count * itemsize)
+        except FileNotFoundError:
             if self._ensure_hot():
                 return np.asarray([], dtype=DTYPE_TO_NUMPY[dtype])
             raise FileNotFoundError(f"missing values file for {name} in run {self._run_name}")
-        with path.open("rb") as fh:
-            data = fh.read(count * itemsize)
         data = data[:self._trim_size(len(data), itemsize)]
         if not data:
             return np.asarray([], dtype=DTYPE_TO_NUMPY[dtype])

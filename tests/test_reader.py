@@ -44,6 +44,52 @@ class TestReader(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "invalid reader kind"):
             plattli.Reader("ignored", kind="other")
 
+    def test_trusted_archive_open_skips_file_type_probe(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_root = Path(tmp) / "run"
+            w = plattli.DirectWriter(run_root, write_threads=0)
+            w.finish(optimize=False, zip=True)
+
+            with mock.patch.object(Path, "is_file", side_effect=AssertionError("unexpected probe")):
+                with plattli.Reader(run_root / "metrics.plattli", kind="zip") as r:
+                    self.assertEqual(r.approx_max_rows(), 0)
+
+    def test_directory_reads_skip_exists_probes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_root = Path(tmp) / "run"
+            w = plattli.DirectWriter(run_root, write_threads=0)
+            w.write(loss=1.0, note="ok")
+            w.end_step()
+            w.finish(optimize=False, zip=False)
+
+            with plattli.Reader(run_root / "plattli", kind="dir") as r:
+                with mock.patch.object(Path, "exists", side_effect=AssertionError("unexpected probe")):
+                    self.assertEqual(r.metric_indices("loss").tolist(), [0])
+                    self.assertEqual(r.metric_values("loss").tolist(), [1.0])
+                    self.assertEqual(r.metric_values("note").tolist(), ["ok"])
+
+    def test_explicit_indices_count_uses_one_open(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_root = Path(tmp) / "run"
+            w = plattli.DirectWriter(run_root, write_threads=0)
+            w.write(loss=1.0)
+            w.end_step()
+            w.finish(optimize=False, zip=False)
+
+            indices_path = run_root / "plattli" / "loss.indices"
+            original_open = Path.open
+            opens = []
+
+            def tracked_open(path, *args, **kwargs):
+                if path == indices_path:
+                    opens.append(path)
+                return original_open(path, *args, **kwargs)
+
+            with plattli.Reader(run_root / "plattli", kind="dir") as r:
+                with mock.patch.object(Path, "open", tracked_open):
+                    self.assertEqual(r.rows("loss"), 1)
+            self.assertEqual(opens, [indices_path])
+
     def test_reader_open_tail_indices(self):
         with tempfile.TemporaryDirectory() as tmp:
             run_root = Path(tmp) / "run"
