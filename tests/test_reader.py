@@ -12,6 +12,38 @@ from plattli.writer import _zip_path_for_root
 
 
 class TestReader(unittest.TestCase):
+    def test_reader_accepts_trusted_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_root = Path(tmp) / "run"
+            w = plattli.DirectWriter(run_root, write_threads=0)
+            w.set_config({"trusted": True})
+            w.write(loss=1.0)
+            w.end_step()
+            w.finish(optimize=False, zip=False)
+
+            with mock.patch("plattli.reader._resolve_plattli", side_effect=AssertionError("unexpected discovery")):
+                with plattli.Reader(run_root / "plattli", kind="dir") as r:
+                    self.assertEqual(r.config(), {"trusted": True})
+                    self.assertEqual(r.approx_max_rows(), 1)
+
+    def test_reader_accepts_trusted_archive(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_root = Path(tmp) / "run"
+            w = plattli.DirectWriter(run_root, write_threads=0)
+            w.set_config({"trusted": True})
+            w.write(loss=1.0)
+            w.end_step()
+            w.finish(optimize=False, zip=True)
+
+            with mock.patch("plattli.reader._resolve_plattli", side_effect=AssertionError("unexpected discovery")):
+                with plattli.Reader(run_root / "metrics.plattli", kind="zip") as r:
+                    self.assertEqual(r.config(), {"trusted": True})
+                    self.assertEqual(r.approx_max_rows(), 1)
+
+    def test_reader_rejects_invalid_trusted_kind(self):
+        with self.assertRaisesRegex(ValueError, "invalid reader kind"):
+            plattli.Reader("ignored", kind="other")
+
     def test_reader_open_tail_indices(self):
         with tempfile.TemporaryDirectory() as tmp:
             run_root = Path(tmp) / "run"

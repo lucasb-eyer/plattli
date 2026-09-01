@@ -99,8 +99,8 @@ def _resolve_plattli(path):
     return None, None, None, None
 
 
-def _run_name_for_root(root):
-    if root.is_file():
+def _run_name_for_root(root, kind):
+    if kind == "zip":
         if root.name == "metrics.plattli":
             return root.parent.name
         if root.suffix == ".plattli":
@@ -112,16 +112,27 @@ def _run_name_for_root(root):
 
 
 class Reader:
-    def __init__(self, path):
-        kind, root, zf, zip_fh = _resolve_plattli(path)
+    def __init__(self, path, kind=None):
         if kind is None:
-            raise FileNotFoundError(f"not a plattli run: {path}")
+            kind, root, zf, zip_fh = _resolve_plattli(path)
+            if kind is None:
+                raise FileNotFoundError(f"not a plattli run: {path}")
+        elif kind == "dir":
+            root = Path(path).expanduser().absolute()
+            zf = zip_fh = None
+        elif kind == "zip":
+            root = Path(path).expanduser().absolute()
+            if (archive := _open_plattli_zip(root)) is None:
+                raise FileNotFoundError(f"not a plattli archive: {path}")
+            zf, zip_fh = archive
+        else:
+            raise ValueError(f"invalid reader kind: {kind}")
         self._zip = zf
         self._zip_fh = zip_fh
         try:
             self.kind = kind
             self.root = root
-            self._run_name = _run_name_for_root(root)
+            self._run_name = _run_name_for_root(root, kind)
             self._manifest = None
             self._config = None
             self._run_rows = None

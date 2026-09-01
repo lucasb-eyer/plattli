@@ -138,7 +138,7 @@ Calling `end_step` from a different thread would lead to silently inconsistent d
 - If `zip=True`, zips the run folder to `<outdir>/metrics.plattli` (stored, not compressed).
 - When zipping, `outdir/plattli` is removed after the zip is written.
 
-### Reader(path)
+### Reader(path, kind=None)
 ```python
 from plattli import Reader
 
@@ -148,6 +148,8 @@ with Reader("/experiments/123456") as r:
     steps, values = r.metric("loss")
     step, value = r.metric("loss", idx=-1)
 ```
+
+Callers that already know the exact storage path can pass `kind="dir"` for a `plattli/` directory or `kind="zip"` for a `.plattli` archive. This bypasses filesystem discovery, so the path and kind must be trusted.
 
 - Prefers `metrics.plattli` if present, otherwise reads the `plattli/` directory.
 - Keeps zip files open until `close()` (use a `with` block or call `close()` manually).
