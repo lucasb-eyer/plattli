@@ -105,7 +105,9 @@ def _run_name_for_root(root, kind):
 
 
 class Reader:
-    def __init__(self, path, kind=None):
+    def __init__(self, path, kind=None, exclude_hot=False):
+        if not isinstance(exclude_hot, bool):
+            raise TypeError("exclude_hot must be a boolean")
         if kind is None:
             kind, root, zf, zip_fh = _resolve_plattli(path)
             if kind is None:
@@ -125,6 +127,7 @@ class Reader:
         try:
             self.kind = kind
             self.root = root
+            self.exclude_hot = exclude_hot
             self._run_name = _run_name_for_root(root, kind)
             self._manifest = None
             self._config = None
@@ -248,7 +251,7 @@ class Reader:
             with path.open("rb") as fh:
                 data = fh.read(count * 4)
         except FileNotFoundError:
-            if self._ensure_hot():
+            if self._missing_columnar_is_empty():
                 return np.asarray([], dtype=np.uint32)
             raise FileNotFoundError(f"missing indices file for {name} in run {self._run_name}")
         data = data[:self._trim_size(len(data), 4)]
@@ -306,7 +309,7 @@ class Reader:
                     fh.seek(offset * 4)
                     data = fh.read(count * 4)
             except FileNotFoundError:
-                if self._ensure_hot():
+                if self._missing_columnar_is_empty():
                     return np.asarray([], dtype=np.uint32)
                 raise FileNotFoundError(f"missing indices file for {name} in run {self._run_name}")
         data = data[:self._trim_size(len(data), 4)]
@@ -338,7 +341,7 @@ class Reader:
                     fh.seek(offset * itemsize)
                     data = fh.read(count * itemsize)
             except FileNotFoundError:
-                if self._ensure_hot():
+                if self._missing_columnar_is_empty():
                     return np.asarray([], dtype=target)
                 raise FileNotFoundError(f"missing values file for {name} in run {self._run_name}")
         data = data[:self._trim_size(len(data), itemsize)]
@@ -524,7 +527,7 @@ class Reader:
             try:
                 return self._read_live_jsonl(path)
             except FileNotFoundError:
-                if self._ensure_hot():
+                if self._missing_columnar_is_empty():
                     return []
                 raise FileNotFoundError(f"missing values file for {name} in run {self._run_name}")
 
@@ -555,7 +558,7 @@ class Reader:
                     fh.seek(valid - 4)
                     last = int(np.frombuffer(fh.read(4), dtype=np.uint32)[0])
             except FileNotFoundError:
-                if self._ensure_hot():
+                if self._missing_columnar_is_empty():
                     return 0, None
                 raise FileNotFoundError(f"missing indices file for {name} in run {self._run_name}")
             return count, last
@@ -574,7 +577,7 @@ class Reader:
         try:
             size = path.stat().st_size
         except FileNotFoundError:
-            if self._ensure_hot():
+            if self._missing_columnar_is_empty():
                 return 0
             raise FileNotFoundError(f"missing values file for {name} in run {self._run_name}")
         valid = self._trim_size(size, itemsize)
@@ -595,6 +598,8 @@ class Reader:
         self._ensure_manifest()
         self._hot_columns = {}
         self._hot_has_file = False
+        if self.exclude_hot:
+            return False
         # Writers remove their hot logs before publishing finalized row metadata.
         if self.kind != "dir" or self._run_rows is not None:
             return False
@@ -627,6 +632,10 @@ class Reader:
                 col["indices"].append(step)
                 col["values"].append(value)
         return self._hot_has_file
+
+    def _missing_columnar_is_empty(self):
+        """A live manifest may advertise a metric before its first compaction."""
+        return self.exclude_hot or self._ensure_hot()
 
     def _metric_spec(self, name, allow_hot=False):
         self._ensure_manifest()
@@ -676,7 +685,7 @@ class Reader:
         try:
             size = path.stat().st_size
         except FileNotFoundError:
-            if self._ensure_hot():
+            if self._missing_columnar_is_empty():
                 return 0
             raise FileNotFoundError(f"missing indices file for {name} in run {self._run_name}")
         return self._trim_size(size, 4) // 4
@@ -800,7 +809,7 @@ class Reader:
                     fh.seek(offset)
                     last_step = int(np.frombuffer(fh.read(4), dtype=np.uint32)[0])
             except FileNotFoundError:
-                if self._ensure_hot():
+                if self._missing_columnar_is_empty():
                     return 0, None
                 raise FileNotFoundError(f"missing indices file for {name} in run {self._run_name}")
             return count, last_step
@@ -845,7 +854,7 @@ class Reader:
                     fh.seek(0)
                     data = fh.read(count * 4)
             except FileNotFoundError:
-                if self._ensure_hot():
+                if self._missing_columnar_is_empty():
                     return np.asarray([], dtype=np.uint32)
                 raise FileNotFoundError(f"missing indices file for {name} in run {self._run_name}")
             data = data[:self._trim_size(len(data), 4)]
@@ -892,7 +901,7 @@ class Reader:
             with path.open("rb") as fh:
                 data = fh.read(count * itemsize)
         except FileNotFoundError:
-            if self._ensure_hot():
+            if self._missing_columnar_is_empty():
                 return np.asarray([], dtype=DTYPE_TO_NUMPY[dtype])
             raise FileNotFoundError(f"missing values file for {name} in run {self._run_name}")
         data = data[:self._trim_size(len(data), itemsize)]

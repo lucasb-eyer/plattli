@@ -138,7 +138,7 @@ Calling `end_step` from a different thread would lead to silently inconsistent d
 - If `zip=True`, zips the run folder to `<outdir>/metrics.plattli` (stored, not compressed).
 - When zipping, `outdir/plattli` is removed after the zip is written.
 
-### Reader(path, kind=None)
+### Reader(path, kind=None, exclude_hot=False)
 ```python
 from plattli import Reader
 
@@ -150,6 +150,11 @@ with Reader("/experiments/123456") as r:
 ```
 
 Callers that already know the exact storage path can pass `kind="dir"` for a `plattli/` directory or `kind="zip"` for a `.plattli` archive. This bypasses filesystem discovery, so the path and kind must be trusted.
+
+Pass `exclude_hot=True` to read only already-compacted columnar data. This can
+substantially reduce I/O and parsing work when a live run's metric/column count
+makes `hot.jsonl` very wide, and exact recency is less important than read
+speed. The default includes the hot tail.
 
 - Prefers `metrics.plattli` if present, otherwise reads the `plattli/` directory.
 - Keeps zip files open until `close()` (use a `with` block or call `close()` manually).

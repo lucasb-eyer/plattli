@@ -1012,6 +1012,46 @@ class TestReader(unittest.TestCase):
                     r.metric_values("missing")
             w.finish(optimize=False, zip=False)
 
+    def test_reader_exclude_hot_uses_only_compacted_columns(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_root = Path(tmp) / "run"
+            plattli_root = run_root / "plattli"
+            w = plattli.CompactingWriter(run_root, hotsize=2)
+            for i in range(6):
+                w.write(loss=float(i), text=str(i))
+                w.end_step()
+                if w._compact_future:
+                    w._compact_future.result()
+            w.write(loss=6.0, text="6", hot_only=7)
+            w.end_step()
+            if w._compact_future:
+                w._compact_future.result()
+
+            self.assertTrue((plattli_root / "hot.jsonl").exists())
+            with plattli.Reader(run_root, exclude_hot=True) as r:
+                original_read_bytes = Path.read_bytes
+
+                def reject_hot(path):
+                    if path.name in ("hot.jsonl", "hot.compacting.jsonl"):
+                        raise AssertionError("read hot file")
+                    return original_read_bytes(path)
+
+                with mock.patch.object(Path, "read_bytes", reject_hot):
+                    self.assertEqual(r.metrics(), ["hot_only", "loss", "text"])
+                    self.assertEqual(r.rows("loss"), 6)
+                    self.assertEqual(r.metric_values("loss").tolist(), [0, 1, 2, 3, 4, 5])
+                    self.assertEqual(r.metric_indices("loss").tolist(), [0, 1, 2, 3, 4, 5])
+                    steps, columns = r.table(["loss", "text"])
+                    self.assertEqual(steps.tolist(), [0, 1, 2, 3, 4, 5])
+                    self.assertEqual(columns["text"].tolist(), ["0", "1", "2", "3", "4", "5"])
+                    self.assertEqual(r.rows("hot_only"), 0)
+                    self.assertEqual(r.metric_values("hot_only").tolist(), [])
+            w.finish(optimize=False, zip=False)
+
+    def test_reader_exclude_hot_must_be_boolean(self):
+        with self.assertRaisesRegex(TypeError, "exclude_hot must be a boolean"):
+            plattli.Reader("missing", exclude_hot=1)
+
     def test_reader_approx_max_rows_hot(self):
         with tempfile.TemporaryDirectory() as tmp:
             run_root = Path(tmp) / "run"
