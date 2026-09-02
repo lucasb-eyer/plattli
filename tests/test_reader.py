@@ -758,6 +758,58 @@ class TestReader(unittest.TestCase):
                     self.assertEqual(indices.tolist(), [0])
                     self.assertTrue(np.allclose(values, [1.0]))
 
+    def test_reader_tolerates_hot_rotation_between_file_reads(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_root = Path(tmp) / "run"
+            plattli_root = run_root / "plattli"
+            w = plattli.CompactingWriter(run_root, hotsize=100)
+            w.write(loss=1.0)
+            w.end_step()
+
+            hot = plattli_root / "hot.jsonl"
+            compacting = plattli_root / "hot.compacting.jsonl"
+            original_read_bytes = Path.read_bytes
+
+            def rotate_before_hot_read(path):
+                if path == hot:
+                    hot.rename(compacting)
+                return original_read_bytes(path)
+
+            with mock.patch.object(Path, "read_bytes", rotate_before_hot_read):
+                with plattli.Reader(run_root) as r:
+                    indices, values = r.metric("loss")
+                    self.assertEqual(indices.tolist(), [0])
+                    self.assertTrue(np.allclose(values, [1.0]))
+
+    def test_metric_stays_aligned_when_compaction_lands_mid_read(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_root = Path(tmp) / "run"
+            plattli_root = run_root / "plattli"
+            plattli_root.mkdir(parents=True)
+            (plattli_root / "plattli.json").write_text(json.dumps({
+                "loss": {"indices": [{"start": 0, "step": 1}], "dtype": "f32"},
+            }), encoding="utf-8")
+            values_path = plattli_root / "loss.f32"
+            np.asarray([0.0, 1.0], dtype=np.float32).tofile(values_path)
+            (plattli_root / "hot.compacting.jsonl").write_text(
+                "".join(json.dumps({"step": step, "loss": float(step)}) + "\n" for step in (2, 3)),
+                encoding="utf-8",
+            )
+
+            with plattli.Reader(run_root) as r:
+                original_columnar_values = r._columnar_values
+
+                def land_compaction(name, spec):
+                    values = original_columnar_values(name, spec)
+                    with values_path.open("ab") as fh:
+                        fh.write(np.asarray([2.0, 3.0], dtype=np.float32).tobytes())
+                    return values
+
+                with mock.patch.object(r, "_columnar_values", land_compaction):
+                    indices, values = r.metric("loss")
+            self.assertEqual(indices.tolist(), [0, 1, 2, 3])
+            self.assertEqual(values.tolist(), [0.0, 1.0, 2.0, 3.0])
+
     def test_reader_missing_files_fail_loud(self):
         with tempfile.TemporaryDirectory() as tmp:
             run_root = Path(tmp) / "run"

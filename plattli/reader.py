@@ -416,8 +416,9 @@ class Reader:
         Returns None when the selector cannot be resolved to chunks (non-monotonic value
         selector); the caller then falls back to a full read + filter."""
         spec = self._metric_spec(name, allow_hot=True)
-        hot_steps, hot_values = self._hot_tail(name, spec)
+        # Freeze the readable columnar prefix before filtering the overlapping hot tail.
         count = self._metric_count(name, spec)
+        hot_steps, hot_values = self._hot_tail(name, spec)
         kind = self._selector_kind(start, stop, istart, istop, vstart, vstop)
         if kind == "position":
             hot_keep = slice(0, 0)
@@ -458,6 +459,10 @@ class Reader:
             else:
                 hot_sel = [value for value, keep in zip(hot_values, hot_keep) if keep]
             values = self._concat([col, np.asarray(hot_sel, dtype=np_dtype)], np_dtype)
+        if indices is not None and values is not None:
+            count = min(len(indices), len(values))
+            indices = indices[:count]
+            values = values[:count]
         return indices, values
 
     def _apply_selector(self, indices, values, start, stop, istart, istop, vstart, vstop):
@@ -588,13 +593,13 @@ class Reader:
         if self.kind != "dir" or self._run_rows is not None:
             return False
         rows = {}
-        for filename in (HOT_COMPACTING_FILENAME, HOT_FILENAME):
+
+        def merge_file(filename):
             hot_path = self.root / filename
             try:
                 lines = hot_path.read_bytes().splitlines()
             except FileNotFoundError:
-                continue  # A completed compaction may unlink its transient file here.
-            self._hot_has_file = True
+                return False  # A completed compaction may unlink its transient file here.
             for idx, line in enumerate(lines):
                 try:
                     row = json.loads(line)
@@ -603,6 +608,13 @@ class Reader:
                         break
                     raise
                 rows[int(row["step"])] = row  # On overlap, the active hot file wins.
+            return True
+
+        for filename in (HOT_COMPACTING_FILENAME, HOT_FILENAME):
+            self._hot_has_file |= merge_file(filename)
+        if not self._hot_has_file:
+            # hot.jsonl may have been renamed after the first compacting-log read.
+            self._hot_has_file = merge_file(HOT_COMPACTING_FILENAME)
         for step, row in rows.items():
             for name, value in row.items():
                 if name == "step":
@@ -940,7 +952,27 @@ class Reader:
         return np.concatenate([columnar, hot_arr])
 
     def _metric_full(self, name):
-        return self._metric_indices_full(name), self._metric_values_full(name)
+        spec = self._metric_spec(name, allow_hot=True)
+        indices = self._columnar_indices(name, spec)
+        values = self._columnar_values(name, spec)
+        # A compaction can land between these reads. Keep their common durable prefix,
+        # then merge the hot tail against that same prefix boundary.
+        count = min(len(indices), len(values))
+        indices = indices[:count]
+        values = values[:count]
+        last_step = int(indices[-1]) if count else None
+        hot_indices, hot_values = self._hot_for_metric(name, last_step)
+        count = min(len(hot_indices), len(hot_values))
+        hot_indices = hot_indices[:count]
+        hot_values = hot_values[:count]
+        dtype = (
+            object if spec is None or spec.get("dtype") == JSONL_DTYPE
+            else DTYPE_TO_NUMPY[spec["dtype"]]
+        )
+        return (
+            self._concat([indices, hot_indices], np.uint32),
+            self._concat([values, np.asarray(hot_values, dtype=dtype)], dtype),
+        )
 
     def metric_indices(self, name, start=None, stop=None, istart=None, istop=None, vstart=None, vstop=None):
         if self._selector_kind(start, stop, istart, istop, vstart, vstop) is None:
