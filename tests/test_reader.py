@@ -711,6 +711,50 @@ class TestReader(unittest.TestCase):
                 self.assertEqual(r.metric_values("text").tolist(), ["a", "b"])
                 self.assertEqual(r.rows("text"), 2)
 
+    def test_reader_retries_transient_jsonl_decode_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_root = Path(tmp) / "run"
+            plattli_root = run_root / "plattli"
+            w = plattli.DirectWriter(run_root, write_threads=0)
+            w.write(note="a")
+            w.end_step()
+            w.write(note="b")
+            w.end_step()
+            w.finish(optimize=False, zip=False)
+
+            path = plattli_root / "note.jsonl"
+            original_read_bytes = Path.read_bytes
+            reads = 0
+
+            def transient_decode_error(target):
+                nonlocal reads
+                data = original_read_bytes(target)
+                if target == path and reads < 2:
+                    reads += 1
+                    return b"\xff" + data
+                return data
+
+            with mock.patch.object(Path, "read_bytes", transient_decode_error):
+                with plattli.Reader(run_root) as r:
+                    self.assertEqual(r.metric_values("note").tolist(), ["a", "b"])
+            self.assertEqual(reads, 2)
+
+    def test_reader_persistent_jsonl_decode_error_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_root = Path(tmp) / "run"
+            plattli_root = run_root / "plattli"
+            w = plattli.DirectWriter(run_root, write_threads=0)
+            w.write(note="a")
+            w.end_step()
+            w.write(note="b")
+            w.end_step()
+            w.finish(optimize=False, zip=False)
+            (plattli_root / "note.jsonl").write_bytes(b"\xff\n\"b\"\n")
+
+            with plattli.Reader(run_root) as r:
+                with self.assertRaises(UnicodeDecodeError):
+                    r.metric_values("note")
+
     def test_reader_tolerates_hot_tail(self):
         with tempfile.TemporaryDirectory() as tmp:
             run_root = Path(tmp) / "run"
@@ -729,6 +773,33 @@ class TestReader(unittest.TestCase):
                 self.assertTrue(np.allclose(r.metric_values("loss"),
                                             np.asarray([1.0, 2.0], dtype=np.float32)))
                 self.assertEqual(r.rows("loss"), 2)
+
+    def test_reader_retries_transient_hot_decode_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_root = Path(tmp) / "run"
+            plattli_root = run_root / "plattli"
+            w = plattli.CompactingWriter(run_root, hotsize=100)
+            for step in range(2):
+                w.write(loss=float(step))
+                w.end_step()
+
+            hot = plattli_root / "hot.jsonl"
+            original_read_bytes = Path.read_bytes
+            corrupted = False
+
+            def transient_decode_error(path):
+                nonlocal corrupted
+                data = original_read_bytes(path)
+                if path == hot and not corrupted:
+                    corrupted = True
+                    return b"\xff" + data
+                return data
+
+            with mock.patch.object(Path, "read_bytes", transient_decode_error):
+                with plattli.Reader(run_root) as r:
+                    indices, values = r.metric("loss")
+            self.assertEqual(indices.tolist(), [0, 1])
+            self.assertEqual(values.tolist(), [0.0, 1.0])
 
     def test_reader_tolerates_transient_hot_unlink(self):
         with tempfile.TemporaryDirectory() as tmp:

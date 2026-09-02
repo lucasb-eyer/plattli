@@ -175,6 +175,26 @@ class Reader:
             return self._zip.read(name)
         return (self.root / name).read_bytes()
 
+    def _parse_jsonl_bytes(self, data):
+        lines = data.splitlines()
+        entries = []
+        for idx, line in enumerate(lines):
+            try:
+                entries.append(json.loads(line.decode("utf-8")))
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                if idx == len(lines) - 1:
+                    break
+                raise
+        return entries
+
+    def _read_live_jsonl(self, path):
+        for attempt in range(3):
+            try:
+                return self._parse_jsonl_bytes(path.read_bytes())
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                if attempt == 2:
+                    raise
+
     def _read_zip_slice(self, name, offset, size):
         # Members are ZIP_STORED, so seeking is O(1); never read more than asked for.
         with self._zip.open(name) as fh:
@@ -498,29 +518,15 @@ class Reader:
 
     def _parse_jsonl_values(self, name):
         if self.kind == "zip":
-            data = self._read_bytes(f"{name}.jsonl")
+            return self._parse_jsonl_bytes(self._read_bytes(f"{name}.jsonl"))
         else:
             path = self.root / f"{name}.jsonl"
             try:
-                data = path.read_bytes()
+                return self._read_live_jsonl(path)
             except FileNotFoundError:
                 if self._ensure_hot():
                     return []
                 raise FileNotFoundError(f"missing values file for {name} in run {self._run_name}")
-        if not data:
-            return []
-        lines = data.splitlines()
-        if not lines:
-            return []
-        values = []
-        for idx, line in enumerate(lines):
-            try:
-                values.append(json.loads(line))
-            except (json.JSONDecodeError, UnicodeDecodeError):
-                if idx == len(lines) - 1:
-                    break
-                raise
-        return values
 
     def _indices_count_and_last(self, name, indices_spec):
         if isinstance(indices_spec, (list, dict)):
@@ -597,16 +603,10 @@ class Reader:
         def merge_file(filename):
             hot_path = self.root / filename
             try:
-                lines = hot_path.read_bytes().splitlines()
+                entries = self._read_live_jsonl(hot_path)
             except FileNotFoundError:
                 return False  # A completed compaction may unlink its transient file here.
-            for idx, line in enumerate(lines):
-                try:
-                    row = json.loads(line)
-                except (json.JSONDecodeError, UnicodeDecodeError):
-                    if idx == len(lines) - 1:
-                        break
-                    raise
+            for row in entries:
                 rows[int(row["step"])] = row  # On overlap, the active hot file wins.
             return True
 
