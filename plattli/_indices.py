@@ -156,7 +156,7 @@ def _segments_truncate(segments, step, total_count=None):
 
 def _segments_too_many(segments, total_count=None):
     total, _ = _segments_count_and_last(segments, total_count)
-    max_segments = max(4, total // 10)
+    max_segments = min(32, max(4, total // 10))
     return len(segments) > max_segments
 
 
@@ -194,7 +194,7 @@ def _find_piecewise_params(indices):
     segments = _piecewise_segments(indices)
     if not segments:
         return None
-    max_segments = max(4, indices.size // 10)
+    max_segments = min(32, max(4, indices.size // 10))
     if len(segments) > max_segments:
         return None
     return segments

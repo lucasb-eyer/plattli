@@ -233,6 +233,34 @@ def _force_indices_files(root, manifest):
         _write_manifest(root / "plattli.json", manifest)
 
 
+def _migrate_oversized_piecewise_indices(root, manifest):
+    run_name = _run_name_for_root(root)
+    updated = False
+    for name, spec in manifest.items():
+        indices_spec = spec["indices"]
+        if indices_spec == "indices":
+            continue
+        try:
+            segments = _segments_from_spec(indices_spec)
+            total_count = (
+                _stored_values_count(root, name, spec["dtype"], allow_missing=False)
+                if _segments_have_open_tail(segments)
+                else None
+            )
+            if not _segments_too_many(segments, total_count=total_count):
+                continue
+            indices = _segments_to_array(segments, total_count=total_count)
+        except (ValueError, RuntimeError) as exc:
+            raise type(exc)(f"{exc} (metric {name}, run {run_name})") from exc
+        idx_path = root / f"{name}.indices"
+        idx_path.parent.mkdir(parents=True, exist_ok=True)
+        with idx_path.open("wb") as fh:
+            indices.tofile(fh)
+        spec["indices"] = "indices"
+        updated = True
+    return updated
+
+
 def _optimize_indices(root, manifest):
     for name, spec in manifest.items():
         if spec["indices"] != "indices":
@@ -733,6 +761,8 @@ class CompactingWriter:
 
         self._load_hot_rows()
         if self._manifest:
+            if _migrate_oversized_piecewise_indices(self.root, self._manifest):
+                rewrite_manifest = True
             self._monotonic, monotonic_changed = _refresh_monotonic_metadata(self.root, self._manifest, self._hot_rows)
             if monotonic_changed:
                 rewrite_manifest = True
