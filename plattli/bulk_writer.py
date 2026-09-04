@@ -79,8 +79,33 @@ class BulkWriter:
         self._step_metrics.clear()
         self.step += 1
 
-    def finish(self, optimize=True, zip=True):
+    def finish(self, optimize=True, zip=True, config_overrides=None):
         self._check_finished()
+        if config_overrides is not None and not isinstance(config_overrides, dict):
+            raise TypeError(f"config_overrides must be a dict in run {self.run_root.name}")
+
+        config = self._config
+        config_target = None
+        if config is None:
+            config = {}
+        if isinstance(config, str):
+            config_target = (self.run_root / config).expanduser()
+            if config_target.exists():
+                if not config_target.is_file():
+                    raise FileNotFoundError(
+                        f"config target is not a file: {config_target} (run {self.run_root.name})")
+                if config_overrides is not None:
+                    config = json.loads(config_target.read_text(encoding="utf-8"))
+                else:
+                    config = None
+            else:
+                config = {}
+                config_target = None
+        if config_overrides is not None:
+            if not isinstance(config, dict):
+                raise TypeError(f"config must be a JSON object to apply overrides in run {self.run_root.name}")
+            config = {**config, **config_overrides}
+
         if zip:
             zip_path = _zip_path_for_root(self.run_root)
             tmp_path = zip_path.with_name(zip_path.name + ".tmp")
@@ -105,23 +130,13 @@ class BulkWriter:
                 return
 
         path = self.root / "config.json"
-        config = self._config
         if config is None:
-            config = {}
-        if isinstance(config, str):
-            target = (self.run_root / config).expanduser()
-            if target.exists():
-                if not target.is_file():
-                    raise FileNotFoundError(f"config target is not a file: {target} (run {self.run_root.name})")
-                if zip:
-                    write_bytes("config.json", target.read_bytes())
-                else:
-                    if path.exists() or path.is_symlink():
-                        path.unlink()
-                    path.symlink_to(target.resolve())
-                config = None
+            if zip:
+                write_bytes("config.json", config_target.read_bytes())
             else:
-                config = {}
+                if path.exists() or path.is_symlink():
+                    path.unlink()
+                path.symlink_to(config_target.resolve())
         if config is not None:
             if not zip and path.is_symlink():
                 path.unlink()

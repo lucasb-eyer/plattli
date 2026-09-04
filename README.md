@@ -128,7 +128,7 @@ Calling `end_step` from a different thread would lead to silently inconsistent d
 ### set_config(config)
 - Replaces `config.json` with the provided json-dumpable config.
 
-### finish(optimize=True, zip=True)
+### finish(optimize=True, zip=True, config_overrides=None)
 - `DirectWriter` flushes writes; `CompactingWriter` compacts any remaining hot rows and removes `hot.jsonl`.
 - Updates `plattli.json`.
 - If `optimize=True`:
@@ -137,6 +137,8 @@ Calling `end_step` from a different thread would lead to silently inconsistent d
   - Writes `run_rows` (max rows across metrics) into the manifest.
 - If `zip=True`, zips the run folder to `<outdir>/metrics.plattli` (stored, not compressed).
 - When zipping, `outdir/plattli` is removed after the zip is written.
+- Shallow-merges `config_overrides` into the finalized `config.json`; override values win.
+- Does not modify the original config dict or linked config file.
 
 ### Reader(path, kind=None, exclude_hot=False)
 ```python

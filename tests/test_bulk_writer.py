@@ -184,6 +184,20 @@ class TestBulkWriter(unittest.TestCase):
                 config = json.loads(zf.read("config.json"))
             self.assertEqual(config, {"seed": 7})
 
+    def test_finish_merges_config_overrides_without_changing_source(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_root = Path(tmp) / "run"
+            source = Path(tmp) / "config.json"
+            source.write_text(json.dumps({"seed": 7, "model": "small"}), encoding="utf-8")
+            w = plattli.BulkWriter(run_root, config=str(source))
+            w.write(loss=1.0)
+            w.end_step()
+            w.finish(config_overrides={"seed": 9, "note": "final"})
+
+            with plattli.Reader(run_root) as r:
+                self.assertEqual(r.config(), {"seed": 9, "model": "small", "note": "final"})
+            self.assertEqual(json.loads(source.read_text(encoding="utf-8")), {"seed": 7, "model": "small"})
+
     def test_config_auto_link(self):
         with tempfile.TemporaryDirectory() as tmp:
             run_root = Path(tmp) / "run"

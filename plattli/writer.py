@@ -161,6 +161,17 @@ def _write_config(run_root, path, config):
     path.write_text(json.dumps(config, ensure_ascii=False), encoding="utf-8")
 
 
+def _config_payload_with_overrides(path, config_overrides, run_name):
+    if config_overrides is None:
+        return None
+    if not isinstance(config_overrides, dict):
+        raise TypeError(f"config_overrides must be a dict in run {run_name}")
+    config = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(config, dict):
+        raise TypeError(f"config must be a JSON object to apply overrides in run {run_name}")
+    return json.dumps({**config, **config_overrides}, ensure_ascii=False)
+
+
 def _truncate_to_step(root, manifest, step, allow_missing):
     run_name = _run_name_for_root(root)
     for name, spec in manifest.items():
@@ -502,7 +513,7 @@ def _tighten_dtypes(root, manifest):
         _fsync_dir(path.parent)
 
 
-def _zip_output(run_root, root):
+def _zip_output(run_root, root, config_payload=None):
     zip_path = _zip_path_for_root(run_root)
     tmp_path = zip_path.with_name(zip_path.name + ".tmp")
     with zipfile.ZipFile(tmp_path, "w", compression=zipfile.ZIP_STORED) as zf:
@@ -510,6 +521,9 @@ def _zip_output(run_root, root):
             if not path.is_file():
                 continue
             rel = path.relative_to(root)
+            if config_payload is not None and rel.as_posix() == "config.json":
+                zf.writestr("config.json", config_payload)
+                continue
             if path.is_symlink():
                 zf.writestr(rel.as_posix(), path.read_bytes())
                 continue
@@ -649,9 +663,11 @@ class DirectWriter:
         self._step_metrics.clear()
         self.step += 1
 
-    def finish(self, optimize=True, zip=True):
+    def finish(self, optimize=True, zip=True, config_overrides=None):
         self._check_finished()
         self._check_broken()
+        config_payload = _config_payload_with_overrides(
+            self.root / "config.json", config_overrides, self.run_root.name)
         wait(self._futures)
         self._drain_errors()
         self._flush_step_indices()
@@ -667,7 +683,9 @@ class DirectWriter:
                                       for name, spec in self._manifest.items()), default=0))
 
         if zip:
-            _zip_output(self.run_root, self.root)
+            _zip_output(self.run_root, self.root, config_payload)
+        elif config_payload is not None:
+            _replace_text_checked(self.root / "config.json", config_payload, "config")
         if self._executor:
             self._executor.shutdown(wait=True)
             self._executor = None
@@ -858,9 +876,11 @@ class CompactingWriter:
         self._current_row = {}
         self.step += 1
 
-    def finish(self, optimize=True, zip=True):
+    def finish(self, optimize=True, zip=True, config_overrides=None):
         self._check_finished()
         self._check_broken()
+        config_payload = _config_payload_with_overrides(
+            self.root / "config.json", config_overrides, self.run_root.name)
         if self._compact_future:
             wait([self._compact_future])
             with self._hot_lock:
@@ -889,7 +909,9 @@ class CompactingWriter:
                                       for name, spec in self._manifest.items()), default=0))
 
         if zip:
-            _zip_output(self.run_root, self.root)
+            _zip_output(self.run_root, self.root, config_payload)
+        elif config_payload is not None:
+            _replace_text_checked(self.root / "config.json", config_payload, "config")
         if self._compact_executor:
             self._compact_executor.shutdown(wait=True)
             self._compact_executor = None

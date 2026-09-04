@@ -1172,6 +1172,37 @@ class TestDirectWriter(unittest.TestCase):
                 config = json.loads(zf.read("config.json"))
             self.assertEqual(config, {"seed": 7})
 
+    def test_finish_merges_config_overrides_without_changing_source(self):
+        for writer_class, kwargs in (
+            (plattli.DirectWriter, {"write_threads": 0}),
+            (plattli.CompactingWriter, {"hotsize": 10}),
+        ):
+            with self.subTest(writer=writer_class.__name__), tempfile.TemporaryDirectory() as tmp:
+                run_root = Path(tmp) / "run"
+                source = Path(tmp) / "config.json"
+                source.write_text(json.dumps({"seed": 7, "model": "small"}), encoding="utf-8")
+                w = writer_class(run_root, config=str(source), **kwargs)
+                w.write(loss=1.0)
+                w.end_step()
+                w.finish(config_overrides={"seed": 9, "note": "final"})
+
+                with plattli.Reader(run_root) as r:
+                    self.assertEqual(r.config(), {"seed": 9, "model": "small", "note": "final"})
+                self.assertEqual(json.loads(source.read_text(encoding="utf-8")), {"seed": 7, "model": "small"})
+
+    def test_finish_directory_replaces_config_symlink(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_root = Path(tmp) / "run"
+            source = Path(tmp) / "config.json"
+            source.write_text(json.dumps({"seed": 7}), encoding="utf-8")
+            w = plattli.DirectWriter(run_root, write_threads=0, config=str(source))
+            w.finish(config_overrides={"seed": 9}, optimize=False, zip=False)
+
+            output = run_root / "plattli" / "config.json"
+            self.assertFalse(output.is_symlink())
+            self.assertEqual(json.loads(output.read_text(encoding="utf-8")), {"seed": 9})
+            self.assertEqual(json.loads(source.read_text(encoding="utf-8")), {"seed": 7})
+
     def test_config_auto_link(self):
         with tempfile.TemporaryDirectory() as tmp:
             run_root = Path(tmp) / "run"
