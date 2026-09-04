@@ -270,7 +270,13 @@ def _optimize_indices(root, manifest):
         segments = _find_piecewise_params(indices)
         if segments:
             spec["indices"] = segments
+            try:
+                _write_manifest(root / "plattli.json", manifest)
+            except BaseException:
+                spec["indices"] = "indices"
+                raise
             idx_path.unlink()
+            _fsync_dir(idx_path.parent)
 
 
 def _indices_length(root, name, spec):
@@ -480,9 +486,20 @@ def _tighten_dtypes(root, manifest):
         new_dtype = f"{tightened.dtype.kind}{tightened.dtype.itemsize * 8}"
         if new_dtype == dtype:
             continue
-        tightened.tofile(root / f"{name}.{new_dtype}")
-        path.unlink()
+        new_path = root / f"{name}.{new_dtype}"
+        with new_path.open("wb") as fh:
+            tightened.tofile(fh)
+            fh.flush()
+            os.fsync(fh.fileno())
+        _fsync_dir(new_path.parent)
         spec["dtype"] = new_dtype
+        try:
+            _write_manifest(root / "plattli.json", manifest)
+        except BaseException:
+            spec["dtype"] = dtype
+            raise
+        path.unlink()
+        _fsync_dir(path.parent)
 
 
 def _zip_output(run_root, root):
