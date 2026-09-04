@@ -985,6 +985,65 @@ class TestDirectWriter(unittest.TestCase):
             self.assertFalse((plattli_root / "loss.indices").exists())
             self.assertEqual(manifest["run_rows"], 3)
 
+    def test_compacting_dtype_tighten_persists_manifest_before_unlink(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_root = Path(tmp) / "run"
+            plattli_root = run_root / "plattli"
+            w = plattli.CompactingWriter(run_root, hotsize=10)
+            w.write(loss=1)
+            w.end_step()
+            w.write(loss=2)
+            w.end_step()
+
+            def interrupt_manifest_write(path, manifest, run_rows=None):
+                self.assertTrue((plattli_root / "loss.i64").exists())
+                self.assertTrue((plattli_root / "loss.u8").exists())
+                raise RuntimeError("interrupted manifest write")
+
+            with mock.patch("plattli.writer._write_manifest", interrupt_manifest_write):
+                with self.assertRaisesRegex(RuntimeError, "interrupted manifest write"):
+                    w.finish(optimize=True, zip=True)
+
+            manifest = json.loads((plattli_root / "plattli.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["loss"]["dtype"], "i64")
+            self.assertTrue((plattli_root / "loss.i64").exists())
+            self.assertFalse((run_root / "metrics.plattli").exists())
+            w._compact_executor.shutdown(wait=True)
+            w._compact_executor = None
+
+    def test_compacting_indices_persists_manifest_before_unlink(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_root = Path(tmp) / "run"
+            plattli_root = run_root / "plattli"
+            w = plattli.CompactingWriter(run_root, hotsize=10)
+            for step in range(3):
+                w.step = step
+                w.write(loss=float(step))
+                w.end_step()
+            w.finish(optimize=False, zip=False)
+
+            w = plattli.CompactingWriter(run_root, step=3, hotsize=10)
+            writer_module._force_indices_files(plattli_root, w._manifest)
+            indices_path = plattli_root / "loss.indices"
+            original_unlink = Path.unlink
+
+            def interrupt_indices_unlink(path, *args, **kwargs):
+                if path == indices_path:
+                    original_unlink(path, *args, **kwargs)
+                    raise RuntimeError("interrupted indices unlink")
+                return original_unlink(path, *args, **kwargs)
+
+            with mock.patch("pathlib.Path.unlink", interrupt_indices_unlink):
+                with self.assertRaisesRegex(RuntimeError, "interrupted indices unlink"):
+                    w.finish(optimize=True, zip=True)
+
+            manifest = json.loads((plattli_root / "plattli.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["loss"]["indices"], [{"start": 0, "stop": 3, "step": 1}])
+            self.assertFalse(indices_path.exists())
+            self.assertFalse((run_root / "metrics.plattli").exists())
+            w._compact_executor.shutdown(wait=True)
+            w._compact_executor = None
+
     def test_optimize_does_not_inline_more_than_32_segments(self):
         with tempfile.TemporaryDirectory() as tmp:
             run_root = Path(tmp) / "run"
