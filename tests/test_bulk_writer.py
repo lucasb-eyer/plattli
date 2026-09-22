@@ -15,10 +15,102 @@ def _read_jsonl(path):
 
 
 class TestBulkWriter(unittest.TestCase):
+    def test_numeric_dtypes_match_streaming_writers(self):
+        for optimize in (False, True):
+            for zipped in (False, True):
+                with self.subTest(optimize=optimize, zipped=zipped), tempfile.TemporaryDirectory() as tmp:
+                    snapshots = []
+                    for cls in (plattli.BulkWriter, plattli.DirectWriter, plattli.CompactingWriter):
+                        path = Path(tmp) / cls.__name__
+                        kwargs = {"write_threads": 0} if cls is plattli.DirectWriter else {"hotsize": 100} if cls is plattli.CompactingWriter else {}
+                        w = cls(path, **kwargs)
+                        w.write(narrow=np.uint8(100), widening=np.uint8(200), loss=1.123456789,
+                                precise=np.float64(1.123456789), flag=True)
+                        w.end_step()
+                        w.write(narrow=np.uint8(200), widening=300, loss=np.float64(2.123456789),
+                                precise=2.123456789, flag=False)
+                        w.end_step()
+                        w.finish(optimize=optimize, zip=zipped)
+                        with plattli.Reader(path) as r:
+                            snapshots.append({name: (r.manifest()[name]["dtype"], r.metric_values(name).tolist())
+                                              for name in r.metrics()})
+                            self.assertEqual(r.manifest()["loss"]["dtype"], "f64")
+                            self.assertEqual(r.manifest()["precise"]["dtype"], "f64")
+                            self.assertEqual(r.manifest()["flag"]["dtype"], "jsonl")
+                            self.assertEqual(r.metric_values("loss").tolist(),
+                                             [float(np.float32(1.123456789)), 2.123456789])
+                            self.assertEqual(r.metric_values("precise").tolist(), [1.123456789, 2.123456789])
+                    self.assertEqual(snapshots[0], snapshots[1])
+                    self.assertEqual(snapshots[0], snapshots[2])
+
+    def test_full_unsigned_range_stays_exact(self):
+        for optimize in (False, True):
+            with self.subTest(optimize=optimize), tempfile.TemporaryDirectory() as tmp:
+                w = plattli.BulkWriter(tmp)
+                w.write(counter=np.uint64(2**64 - 1))
+                w.end_step()
+                w.write(counter=7)
+                w.end_step()
+                with self.assertRaises((ValueError, OverflowError)):
+                    w.write(counter=-1)
+                w.finish(optimize=optimize, zip=False)
+                with plattli.Reader(tmp) as r:
+                    self.assertEqual(r.metric_values("counter", dtype="storage").tolist(), [2**64 - 1, 7])
+
+    def test_mixed_numeric_families_raise_before_mutating(self):
+        for first, invalid in ((1, 1.5), (1.0, "not numeric")):
+            with self.subTest(first=first), tempfile.TemporaryDirectory() as tmp:
+                w = plattli.BulkWriter(tmp)
+                w.write(value=first)
+                w.end_step()
+                with self.assertRaises((TypeError, ValueError)):
+                    w.write(value=invalid)
+                w.finish(optimize=False, zip=False)
+                with plattli.Reader(tmp) as r:
+                    self.assertEqual(r.metric_values("value").tolist(), [first])
+
+    def test_unsigned_bounds_follow_appends_and_rewinds(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            w = plattli.BulkWriter(tmp)
+            for value in (np.uint64(1), np.uint64(2**64 - 1), 2, 3):
+                w.write(counter=value)
+                w.end_step()
+            with self.assertRaises(OverflowError):
+                w.write(counter=-1)
+            # The converter rewinds buffers in-place before continuing a run.
+            column = w._columns["counter"]
+            del column.i[1:]
+            del column.v[1:]
+            w.step = 1
+            w.write(counter=-1)
+            w.finish(optimize=False, zip=False)
+            with plattli.Reader(tmp) as r:
+                self.assertEqual(r.metric_values("counter").tolist(), [1, -1])
+                self.assertEqual(r.manifest()["counter"]["dtype"], "i64")
+
+    def test_unsigned_bounds_invalidate_after_same_dtype_rewind_appends(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            writer = plattli.BulkWriter(tmp)
+            for value in (np.uint64(1), np.uint64(2**64 - 1), 2, 3):
+                writer.write(counter=value)
+                writer.end_step()
+            column = writer._columns["counter"]
+            del column.i[1:]
+            del column.v[1:]
+            writer.step = 1
+            # Matching dtypes do not query bounds; refill to the old cached length.
+            for value in (7, 8, 9):
+                writer.write(counter=np.uint64(value))
+                writer.end_step()
+            writer.write(counter=-1)
+            writer.finish(optimize=False, zip=False)
+            with plattli.Reader(tmp) as reader:
+                self.assertEqual(reader.metric_values("counter").tolist(), [1, 7, 8, 9, -1])
+
     def test_negative_step(self):
         with tempfile.TemporaryDirectory() as tmp:
             run_root = Path(tmp)
-            with self.assertRaises(AssertionError):
+            with self.assertRaises(ValueError):
                 plattli.BulkWriter(run_root, step=-1)
 
     def test_basic_write(self):

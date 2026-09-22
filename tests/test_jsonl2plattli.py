@@ -118,6 +118,57 @@ class TestJsonl2Plattli(unittest.TestCase):
                 convert_run(run_dir, run_dir, False)
             self.assertIn("--allow-rewinds", str(ctx.exception))
 
+    def test_rewind_discards_empty_column_dtype(self):
+        for discarded in (1, {"old": 1}):
+            with self.subTest(discarded=discarded), tempfile.TemporaryDirectory() as tmp:
+                run_dir = Path(tmp) / "run"
+                run_dir.mkdir()
+                rows = [{"step": 5, "value": discarded}, {"step": 4, "value": 2.5}]
+                (run_dir / "metrics.jsonl").write_text(
+                    "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+
+                outpath, _, _, manifest = convert_run(run_dir, run_dir, False, allow_rewinds=True)
+
+                self.assertEqual(manifest["value"]["dtype"], "f32")
+                with zipfile.ZipFile(outpath) as zf:
+                    self.assertEqual(np.frombuffer(zf.read("value.f32"), dtype=np.float32).tolist(), [2.5])
+                    self.assertEqual(_read_indices(zf, "value", manifest["value"]["indices"]).tolist(), [4])
+
+    def test_rewind_removes_fully_discarded_metric(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "run"
+            run_dir.mkdir()
+            rows = [{"step": 5, "discarded": 1}, {"step": 4, "kept": 2.5}]
+            (run_dir / "metrics.jsonl").write_text(
+                "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+
+            outpath, _, _, manifest = convert_run(run_dir, run_dir, False, allow_rewinds=True)
+
+            self.assertNotIn("discarded", manifest)
+            with zipfile.ZipFile(outpath) as zf:
+                self.assertFalse(any(name.startswith("discarded.") for name in zf.namelist()))
+
+    def test_rewind_preserves_nonempty_column_precision(self):
+        for rewind_step in (2, 4):
+            with self.subTest(rewind_step=rewind_step), tempfile.TemporaryDirectory() as tmp:
+                run_dir = Path(tmp) / "run"
+                run_dir.mkdir()
+                rows = [
+                    {"step": 1, "value": 1.5},
+                    {"step": 3, "value": 2**24 + 1},
+                    {"step": 5, "value": 3.5},
+                    {"step": rewind_step, "value": 2.5},
+                ]
+                (run_dir / "metrics.jsonl").write_text(
+                    "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+
+                outpath, _, _, manifest = convert_run(run_dir, run_dir, False, allow_rewinds=True)
+
+                self.assertEqual(manifest["value"]["dtype"], "f64")
+                with zipfile.ZipFile(outpath) as zf:
+                    values = np.frombuffer(zf.read("value.f64"), dtype=np.float64)
+                    self.assertEqual(values.tolist(), [1.5, 2.5] if rewind_step == 2 else [1.5, 2**24 + 1, 2.5])
+
     def test_cli_no_runs(self):
         with tempfile.TemporaryDirectory() as tmp:
             output = _run_cli([tmp])

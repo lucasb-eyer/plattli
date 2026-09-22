@@ -1,5 +1,7 @@
 import json
 import zipfile
+from collections.abc import Mapping
+from functools import wraps
 from pathlib import Path
 
 import numpy as np
@@ -19,6 +21,36 @@ from .writer import (
     _validate_metric_names,
     _validate_metric_name,
 )
+
+
+class _ManifestStale(Exception):
+    pass
+
+
+def _retry_stale_manifest(read):
+    @wraps(read)
+    def retry(self, *args, **kwargs):
+        # Promotions and hot compaction can invalidate metadata during a live read;
+        # retry instead of exposing transient missing files or incomplete prefixes.
+        # Tables still dispatch through metric() overrides, but the outer read owns
+        # retries so a changed representation restarts every requested column.
+        if self._manifest_retry_active:
+            return read(self, *args, **kwargs)
+        self._manifest_retry_active = True
+        try:
+            for attempt in range(3):
+                try:
+                    return read(self, *args, **kwargs)
+                except _ManifestStale as exc:
+                    # Invalidate even on the last attempt: a partial hot snapshot
+                    # must not survive under stale metadata into the next read.
+                    self.refresh()
+                    if attempt == 2:
+                        raise RuntimeError(f"storage metadata kept changing while reading run {self._run_name}; retry the read") from exc
+        finally:
+            self._manifest_retry_active = False
+    return retry
+
 
 def is_run(path):
     kind, _, zf, zip_fh = _resolve_plattli(path)
@@ -105,6 +137,8 @@ def _run_name_for_root(root, kind):
 
 
 class Reader:
+    """Use one Reader per thread, or synchronize access to its mutable caches."""
+
     def __init__(self, path, kind=None, exclude_hot=False):
         if not isinstance(exclude_hot, bool):
             raise TypeError("exclude_hot must be a boolean")
@@ -137,6 +171,7 @@ class Reader:
             self._hot_has_file = None
             self._rows_cache = {}
             self._jsonl_cache = {}
+            self._manifest_retry_active = False
         except BaseException:
             self.close()
             raise
@@ -341,6 +376,7 @@ class Reader:
                     fh.seek(offset * itemsize)
                     data = fh.read(count * itemsize)
             except FileNotFoundError:
+                self._check_storage_metadata((name,))
                 if self._missing_columnar_is_empty():
                     return np.asarray([], dtype=target)
                 raise FileNotFoundError(f"missing values file for {name} in run {self._run_name}")
@@ -410,7 +446,12 @@ class Reader:
         path = self.root / f"{name}.{dtype}"
         target = DTYPE_TO_NUMPY[dtype]
         itemsize = np.dtype(target).itemsize
-        with path.open("rb") as fh:
+        try:
+            fh = path.open("rb")
+        except FileNotFoundError:
+            self._check_storage_metadata((name,))
+            raise
+        with fh:
             def value_at(pos):
                 fh.seek(pos * itemsize)
                 return np.frombuffer(fh.read(itemsize), dtype=target)[0]
@@ -441,7 +482,7 @@ class Reader:
         spec = self._metric_spec(name, allow_hot=True)
         # Freeze the readable columnar prefix before filtering the overlapping hot tail.
         count = self._metric_count(name, spec)
-        hot_steps, hot_values = self._hot_tail(name, spec)
+        hot_steps, hot_values = self._hot_tail(name, spec, count)
         kind = self._selector_kind(start, stop, istart, istop, vstart, vstop)
         if kind == "position":
             hot_keep = slice(0, 0)
@@ -577,6 +618,7 @@ class Reader:
         try:
             size = path.stat().st_size
         except FileNotFoundError:
+            self._check_storage_metadata((name,))
             if self._missing_columnar_is_empty():
                 return 0
             raise FileNotFoundError(f"missing values file for {name} in run {self._run_name}")
@@ -591,6 +633,24 @@ class Reader:
         self._when_exported = manifest.pop("when_exported", None)
         _validate_metric_names(manifest, self._run_name)
         self._manifest = manifest
+
+    def _check_storage_metadata(self, names):
+        """Only probe after missing numeric storage or loading a fresh hot snapshot.
+
+        A writer publishes its replacement before retiring the old dtype file. The
+        caller must restart the complete read if its cached representation changed.
+        An empty index spec can also become obsolete when hot rows move to columns.
+        Ordinary appended rows still follow the explicit refresh() contract.
+        """
+        latest = json.loads(self._read_text("plattli.json"))
+        for name in names:
+            spec = latest.get(name)
+            cached = self._manifest.get(name, {})
+            if spec is not None and (
+                spec.get("dtype") != cached.get("dtype")
+                or (cached.get("indices") == [] and spec.get("indices") != [])
+            ):
+                raise _ManifestStale(name)
 
     def _ensure_hot(self):
         if self._hot_columns is not None:
@@ -631,6 +691,14 @@ class Reader:
                     self._hot_columns[name] = col
                 col["indices"].append(step)
                 col["values"].append(value)
+        names = list(self._hot_columns)
+        names.extend(name for name, spec in self._manifest.items()
+                     if spec.get("indices") == [] and name not in self._hot_columns)
+        if names:
+            # Hot-only columns have no missing old file to reveal a promotion. They
+            # can also disappear from the hot snapshot after moving into columns,
+            # leaving a stale empty index spec even when no hot files remain.
+            self._check_storage_metadata(names)
         return self._hot_has_file
 
     def _missing_columnar_is_empty(self):
@@ -639,10 +707,13 @@ class Reader:
 
     def _metric_spec(self, name, allow_hot=False):
         self._ensure_manifest()
+        if allow_hot:
+            # Capture rows before reading columns: compaction appends the columnar
+            # data before retiring its hot log, so this order keeps their union.
+            self._ensure_hot()
         if name in self._manifest:
             return self._manifest[name]
         if allow_hot:
-            self._ensure_hot()
             if name in self._hot_columns:
                 return None
         raise KeyError(f"unknown metric {name} in run {self._run_name}")
@@ -660,6 +731,7 @@ class Reader:
         self._ensure_manifest()
         return self._manifest
 
+    @_retry_stale_manifest
     def rows(self, name):
         if name in self._rows_cache:
             return self._rows_cache[name]
@@ -690,6 +762,7 @@ class Reader:
             raise FileNotFoundError(f"missing indices file for {name} in run {self._run_name}")
         return self._trim_size(size, 4) // 4
 
+    @_retry_stale_manifest
     def approx_max_rows(self, nprobes=12):
         """Estimate the largest metric row count with at most nprobes file probes.
 
@@ -760,19 +833,21 @@ class Reader:
             max_rows = max(max_rows, self._probe_metric_count(name, spec))
         return max_rows
 
+    @_retry_stale_manifest
     def metrics(self):
         self._ensure_manifest()
         self._ensure_hot()
         return sorted(set(self._manifest.keys()) | set(self._hot_columns.keys()))
 
-    def _columnar_count_and_last_step(self, name, spec):
+    def _columnar_count_and_last_step(self, name, spec, values_count=None):
         if spec is None:
             return 0, None
         indices_spec = spec.get("indices")
         indices_count, indices_last = self._indices_count_and_last(name, indices_spec)
         if indices_count == 0:
             return 0, None
-        values_count = self._values_count(name, spec)
+        if values_count is None:
+            values_count = self._values_count(name, spec)
         count = min(indices_count, values_count)
         if count <= 0:
             return 0, None
@@ -901,6 +976,7 @@ class Reader:
             with path.open("rb") as fh:
                 data = fh.read(count * itemsize)
         except FileNotFoundError:
+            self._check_storage_metadata((name,))
             if self._missing_columnar_is_empty():
                 return np.asarray([], dtype=DTYPE_TO_NUMPY[dtype])
             raise FileNotFoundError(f"missing values file for {name} in run {self._run_name}")
@@ -909,14 +985,15 @@ class Reader:
             return np.asarray([], dtype=DTYPE_TO_NUMPY[dtype])
         return np.frombuffer(data, dtype=DTYPE_TO_NUMPY[dtype])
 
-    def _hot_tail(self, name, spec):
-        """Hot rows for this metric beyond the columnar data, as (steps, values list)."""
+    def _hot_tail(self, name, spec, columnar_count):
+        """Hot rows beyond the captured columnar prefix, as (steps, values list)."""
         if not self._ensure_hot():
             return np.asarray([], dtype=np.uint32), []
         last_step = None
         if spec is not None:
+            # Resolve the captured count, not a larger prefix added by compaction.
             # Cheap: stat + tail peek, not a full indices read.
-            _, last_step = self._columnar_count_and_last_step(name, spec)
+            _, last_step = self._columnar_count_and_last_step(name, spec, columnar_count)
         return self._hot_for_metric(name, last_step)
 
     def _hot_for_metric(self, name, last_step):
@@ -946,7 +1023,7 @@ class Reader:
     def _metric_values_full(self, name):
         spec = self._metric_spec(name, allow_hot=True)
         columnar = self._columnar_values(name, spec)
-        _, hot_values = self._hot_tail(name, spec)
+        _, hot_values = self._hot_tail(name, spec, len(columnar))
         if not hot_values:
             return columnar
         if spec is None or spec.get("dtype") == JSONL_DTYPE:
@@ -983,6 +1060,7 @@ class Reader:
             self._concat([values, np.asarray(hot_values, dtype=dtype)], dtype),
         )
 
+    @_retry_stale_manifest
     def metric_indices(self, name, start=None, stop=None, istart=None, istop=None, vstart=None, vstop=None):
         if self._selector_kind(start, stop, istart, istop, vstart, vstop) is None:
             return self._metric_indices_full(name)
@@ -992,31 +1070,108 @@ class Reader:
             return self._apply_selector(indices, values, start, stop, istart, istop, vstart, vstop)[0]
         return selected[0]
 
-    def metric_values(self, name, start=None, stop=None, istart=None, istop=None, vstart=None, vstop=None):
-        if self._selector_kind(start, stop, istart, istop, vstart, vstop) is None:
-            return self._metric_values_full(name)
-        selected = self._metric_select(name, start, stop, istart, istop, vstart, vstop, want_indices=False)
-        if selected is None:
-            indices, values = self._metric_full(name)
-            return self._apply_selector(indices, values, start, stop, istart, istop, vstart, vstop)[1]
-        return selected[1]
+    def _convert_values(self, name, values, dtype):
+        if isinstance(dtype, str) and dtype == "storage":
+            return values
+        source = getattr(values, "dtype", np.dtype(object))
+        if isinstance(dtype, str) and dtype == "standard":
+            if source.kind in "iu":
+                if source.kind == "u" and source.itemsize == 8:
+                    if values.size and int(values.max()) > 0x7FFFFFFFFFFFFFFF:
+                        raise OverflowError(f"values do not fit int64 for metric {name}; request a wider dtype or dtype='storage'")
+                    if source.isnative:
+                        return values.view(np.int64)
+                elif source.itemsize == 8 and source.isnative:
+                    return values
+                return values.astype(np.int64, copy=False)
+            elif source.kind == "f" and source.itemsize < 4:
+                target = np.dtype(np.float32)
+            else:
+                return values
+        else:
+            if dtype is None:
+                raise TypeError("dtype must be 'standard', 'storage', or a NumPy dtype")
+            target = np.dtype(dtype)
+        if source == target:
+            return values
+        if target.kind in "iu" and not np.can_cast(source, target, casting="safe"):
+            if source.kind not in "biuf":
+                raise TypeError(f"cannot convert {source} values to {target} for metric {name}")
+            if np.size(values):
+                if source.kind == "f":
+                    if not np.isfinite(values).all():
+                        raise ValueError(f"nonfinite values cannot be converted to {target} for metric {name}")
+                    if not np.equal(values, np.trunc(values)).all():
+                        raise ValueError(f"fractional values cannot be converted to {target} for metric {name}")
+                limits = np.iinfo(target)
+                # Python ints keep comparisons exact at signed/unsigned 64-bit bounds,
+                # where NumPy mixed-type comparisons can round through float64.
+                source_limits = np.iinfo(source) if source.kind in "iu" else None
+                below = (source_limits is None or source_limits.min < limits.min) and int(values.min()) < limits.min
+                above = (source_limits is None or source_limits.max > limits.max) and int(values.max()) > limits.max
+                if below or above:
+                    raise OverflowError(f"values do not fit {target} for metric {name}; request a wider dtype or dtype='storage'")
+        if source.kind in "iu" and target.kind in "iu" and source.itemsize == target.itemsize and source.byteorder == target.byteorder:
+            # Checked signedness changes preserve the bit pattern. In particular,
+            # standard uint64 reads need a bounds scan but no second large buffer.
+            return values.view(target)
+        if not hasattr(values, "astype"):
+            return np.asarray(values).astype(target)[()]
+        return values.astype(target, copy=False)
 
-    def table(self, names, on="step", start=None, stop=None, istart=None, istop=None, vstart=None, vstop=None):
+    @_retry_stale_manifest
+    def metric_values(self, name, start=None, stop=None, istart=None, istop=None, vstart=None, vstop=None, *, dtype="standard"):
+        """Read metric values, converting only the selected rows.
+
+        Standard reads return int64 integers and retain float32/float64 precision.
+        Use dtype="storage" for the stored type, or a NumPy dtype for an explicit
+        conversion. Integer conversions reject overflow and fractional truncation.
+        """
+        if self._selector_kind(start, stop, istart, istop, vstart, vstop) is None:
+            values = self._metric_values_full(name)
+        else:
+            selected = self._metric_select(name, start, stop, istart, istop, vstart, vstop, want_indices=False)
+            if selected is None:
+                indices, values = self._metric_full(name)
+                values = self._apply_selector(indices, values, start, stop, istart, istop, vstart, vstop)[1]
+            else:
+                values = selected[1]
+        return self._convert_values(name, values, dtype)
+
+    def table(self, names, on="step", start=None, stop=None, istart=None, istop=None, vstart=None, vstop=None, *, dtype="standard"):
         """Read several metrics step-aligned: (steps, {name: values}), all equal length,
         keeping only steps present in every requested metric.
 
         Selectors select rows of the `on` column. With the default on="step" that is the
         aligned table itself (vstart/vstop are not meaningful there); with a metric name,
-        vstart/vstop select by that metric's values and the other columns follow."""
+        vstart/vstop select by that metric's values and the other columns follow.
+
+        dtype applies to all value columns, or can map names to individual dtypes;
+        omitted names use "standard". Conversion follows alignment and selection.
+        Steps always remain uint32.
+        """
+        names = tuple(names)
         if not names:
             raise ValueError(f"table() needs at least one metric name in run {self._run_name}")
+        if isinstance(dtype, Mapping):
+            unknown = dtype.keys() - set(names)
+            if unknown:
+                raise ValueError(f"dtype specified for unrequested table metrics: {sorted(unknown)}")
+        steps, columns = self._table_storage(names, on, start, stop, istart, istop, vstart, vstop)
+        return steps, {
+            name: self._convert_values(name, values, dtype.get(name, "standard") if isinstance(dtype, Mapping) else dtype)
+            for name, values in columns.items()
+        }
+
+    @_retry_stale_manifest
+    def _table_storage(self, names, on, start, stop, istart, istop, vstart, vstop):
         kind = self._selector_kind(start, stop, istart, istop, vstart, vstop)
         if on == "step":
             if kind == "value":
                 raise ValueError("vstart/vstop need a metric as the `on` column")
             # Step ranges push down to every column; positions apply to the joined table.
             sel = {"start": start, "stop": stop} if kind == "step" else {}
-            columns = {name: self.metric(name, **sel) for name in names}
+            columns = {name: self.metric(name, dtype="storage", **sel) for name in names}
             column_values = iter(columns.values())
             steps = next(column_values)[0]
             # Equal-cadence columns need neither an intersection nor remapping.
@@ -1035,15 +1190,15 @@ class Reader:
             elif same_indices:
                 return steps, {name: vals[:len(steps)] for name, (_, vals) in columns.items()}
         else:
-            steps, on_values = self.metric(on, start=start, stop=stop, istart=istart, istop=istop, vstart=vstart, vstop=vstop)
+            steps, on_values = self.metric(on, start=start, stop=stop, istart=istart, istop=istop, vstart=vstart, vstop=vstop, dtype="storage")
             columns = {}
             for name in names:
                 if name == on:
                     columns[name] = (steps, on_values)
                 elif len(steps):  # Other columns only need the selected step window.
-                    columns[name] = self.metric(name, start=int(steps[0]), stop=int(steps[-1]))
+                    columns[name] = self.metric(name, start=int(steps[0]), stop=int(steps[-1]), dtype="storage")
                 else:
-                    columns[name] = self.metric(name, istart=0, istop=0)
+                    columns[name] = self.metric(name, istart=0, istop=0, dtype="storage")
             same_indices = True
             for idx, _ in columns.values():
                 if idx is steps or (len(idx) == len(steps) and np.array_equal(idx, steps)):
@@ -1060,14 +1215,20 @@ class Reader:
             for name, (idx, vals) in columns.items()
         }
 
-    def metric(self, name, idx=None, start=None, stop=None, istart=None, istop=None, vstart=None, vstop=None):
+    @_retry_stale_manifest
+    def metric(self, name, idx=None, start=None, stop=None, istart=None, istop=None, vstart=None, vstop=None, *, dtype="standard"):
+        """Read (uint32 steps, values), with the same dtype policy as metric_values.
+
+        idx selects from the filtered rows; scalar reads return NumPy numeric scalars
+        of the requested dtype. Conversion happens after all selection.
+        """
         if self._selector_kind(start, stop, istart, istop, vstart, vstop) is None:
             if isinstance(idx, (int, np.integer)) and not isinstance(idx, bool):
                 # Fast path: seek-read just the one requested row instead of the whole column.
                 indices, values = self._metric_select(name, None, None, int(idx), None if idx == -1 else int(idx) + 1, None, None)
                 if len(indices) != 1:
                     raise IndexError(f"index {idx} out of range for metric {name} in run {self._run_name}")
-                return indices[0], values[0]
+                return indices[0], self._convert_values(name, values, dtype)[0]
             indices, values = self._metric_full(name)
         else:
             selected = self._metric_select(name, start, stop, istart, istop, vstart, vstop)
@@ -1079,5 +1240,5 @@ class Reader:
             else:
                 indices, values = selected
         if idx is None:
-            return indices, values
-        return indices[idx], values[idx]
+            return indices, self._convert_values(name, values, dtype)
+        return indices[idx], self._convert_values(name, values[idx], dtype)

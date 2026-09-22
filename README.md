@@ -88,7 +88,14 @@ Calling `end_step` from a different thread would lead to silently inconsistent d
 - `write_threads=0` disables background writes.
 - `config` is a dict written to `config.json`, or a string path (resolved relative to `outdir`)
   to symlink `config.json` to (default: `"config.json"`).
-- If the target path does not exist, an empty config is written; pass `None` to force an empty config.
+- If the target path does not exist, an empty config is written. Passing `None`
+  preserves an existing config or writes an empty config for a new run.
+- Constructor options and in-memory configuration are validated before extracting
+  a finalized run or truncating existing data for resume. Config paths that would
+  become directories during extraction are rejected before changing the archive.
+- Recovery removes alternate representations of known metrics and recognized
+  writer temporary files. Finalization also removes orphan value/index pairs.
+  Unrelated extra files are preserved.
 
 ### CompactingWriter(outdir, step=0, *, hotsize, config="config.json", allow_resume_finalized=False)
 - Hot mode: writes rows to `hot.jsonl` and compacts them into columnar files in the background.
@@ -99,8 +106,14 @@ Calling `end_step` from a different thread would lead to silently inconsistent d
 
 ### BulkWriter(outdir, step=0, config="config.json", overwrite=False)
 - Buffers a complete run in memory and writes the columnar export on `finish()`.
+- Uses the same dtype inference, checked conversions, and promotion rules as the streaming writers.
 - Refuses to replace an existing `outdir/plattli` directory or `outdir/metrics.plattli`
   unless `overwrite=True`.
+- Replacements are written to a staging location before publication. The previous
+  output is retired, including when switching between directory and ZIP output;
+  unrelated extra files are preserved. Conflicting extra files cause an error
+  before publication.
+- A config sourced from the output being replaced is copied before that output is retired.
 
 ### DirectWriter.write(...)
 - Appends each metric at the current step (pass at most one dict or keyword metrics; the dict form is needed for slash-named metrics like `detail/thing0`).
@@ -111,14 +124,49 @@ Calling `end_step` from a different thread would lead to silently inconsistent d
   - int -> `i64`
   - explicit numpy types (eg `np.float64`) are taken as-is.
   - everything else -> `jsonl`
-- Force a dtype by casting the value (for example: `write(dim=np.float32(128))`).
-- Only scalar values are supported (including 0-d array-likes).
+- Select an initial storage dtype by casting the value (for example: `write(dim=np.float32(128))`).
+- Each new measurement can widen its metric's storage dtype, but never narrow it:
+  `np.uint8` followed by a Python int promotes to `i64`, and `f32` followed by
+  `np.float64` promotes to `f64`. Repeated `np.uint8` values stay `u8`, including
+  after resuming. Python floats continue to mean `f32`; they do not narrow an
+  existing `f64` metric. An integer can join a float metric if it is exactly
+  representable at the current width, or after promotion to `f64`; otherwise it
+  raises. Float values cannot join an integer metric.
+- Integer writes are checked before casting; overflow never silently wraps.
+  Signed/unsigned mixtures remain exact integers. A negative value cannot coexist
+  with values above the `i64` maximum in a supported fixed-width integer column.
+- Finite float values that would overflow to infinity raise. Explicit NaN and
+  infinity are accepted. Promotion to `f64` cannot recover precision already lost
+  when earlier values were stored as `f32`.
+- Opening or resuming a writer does not widen columns. A required promotion happens
+  on the next measurement, preserving retained data and pending hot rows. Promotion
+  rewrites the existing column, with time and I/O proportional to its size. In
+  particular, after `finish(optimize=True)` narrows an integer column, the first
+  plain Python integer written on resume widens it back to `i64` and rewrites it.
+- Existing `jsonl` metrics accept heterogeneous JSON-serializable values;
+  numeric metrics reject strings and other nonnumeric values.
+- All three writers validate every metric in a `write()` call before changing
+  values or column dtypes. Invalid input leaves the batch unapplied. This does not
+  make a batch transactional against filesystem failures.
+- JSON values are captured during `write()`. Later changes to a supplied list or
+  dictionary, including nested values, do not change the logged measurement.
+- NumPy arrays and objects implementing `__array__` must be 0-d. Plain Python lists
+  and dictionaries can be stored as JSON.
 - Only standard dtypes are supported for now: no bf16, nvfp4, fp8; no complex/composite.
+- Steps must be integers in the `uint32` range; booleans and non-integers raise
+  `TypeError`, and out-of-range steps raise `ValueError`, including under `python -O`.
+  NumPy integer steps are normalized to Python integers so
+  incrementing cannot wrap. Constructor checks precede any resume or overwrite
+  operations. The last valid step can still be ended and finalized.
+  TODO: automatically promote step storage and returned indices to `uint64` when
+  this range is exceeded.
 
 ### CompactingWriter.write(..., flush=False)
 - Appends each metric at the current step (pass at most one dict or keyword metrics).
 - `flush=True` forces a `hot.jsonl` rewrite without advancing the step (use `write(flush=True)` to flush only).
 - Uses the same auto-dtype rules and scalar restrictions as `DirectWriter.write`.
+- Pending rows are checked for valid steps before publication, including explicit
+  flushes, `end_step()`, `finish()`, and context-manager exit.
 
 ### end_step()
 - Increments step counter by one.
@@ -126,7 +174,9 @@ Calling `end_step` from a different thread would lead to silently inconsistent d
 - `CompactingWriter` flushes the hot row for the current step.
 
 ### set_config(config)
-- Replaces `config.json` with the provided json-dumpable config.
+- Streaming writers atomically replace `config.json` with the provided json-dumpable
+  config. Replacing a linked config leaves the original link target unchanged.
+- `BulkWriter` buffers the config until `finish()`.
 
 ### finish(optimize=True, zip=True, config_overrides=None)
 - `DirectWriter` flushes writes; `CompactingWriter` compacts any remaining hot rows and removes `hot.jsonl`.
@@ -153,6 +203,9 @@ with Reader("/experiments/123456") as r:
 
 Callers that already know the exact storage path can pass `kind="dir"` for a `plattli/` directory or `kind="zip"` for a `.plattli` archive. This bypasses filesystem discovery, so the path and kind must be trusted.
 
+Each `Reader` is intended for one thread. Use separate instances or an external
+lock when reading from multiple threads.
+
 Pass `exclude_hot=True` to read only already-compacted columnar data. This can
 substantially reduce I/O and parsing work when a live run's metric/column count
 makes `hot.jsonl` very wide, and exact recency is less important than read
@@ -162,11 +215,30 @@ speed. The default includes the hot tail.
 - Keeps zip files open until `close()` (use a `with` block or call `close()` manually).
 - List all available metric names with `metrics()`.
 - Read a metric with one of `metric(name, idx=None) -> (indices, values)`, `metric_indices(name)`, `metric_values(name)`, which return numpy arrays.
+- Metric value reads default to `dtype="standard"`: integers become checked `int64`,
+  while `f32` and `f64` retain their width. JSON values keep their object dtype.
+  Step indices remain `uint32`, independently of the value dtype.
+- Pass keyword-only `dtype="storage"` to return the stored value dtype, or an actual
+  NumPy dtype such as `dtype=np.float64` to request a conversion. These overrides
+  apply to `metric`, `metric_values`, and `table`; `metric_indices` always returns
+  `uint32`. `manifest()[name]["dtype"]` describes storage, not the default return type.
+- Conversions happen after selection and alignment, including empty and single-row
+  reads. Scalar reads return the matching NumPy scalar. Integer conversions reject
+  overflow and fractional truncation; explicit float narrowing uses NumPy rounding.
+- Stored `u64` values above the `int64` maximum raise on standard reads. Select
+  `dtype=np.uint64`, `dtype=object`, or `dtype="storage"` explicitly for these values.
+- Returned arrays may be read-only. Use `.copy()` when you need to modify them.
 - An integer `idx` (like `idx=-1` for the latest value) reads just that one row, without loading the whole column.
 - Some useful metadata: `config()` returns the attached config dict; `when_exported()` is a timestamp, and `rows(name)` is the exact row count (not last step!) in the given metric.
 - `approx_max_rows(nprobes=12)` cheaply estimates the row count of the most-frequent metric. Closed index specs and finalized `run_rows` metadata need no probes; otherwise it checks at most `nprobes` explicit-index or open numeric columns, distributed across their index cadences. The result becomes exact for stable columnar data when the budget covers every candidate, but may otherwise underestimate; hot rows and open JSONL columns are excluded.
 - While the data format is simple, the reader code is a bit more complex because it tolerates corrupt tails, such that it's fine to read plattli's while they are being written.
 - Metadata (manifest, config, hot rows, row counts, jsonl values) is cached on first use, while raw data files are read fresh on every call. On a long-lived `Reader` of a live run, call `refresh()` to drop the caches and pick up new metrics and hot rows. Zip readers are immutable snapshots.
+- If a live storage promotion invalidates a read's cached dtype, or a read encounters
+  a new hot metric missing from its cached manifest, the reader refreshes and retries
+  that read. It also retries when a fresh hot snapshot reveals that a previously
+  hot-only metric has moved into columnar storage. For `table()`, this restarts the
+  whole table. This does not guarantee an atomic snapshot of concurrent writes or
+  replace `refresh()` for ordinary appended data and guaranteed visibility of new metrics.
 
 ### Aligned reads: table()
 
@@ -181,11 +253,20 @@ than `on` are only read within the selected step window, so zoomed reads stay ch
 when metrics were logged at different cadences.
 
 ```python
+import numpy as np
+
 with Reader("/experiments/123456") as r:
     steps, cols = r.table(["loss", "accuracy"])                    # aligned full read
     steps, cols = r.table(["walltime", "loss"], on="walltime", vstart=10.0, vstop=20.0)
     x, y = cols["walltime"], cols["loss"]
+
+    # Override one metric's dtype; all other columns use "standard".
+    steps, cols = r.table(["loss", "tokens"], dtype={"loss": np.float64})
 ```
+
+`table(..., dtype=...)` accepts either one dtype for every requested metric or a
+mapping from metric names to dtypes. It never changes the dtype of the returned steps.
+`names` can be any nonempty iterable, including a generator.
 
 ### Advanced API topics
 
@@ -240,7 +321,8 @@ JSON object keyed by metric name, plus metadata keys like `run_rows` and `when_e
 
 Fields:
 - `indices`: `"indices"`, a list of `{start, stop, step}` segments (canonical), or a single `{start, stop, step}` (legacy). During live compacting writes, the final segment may omit `stop`; readers derive it from the value file length.
-- `dtype`: one of `f{32,64}`, `{i,u}{8,16,32,64}`, or `jsonl`.
+- `dtype`: storage type, one of `f{32,64}`, `{i,u}{8,16,32,64}`, or `jsonl`.
+  Integer compaction changes this field without changing standard reader output.
 - `monotonic`: optional `"inc"` or `"dec"` for numeric metrics whose stored values are monotonic; flat-only metrics use `"inc"`.
 - `run_rows`: optional max rows across all metrics (written on `finish` only).
 - `when_exported`: timestamp updated on manifest writes.

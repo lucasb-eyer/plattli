@@ -52,10 +52,12 @@ def convert_run(run_dir, dest, use_named_zip, skip_cols=None, allow_rewinds=Fals
                     raise ValueError(f"step out of uint32 range at {metrics_path}:{lineno}: {row_step}")
                 if prev_step is not None and row_step <= prev_step:
                     if allow_rewinds and row_step < prev_step:
-                        for column in w._columns.values():
+                        for name, column in list(w._columns.items()):
                             while column.i and column.i[-1] >= row_step:
                                 column.i.pop()
                                 column.v.pop()
+                            if not column.i:
+                                del w._columns[name]
                         w._step_metrics.clear()
                     else:
                         raise ValueError(

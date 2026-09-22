@@ -1,4 +1,6 @@
 import json
+import math
+import operator
 import os
 import threading
 import zipfile
@@ -34,6 +36,11 @@ DTYPE_TO_NUMPY = {
     "u32": np.uint32,
     "u64": np.uint64,
 }
+_INT_LIMITS = {
+    tag: (int(np.iinfo(dtype).min), int(np.iinfo(dtype).max))
+    for tag, dtype in DTYPE_TO_NUMPY.items() if tag[0] in "iu"
+}
+_F32_MAX = float(np.finfo(np.float32).max)
 
 JSONL_DTYPE = "jsonl"
 HOT_FILENAME = "hot.jsonl"
@@ -44,6 +51,7 @@ _RESERVED_METRIC_NAMES = frozenset({"step", "run_rows", "when_exported", "hot", 
 def _validate_metric_name(name, run_name):
     if not isinstance(name, str):
         raise TypeError(f"metric names must be strings in run {run_name} (got {type(name).__name__})")
+    name.encode("utf-8")  # Reject invalid filenames before any schema/data is published.
     if not name or "\x00" in name or "\\" in name:
         raise ValueError(f"invalid metric name {name!r} in run {run_name}")
     if name in _RESERVED_METRIC_NAMES:
@@ -61,6 +69,25 @@ def _validate_metric_name(name, run_name):
 def _validate_metric_names(names, run_name):
     for name in names:
         _validate_metric_name(name, run_name)
+
+
+def _coerce_step(step, run_name):
+    if type(step) is int:
+        return step
+    if isinstance(step, (bool, np.bool_)):
+        raise TypeError(f"step must be an integer for run {run_name}, not bool")
+    try:
+        return operator.index(step)
+    except TypeError as exc:
+        raise TypeError(f"step must be an integer for run {run_name}: {step!r}") from exc
+
+
+def _validate_step(step, run_name):
+    step = _coerce_step(step, run_name)
+    # TODO: auto-promote step storage and returned indices to uint64.
+    if step < 0 or step > 0xFFFFFFFF:
+        raise ValueError(f"step out of uint32 range for run {run_name}: {step}")
+    return step
 
 
 def _archive_member_path(root, name, run_name):
@@ -110,12 +137,22 @@ def _write_manifest(path, manifest, run_rows=None):
     _replace_text_checked(path, _manifest_payload(manifest, run_rows, _run_name_for_root(path.parent)), "manifest")
 
 
+def _check_temp_source(path, source):
+    temporary = path.parent.resolve() / (path.name + ".tmp")
+    if source.resolve() == temporary or source.parent.resolve() / source.name == temporary:
+        raise ValueError(f"source uses the writer's reserved temporary path: {temporary}")
+
+
 def _replace_text_checked(path, payload, label):
     if not payload:
         raise RuntimeError(f"{label} payload must not be empty for {path}")
     path = Path(path)
+    if path.is_symlink():
+        _check_temp_source(path, path.parent / os.readlink(path))
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_name(path.name + ".tmp")
+    if tmp_path.is_symlink():
+        tmp_path.unlink()  # A failed config-link replacement must not redirect this write.
     with tmp_path.open("w", encoding="utf-8") as fh:  # Do this whole dance to be atomic on NFS.
         fh.write(payload)
         fh.flush()
@@ -149,16 +186,38 @@ def _write_config(run_root, path, config):
         if target.exists():
             if not target.is_file():
                 raise FileNotFoundError(f"config target is not a file: {target} (run {run_name})")
-            if path.exists() or path.is_symlink():
-                path.unlink()
-            path.symlink_to(target.resolve())
+            target = target.resolve()
+            if target == path.resolve():
+                return
+            tmp_path = path.with_name(path.name + ".tmp")
+            if tmp_path.exists() or tmp_path.is_symlink():
+                tmp_path.unlink()
+            tmp_path.symlink_to(target)
+            tmp_path.replace(path)
+            _fsync_dir(path.parent)
             return
         if path.exists() or path.is_symlink():
             return
         config = {}
+    # Replace the link itself when switching from an external config to a value.
+    _replace_text_checked(path, json.dumps(config, ensure_ascii=False), "config")
+
+
+def _prepare_config(run_root, config):
+    path = run_root / "plattli" / "config.json"
     if path.is_symlink():
-        path.unlink()
-    path.write_text(json.dumps(config, ensure_ascii=False), encoding="utf-8")
+        _check_temp_source(path, path.parent / os.readlink(path))
+    if config is None:
+        return None
+    if isinstance(config, str):
+        target = (run_root / config).expanduser()
+        _check_temp_source(path, target)
+        if (target.exists() and not target.is_file()) or target.resolve() == (run_root / "plattli").resolve():
+            raise FileNotFoundError(f"config target is not a file: {target} (run {_run_name_for_root(run_root)})")
+        return config
+    payload = json.dumps(config, ensure_ascii=False)
+    payload.encode("utf-8")  # JSON permits lone surrogates; UTF-8 files do not.
+    return json.loads(payload)
 
 
 def _config_payload_with_overrides(path, config_overrides, run_name):
@@ -169,7 +228,9 @@ def _config_payload_with_overrides(path, config_overrides, run_name):
     config = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(config, dict):
         raise TypeError(f"config must be a JSON object to apply overrides in run {run_name}")
-    return json.dumps({**config, **config_overrides}, ensure_ascii=False)
+    payload = json.dumps({**config, **config_overrides}, ensure_ascii=False)
+    payload.encode("utf-8")  # Validate file encoding before finalization mutates data.
+    return payload
 
 
 def _truncate_to_step(root, manifest, step, allow_missing):
@@ -364,19 +425,153 @@ def _merge_metrics(args, kwargs, run_name):
 
 
 def _coerce_stored_value(value, dtype, name, run_name):
-    if hasattr(value, "__array__"):
+    if type(value) not in (int, float, bool) and hasattr(value, "__array__"):
         value = np.asarray(value)
     if isinstance(value, (np.ndarray, np.generic)):
         if value.shape != ():
             raise ValueError(f"only scalar values are supported for {name} in run {run_name} (shape {value.shape})")
         value = value.item()
     if dtype == JSONL_DTYPE:
-        return value
+        # Validate the complete batch before any writer publishes data or schema.
+        payload = json.dumps(value, ensure_ascii=False)
+        payload.encode("utf-8")
+        return value if value is None or type(value) in (str, int, float, bool) else json.loads(payload)
+    if dtype in _INT_LIMITS:
+        if not isinstance(value, (int, float)) or (isinstance(value, float) and not np.isfinite(value)):
+            raise ValueError(f"expected an integer for {name} in run {run_name}")
+        integer = int(value)
+        if integer != value:
+            raise ValueError(f"fractional value cannot be stored as {dtype} for {name} in run {run_name}")
+        lo, hi = _INT_LIMITS[dtype]
+        if not lo <= integer <= hi:
+            raise OverflowError(f"value {integer} is out of range for {dtype} for {name} in run {run_name}")
+        return integer
+    if not isinstance(value, (int, float)):
+        raise TypeError(f"expected a numeric scalar for {name} in run {run_name}")
+    # Python float -> f32 may round, but a finite value must not become infinity.
+    if dtype == "f32" and abs(value) > _F32_MAX and math.isfinite(value):
+        with np.errstate(over="ignore"):
+            converted = np.float32(value).item()
+        if math.isinf(converted):
+            raise OverflowError(f"finite value is out of range for {dtype} for {name} in run {run_name}")
+        return converted
+    return DTYPE_TO_NUMPY[dtype](value).item()
 
-    arr = np.asarray(value)
-    if arr.shape != ():
-        raise ValueError(f"only scalar values are supported for {name} in run {run_name} (shape {arr.shape})")
-    return np.asarray(arr, dtype=DTYPE_TO_NUMPY[dtype]).item()
+
+def _prepare_metrics(metrics, manifest, step_metrics, step, run_name, integer_bounds):
+    """Validate and snapshot the whole batch before publishing any changes."""
+    prepared = {}
+    for name, value in metrics.items():
+        if name in step_metrics:
+            raise RuntimeError(f"metric already written in step {step} for {name} in run {run_name}")
+        if name not in manifest:
+            dtype = _resolve_dtype(value, name=name, run_name=run_name)
+        else:
+            dtype = _reconcile_dtype(manifest[name]["dtype"], value, name, run_name,
+                                     lambda name=name: integer_bounds(name))
+        prepared[name] = dtype, _coerce_stored_value(value, dtype, name, run_name)
+    return prepared
+
+
+def _reconcile_dtype(dtype, value, name, run_name, integer_bounds):
+    """Use new scalar dtype evidence; recovered JSON rows must not call this."""
+    if dtype == JSONL_DTYPE:
+        return dtype
+    incoming = _resolve_dtype(value, name=name, run_name=run_name)
+    if incoming == dtype:
+        return dtype
+    if incoming == JSONL_DTYPE and isinstance(value, (list, tuple)):
+        raise ValueError(f"only scalar values are supported for {name} in run {run_name}")
+    if incoming == JSONL_DTYPE or (dtype[0] != "f" and incoming[0] == "f"):
+        raise TypeError(f"cannot mix {dtype} and {incoming} values for {name} in run {run_name}")
+    if dtype[0] == "f":
+        if incoming[0] in "iu":
+            integer = int(value) if isinstance(value, (int, np.integer)) else int(np.asarray(value).item())
+            # Equality between a NumPy float and int can itself round the int.
+            # Convert back to a Python integer before testing exactness.
+            candidate = float(integer)
+            if dtype == "f32" and abs(candidate) <= _F32_MAX:
+                candidate = float(np.float32(candidate))
+                if int(candidate) == integer:
+                    return dtype
+            if int(float(integer)) == integer:
+                return "f64"
+            raise OverflowError(f"integer cannot be represented exactly as a float for {name} in run {run_name}")
+        return "f64" if "f64" in (dtype, incoming) else "f32"
+    if dtype[0] == incoming[0]:
+        return dtype if int(dtype[1:]) >= int(incoming[1:]) else incoming
+
+    # Unlike np.promote_types, signed/unsigned reconciliation must never use floats.
+    unsigned = dtype if dtype[0] == "u" else incoming
+    signed = dtype if dtype[0] == "i" else incoming
+    if unsigned != "u64":
+        bits = max(int(signed[1:]), int(unsigned[1:]) * 2)
+        return f"i{bits}"
+    scalar = int(value) if isinstance(value, (int, np.integer)) else int(np.asarray(value).item())
+    if dtype == "i64" and scalar <= _INT_LIMITS["i64"][1]:
+        return dtype
+    lo, hi = integer_bounds()
+    lo, hi = min(lo, scalar), max(hi, scalar)
+    if hi <= _INT_LIMITS["i64"][1]:
+        return "i64"
+    if lo >= 0:
+        return "u64"
+    raise OverflowError(f"negative and uint64 values cannot share an integer dtype for {name} in run {run_name}")
+
+
+def _integer_bounds(root, name, dtype, hot_rows=()):
+    path = root / f"{name}.{dtype}"
+    lo = hi = 0
+    if path.exists() and path.stat().st_size:
+        values = np.fromfile(path, dtype=DTYPE_TO_NUMPY[dtype])
+        lo, hi = int(values.min()), int(values.max())
+    for row in hot_rows:
+        if name in row:
+            value = int(row[name])
+            lo, hi = min(lo, value), max(hi, value)
+    return lo, hi
+
+
+def _publish_stored_dtype(root, manifest, name, dtype, values, publish):
+    """Publish a complete replacement before removing the old column."""
+    spec = manifest[name]
+    old_dtype = spec["dtype"]
+    old_path = root / f"{name}.{old_dtype}"
+    if values is not None:
+        new_path = root / f"{name}.{dtype}"
+        tmp_path = new_path.with_name(new_path.name + ".tmp")
+        with tmp_path.open("wb") as fh:
+            values.tofile(fh)
+            fh.flush()
+            os.fsync(fh.fileno())
+        tmp_path.replace(new_path)
+        _fsync_dir(new_path.parent)
+    spec["dtype"] = dtype
+    try:
+        publish()
+    except BaseException:
+        spec["dtype"] = old_dtype
+        raise
+    if old_path.exists():
+        old_path.unlink()
+        _fsync_dir(old_path.parent)
+
+
+def _rewrite_stored_dtype(root, manifest, name, dtype, publish):
+    old_path = root / f"{name}.{manifest[name]['dtype']}"
+    values = None
+    if old_path.exists():
+        values = np.fromfile(old_path, dtype=DTYPE_TO_NUMPY[manifest[name]["dtype"]])
+        target = np.dtype(DTYPE_TO_NUMPY[dtype])
+        if values.dtype.kind in "iu" and target.kind in "iu":
+            if values.size and not np.can_cast(values.dtype, target, casting="safe"):
+                lo, hi = _INT_LIMITS[dtype]
+                if int(values.min()) < lo or int(values.max()) > hi:
+                    raise OverflowError(f"stored values are out of range for {dtype} for {name} in run {_run_name_for_root(root)}")
+        elif values.dtype.kind != "f" or target.kind != "f" or target.itemsize < values.dtype.itemsize:
+            raise TypeError(f"cannot rewrite {values.dtype} values as {dtype} for {name} in run {_run_name_for_root(root)}")
+        values = values.astype(target, copy=False)
+    _publish_stored_dtype(root, manifest, name, dtype, values, publish)
 
 
 class _Monotonic:
@@ -497,20 +692,8 @@ def _tighten_dtypes(root, manifest):
         new_dtype = f"{tightened.dtype.kind}{tightened.dtype.itemsize * 8}"
         if new_dtype == dtype:
             continue
-        new_path = root / f"{name}.{new_dtype}"
-        with new_path.open("wb") as fh:
-            tightened.tofile(fh)
-            fh.flush()
-            os.fsync(fh.fileno())
-        _fsync_dir(new_path.parent)
-        spec["dtype"] = new_dtype
-        try:
-            _write_manifest(root / "plattli.json", manifest)
-        except BaseException:
-            spec["dtype"] = dtype
-            raise
-        path.unlink()
-        _fsync_dir(path.parent)
+        _publish_stored_dtype(root, manifest, name, new_dtype, tightened,
+                              lambda: _write_manifest(root / "plattli.json", manifest))
 
 
 def _zip_output(run_root, root, config_payload=None):
@@ -532,7 +715,52 @@ def _zip_output(run_root, root, config_payload=None):
     rmtree(root)
 
 
-def _maybe_resume_finalized(run_root, root, allow_resume_finalized):
+def _cleanup_stored_files(root, manifest, *, include_orphans=False):
+    """Remove obsolete known files; sweep unreferenced pairs only on finalization."""
+    active = {"plattli.json", "config.json", HOT_FILENAME, HOT_COMPACTING_FILENAME}
+    for name, spec in manifest.items():
+        value_name = f"{name}.{spec['dtype']}"
+        active.add(value_name)
+        if spec["indices"] == "indices":
+            active.add(f"{name}.indices")
+            if not (root / f"{name}.indices").is_file():
+                raise FileNotFoundError(f"missing indices file for {name} in run {_run_name_for_root(root)}")
+        # Never delete an alternate representation to hide a missing active one.
+        if not (root / value_name).is_file() and _indices_length(root, name, spec):
+            raise FileNotFoundError(f"missing values file for {name} in run {_run_name_for_root(root)}")
+
+    config = root / "config.json"
+    if config.is_symlink():
+        try:
+            active.add(config.resolve().relative_to(root.resolve()).as_posix())
+        except ValueError:
+            pass  # Config links outside the metric directory are not scanned.
+
+    files = {path.relative_to(root).as_posix(): path for path in root.rglob("*") if path.is_file() or path.is_symlink()}
+    value_suffixes = {*DTYPE_TO_NUMPY, JSONL_DTYPE}
+    orphan_stems = set()
+    if include_orphans:
+        for rel in files:
+            stem, _, suffix = rel.rpartition(".")
+            if suffix in value_suffixes and stem not in manifest and f"{stem}.indices" in files:
+                orphan_stems.add(stem)
+
+    changed_dirs = set()
+    for rel, path in files.items():
+        if rel in active:
+            continue
+        base = rel.removesuffix(".tmp")
+        stem, _, suffix = base.rpartition(".")
+        metadata_tmp = rel in {"plattli.json.tmp", "config.json.tmp", f"{HOT_FILENAME}.tmp", f"{HOT_COMPACTING_FILENAME}.tmp"}
+        metric_artifact = suffix in value_suffixes | {"indices"} and (stem in manifest or stem in orphan_stems)
+        if metadata_tmp or metric_artifact:
+            path.unlink()
+            changed_dirs.add(path.parent)
+    for directory in changed_dirs:
+        _fsync_dir(directory)
+
+
+def _maybe_resume_finalized(run_root, root, allow_resume_finalized, config=None):
     zip_path = _zip_path_for_root(run_root)
     if not zip_path.exists():
         return
@@ -546,8 +774,6 @@ def _maybe_resume_finalized(run_root, root, allow_resume_finalized):
             raise RuntimeError(f"expected {root} to be a directory for run {run_name}")
         if any(root.iterdir()):
             raise RuntimeError(f"found both {zip_path} and {root} for run {run_name}; refuse to merge")
-    else:
-        root.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(zip_path) as zf:
         zf.getinfo("plattli.json")
         members = []
@@ -556,6 +782,11 @@ def _maybe_resume_finalized(run_root, root, allow_resume_finalized):
             if info.filename.endswith("/"):
                 continue
             members.append((info, out_path))
+        if isinstance(config, str):
+            target = (run_root / config).expanduser().resolve()
+            if any(target in out_path.parents for _, out_path in members):
+                raise FileNotFoundError(f"config target is not a file: {target} (run {run_name})")
+        root.mkdir(parents=True, exist_ok=True)
         for info, out_path in members:
             out_path.parent.mkdir(parents=True, exist_ok=True)
             out_path.write_bytes(zf.read(info))
@@ -567,18 +798,21 @@ class DirectWriter:
         self.run_root = Path(outdir)
         if self.run_root.name == "plattli":
             raise ValueError(f"outdir should be a run directory, not the plattli folder: {outdir}")
+        self.step = _validate_step(step, self.run_root.name)
+        write_threads = operator.index(write_threads)
+        if write_threads < 0:
+            raise ValueError(f"write_threads must be >= 0 for run {self.run_root.name}: {write_threads}")
+        config = _prepare_config(self.run_root, config)
         self.root = self.run_root / "plattli"
-        _maybe_resume_finalized(self.run_root, self.root, allow_resume_finalized)
+        _maybe_resume_finalized(self.run_root, self.root, allow_resume_finalized, config)
         self.root.mkdir(parents=True, exist_ok=True)
-
-        self.step = int(step)
-        assert self.step >= 0, f"step must be >= 0 for run {self.run_root.name}: {self.step}"
 
         self._manifest = {}
         self._executor = ThreadPoolExecutor(max_workers=write_threads) if write_threads else None
         self._futures = []
         self._step_metrics = set()
         self._monotonic = {}
+        self._integer_bounds_cache = {}
         self._broken = None
         self._finished = False
 
@@ -596,36 +830,46 @@ class DirectWriter:
             if rewrite_manifest:
                 _write_manifest(self.root / "plattli.json", self._manifest)
 
-        self.set_config(config)
+        _write_config(self.run_root, self.root / "config.json", config)
+        if (self.root / "plattli.json").exists():
+            _cleanup_stored_files(self.root, self._manifest)
 
     def write(self, *args, **kwargs):
         self._check_finished()
         self._check_broken()
         self._drain_errors()
         metrics = _merge_metrics(args, kwargs, self.run_root.name)
-        _validate_metric_names(metrics, self.run_root.name)
+        # Existing names were validated when first published or loaded on resume.
+        _validate_metric_names((name for name in metrics if name not in self._manifest), self.run_root.name)
         if not metrics:
             return
 
-        if self.step < 0 or self.step > 0xFFFFFFFF:
-            raise ValueError(f"step out of uint32 range for run {self.run_root.name}: {self.step}")
+        self.step = _validate_step(self.step, self.run_root.name)
+
+        prepared = _prepare_metrics(metrics, self._manifest, self._step_metrics,
+                                    self.step, self.run_root.name, self._integer_bounds)
 
         new_metric = False
-        for name, value in metrics.items():
-            if name == "step":
-                raise ValueError(f"metric name 'step' is reserved in run {self.run_root.name}")
-            if name in self._step_metrics:
-                raise RuntimeError(f"metric already written in step {self.step} for {name} in run {self.run_root.name}")
+        for name, (dtype, value) in prepared.items():
             is_new = name not in self._manifest
             if is_new:
-                dtype = _resolve_dtype(value, name=name, run_name=self.run_root.name)
                 (self.root / name).parent.mkdir(parents=True, exist_ok=True)
                 self._manifest[name] = {"indices": "indices", "dtype": dtype}
                 new_metric = True
             else:
-                dtype = self._manifest[name]["dtype"]
-            value = _coerce_stored_value(value, dtype, name, self.run_root.name)
+                if dtype != self._manifest[name]["dtype"]:
+                    wait(self._futures)
+                    self._drain_errors()
+                    try:
+                        _rewrite_stored_dtype(self.root, self._manifest, name, dtype,
+                                              lambda: _write_manifest(self.root / "plattli.json", self._manifest))
+                    except Exception as err:
+                        self._broken = err
+                        raise
             new_metric = _track_monotonic_value(self._manifest, self._monotonic, name, value) or new_metric
+            if name in self._integer_bounds_cache:
+                lo, hi = self._integer_bounds_cache[name]
+                self._integer_bounds_cache[name] = min(lo, value), max(hi, value)
             write_indices = self._manifest[name]["indices"] == "indices"
             if is_new:
                 try:
@@ -657,6 +901,7 @@ class DirectWriter:
     def end_step(self):
         self._check_finished()
         self._check_broken()
+        self.step = _coerce_step(self.step, self.run_root.name)
         wait(self._futures)
         self._drain_errors()
         self._flush_step_indices()
@@ -681,6 +926,7 @@ class DirectWriter:
         _write_manifest(self.root / "plattli.json", self._manifest,
                         run_rows=max((_indices_length(self.root, name, spec)
                                       for name, spec in self._manifest.items()), default=0))
+        _cleanup_stored_files(self.root, self._manifest, include_orphans=True)
 
         if zip:
             _zip_output(self.run_root, self.root, config_payload)
@@ -693,7 +939,7 @@ class DirectWriter:
 
     def set_config(self, config):
         self._check_finished()
-        _write_config(self.run_root, self.root / "config.json", config)
+        _write_config(self.run_root, self.root / "config.json", _prepare_config(self.run_root, config))
 
     def _check_finished(self):
         if self._finished:
@@ -715,6 +961,15 @@ class DirectWriter:
             _append_numeric(self.root / f"{name}.{dtype}", [value], dtype)
         if write_indices:
             _append_indices((self.root / f"{name}.indices"), [step])
+
+    def _integer_bounds(self, name):
+        if name in self._integer_bounds_cache:
+            return self._integer_bounds_cache[name]
+        wait(self._futures)
+        self._drain_errors()
+        bounds = _integer_bounds(self.root, name, self._manifest[name]["dtype"])
+        self._integer_bounds_cache[name] = bounds
+        return bounds
 
     def _flush_step_indices(self):
         if not self._step_metrics:
@@ -755,22 +1010,21 @@ class CompactingWriter:
         self.run_root = Path(outdir)
         if self.run_root.name == "plattli":
             raise ValueError(f"outdir should be a run directory, not the plattli folder: {outdir}")
-        self.root = self.run_root / "plattli"
-        _maybe_resume_finalized(self.run_root, self.root, allow_resume_finalized)
-        self.root.mkdir(parents=True, exist_ok=True)
-
-        self.step = int(step)
-        assert self.step >= 0, f"step must be >= 0 for run {self.run_root.name}: {self.step}"
-
+        self.step = _validate_step(step, self.run_root.name)
         self.hotsize = int(hotsize)
         if self.hotsize <= 0:
             raise ValueError(f"hotsize must be > 0 for run {self.run_root.name}: {self.hotsize}")
+        config = _prepare_config(self.run_root, config)
+        self.root = self.run_root / "plattli"
+        _maybe_resume_finalized(self.run_root, self.root, allow_resume_finalized, config)
+        self.root.mkdir(parents=True, exist_ok=True)
 
         self._manifest = {}
         self._compact_executor = ThreadPoolExecutor(max_workers=1)
         self._compact_future = None
         self._step_metrics = set()
         self._monotonic = {}
+        self._integer_bounds_cache = {}
         self._broken = None
         self._finished = False
 
@@ -803,7 +1057,9 @@ class CompactingWriter:
                 rewrite_manifest = True
         if rewrite_manifest:
             _write_manifest(self.root / "plattli.json", self._manifest)
-        self.set_config(config)
+        _write_config(self.run_root, self.root / "config.json", config)
+        if (self.root / "plattli.json").exists():
+            _cleanup_stored_files(self.root, self._manifest)
 
     def __del__(self):
         # Some callers intentionally drop unfinished writers to resume later.
@@ -827,37 +1083,48 @@ class CompactingWriter:
         self._check_broken()
         self._drain_errors()
         metrics = _merge_metrics(args, kwargs, self.run_root.name)
-        _validate_metric_names(metrics, self.run_root.name)
+        # Existing names were validated when first published or loaded on resume.
+        _validate_metric_names((name for name in metrics if name not in self._manifest), self.run_root.name)
         if not metrics and flush:
             self._flush_hot()
             return
         if not metrics:
             return
 
-        if self.step < 0 or self.step > 0xFFFFFFFF:
-            raise ValueError(f"step out of uint32 range for run {self.run_root.name}: {self.step}")
+        self.step = _validate_step(self.step, self.run_root.name)
+
+        # Never wait for a worker while holding its manifest lock. Most writes keep
+        # their dtype and don't wait; widening drains the old representation first.
+        prepared = _prepare_metrics(metrics, self._manifest, self._step_metrics,
+                                    self.step, self.run_root.name, self._integer_bounds)
+
+        for name, (dtype, value) in prepared.items():
+            if name in self._manifest and dtype != self._manifest[name]["dtype"]:
+                self._wait_for_compaction()
+                with self._hot_lock:
+                    try:
+                        _rewrite_stored_dtype(self.root, self._manifest, name, dtype,
+                                              lambda: self._persist_manifest(*self._serialize_manifest_locked()))
+                    except Exception as err:
+                        self._broken = err
+                        raise
 
         new_metric = False
         pending = None
         with self._hot_lock:  # The compaction thread reads and serializes the manifest.
-            for name, value in metrics.items():
-                if name == "step":
-                    raise ValueError(f"metric name 'step' is reserved in run {self.run_root.name}")
-                if name in self._step_metrics:
-                    raise RuntimeError(f"metric already written in step {self.step} for {name} in run {self.run_root.name}")
+            for name, (dtype, value) in prepared.items():
                 if name not in self._manifest:
-                    dtype = _resolve_dtype(value, name=name, run_name=self.run_root.name)
                     (self.root / name).parent.mkdir(parents=True, exist_ok=True)
                     self._manifest[name] = {"indices": [], "dtype": dtype}
                     new_metric = True
-                else:
-                    dtype = self._manifest[name]["dtype"]
-                value = _coerce_stored_value(value, dtype, name, self.run_root.name)
                 if _track_monotonic_value(self._manifest, self._monotonic, name, value):
                     # Safe to defer: flags are persisted by the next compaction before any
                     # values land in columnar files, and recomputed from data on resume.
                     self._manifest_dirty = True
                 self._current_row[name] = value
+                if name in self._integer_bounds_cache:
+                    lo, hi = self._integer_bounds_cache[name]
+                    self._integer_bounds_cache[name] = min(lo, value), max(hi, value)
                 self._step_metrics.add(name)
 
             if new_metric:
@@ -870,6 +1137,7 @@ class CompactingWriter:
     def end_step(self):
         self._check_finished()
         self._check_broken()
+        self.step = _coerce_step(self.step, self.run_root.name)
         if self._current_row or self.step in self._hot_index:
             self._flush_hot()
         self._step_metrics.clear()
@@ -879,6 +1147,8 @@ class CompactingWriter:
     def finish(self, optimize=True, zip=True, config_overrides=None):
         self._check_finished()
         self._check_broken()
+        if self._current_row:
+            self.step = _validate_step(self.step, self.run_root.name)
         config_payload = _config_payload_with_overrides(
             self.root / "config.json", config_overrides, self.run_root.name)
         if self._compact_future:
@@ -907,6 +1177,7 @@ class CompactingWriter:
         _write_manifest(self.root / "plattli.json", self._manifest,
                         run_rows=max((_indices_length(self.root, name, spec)
                                       for name, spec in self._manifest.items()), default=0))
+        _cleanup_stored_files(self.root, self._manifest, include_orphans=True)
 
         if zip:
             _zip_output(self.run_root, self.root, config_payload)
@@ -919,11 +1190,25 @@ class CompactingWriter:
 
     def set_config(self, config):
         self._check_finished()
-        _write_config(self.run_root, self.root / "config.json", config)
+        _write_config(self.run_root, self.root / "config.json", _prepare_config(self.run_root, config))
 
     def _check_finished(self):
         if self._finished:
             raise RuntimeError(f"writer for run {self.run_root.name} is already finished")
+
+    def _wait_for_compaction(self):
+        if self._compact_future is not None:
+            wait([self._compact_future])
+            with self._hot_lock:
+                self._maybe_finalize_compaction_locked()
+
+    def _integer_bounds(self, name):
+        if name in self._integer_bounds_cache:
+            return self._integer_bounds_cache[name]
+        self._wait_for_compaction()
+        bounds = _integer_bounds(self.root, name, self._manifest[name]["dtype"], self._hot_rows)
+        self._integer_bounds_cache[name] = bounds
+        return bounds
 
     def _load_hot_rows(self):
         hot_path = self.root / HOT_FILENAME
@@ -997,7 +1282,8 @@ class CompactingWriter:
         return self._manifest_version, _manifest_payload(self._manifest)
 
     def _persist_manifest(self, version, payload):
-        # The fsyncs happen here, outside _hot_lock, so they never stall the other thread.
+        # Ordinary compaction fsyncs outside _hot_lock. Dtype promotion holds it
+        # after draining compaction so the replacement and its schema stay together.
         with self._manifest_io_lock:
             if version <= self._manifest_disk_version:
                 return  # A newer serialization already landed.
@@ -1005,6 +1291,8 @@ class CompactingWriter:
             self._manifest_disk_version = version
 
     def _flush_hot(self):
+        if self._current_row:
+            self.step = _validate_step(self.step, self.run_root.name)
         with self._hot_lock:
             future = self._compact_future
             backlogged = future is not None and len(self._hot_rows) >= 10 * self.hotsize
@@ -1196,7 +1484,8 @@ def _tightest_int(array):
     if not np.issubdtype(array.dtype, np.integer):
         return array  # pragma: no cover - unreachable
 
-    amin, amax = array.min(), array.max()
+    # Python comparisons stay exact at the int64/uint64 boundary.
+    amin, amax = int(array.min()), int(array.max())
 
     if amin >= 0:
         for dt in (np.uint8, np.uint16, np.uint32, np.uint64):
@@ -1222,11 +1511,11 @@ def _tight_dtype(array):
 
 
 def _append_numeric(path, values, dtype):
-    arr = np.asarray(values)
+    arr = np.asarray(values, dtype=DTYPE_TO_NUMPY[dtype])
     if arr.ndim != 1:
         raise ValueError(f"expected 1d values for {path} (shape {arr.shape})")
     with path.open("ab") as fh:
-        np.asarray(arr, dtype=DTYPE_TO_NUMPY[dtype]).tofile(fh)
+        arr.tofile(fh)
 
 
 def _append_indices(path, indices):
@@ -1251,7 +1540,11 @@ def _append_jsonl(path, values):
 
 
 def _resolve_dtype(value, name=None, run_name=None):
-    if hasattr(value, "__array__"):
+    if type(value) is int:
+        return "i64"
+    if type(value) is float:
+        return "f32"
+    if not isinstance(value, (np.ndarray, np.generic)) and hasattr(value, "__array__"):
         value = np.asarray(value)
     if isinstance(value, (np.ndarray, np.generic)):
         if value.shape != ():

@@ -371,6 +371,7 @@ class TestReader(unittest.TestCase):
         indices = np.asarray([0, 1], dtype=np.uint32)
         r = object.__new__(plattli.Reader)
         r._run_name = "mock-live-run"
+        r._manifest_retry_active = False
         r.metric = mock.Mock(side_effect=[
             (indices, np.asarray([10.0, 11.0, 12.0], dtype=np.float32)),
             (indices.copy(), np.asarray([20.0, 21.0, 22.0], dtype=np.float32)),
@@ -387,6 +388,7 @@ class TestReader(unittest.TestCase):
     def test_table_aligns_equal_length_different_indices(self):
         r = object.__new__(plattli.Reader)
         r._run_name = "mock-run"
+        r._manifest_retry_active = False
         r.metric = mock.Mock(side_effect=[
             (np.asarray([0, 1, 3], dtype=np.uint32), np.asarray([10.0, 11.0, 13.0], dtype=np.float32)),
             (np.asarray([0, 2, 3], dtype=np.uint32), np.asarray([20.0, 22.0, 23.0], dtype=np.float32)),

@@ -386,7 +386,7 @@ class TestDirectWriter(unittest.TestCase):
     def test_negative_step(self):
         with tempfile.TemporaryDirectory() as tmp:
             run_root = Path(tmp)
-            with self.assertRaises(AssertionError):
+            with self.assertRaises(ValueError):
                 plattli.DirectWriter(run_root, step=-1)
 
     def test_compacting_hotsize_is_required(self):
@@ -452,7 +452,7 @@ class TestDirectWriter(unittest.TestCase):
             self.assertEqual((plattli_root / "loss.f64").stat().st_size, 16)
             self.assertEqual(loss_vals.tolist(), [1.5, 2.5])
 
-    def test_dtype_cast_existing_metric(self):
+    def test_dtype_promotes_existing_metric(self):
         with tempfile.TemporaryDirectory() as tmp:
             run_root = Path(tmp)
             plattli_root = run_root / "plattli"
@@ -462,9 +462,9 @@ class TestDirectWriter(unittest.TestCase):
             w.write(loss=np.float64(1.5))
             w.finish(optimize=False, zip=False)
 
-            loss_vals = np.fromfile(plattli_root / "loss.f32", dtype=np.float32)
+            loss_vals = np.fromfile(plattli_root / "loss.f64", dtype=np.float64)
             self.assertTrue(np.allclose(loss_vals, [1.0, 1.5]))
-            self.assertEqual((plattli_root / "loss.f32").stat().st_size, 8)
+            self.assertEqual((plattli_root / "loss.f64").stat().st_size, 16)
 
     def test_duplicate_metric_same_step(self):
         with tempfile.TemporaryDirectory() as tmp:
