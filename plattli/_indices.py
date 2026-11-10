@@ -136,7 +136,7 @@ def _segments_truncate(segments, step, total_count=None):
         stop = start + count * stride
         if step <= start:
             break
-        if step >= stop:
+        if step > start + (count - 1) * stride:
             if is_open:
                 kept.append({"start": start, "step": stride})
             else:

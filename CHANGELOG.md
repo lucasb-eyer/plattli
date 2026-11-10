@@ -2,6 +2,10 @@
 
 All notable changes to this project are documented in this file.
 
+## Unreleased
+- Fixed resume dropping later segments when a preceding segment's canonical stop
+  extends past the next segment's start.
+
 ## 0.19.0 - 2026-09-22
 - Breaking API change: metric reads now default to signed `int64` for integers,
   independently of compact storage. Float widths and `uint32` steps are unchanged.
