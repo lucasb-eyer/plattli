@@ -191,6 +191,37 @@ class TestReader(unittest.TestCase):
                 self.assertEqual(idx.tolist(), [1, 2, 3])
                 self.assertTrue(np.allclose(values, [11, 12, 13]))
 
+    def test_table_merges_adjacent_storage_chunks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            # Many inline ranges, with a missing step after every seven ranges.
+            segments = [
+                {"start": 3 * i + i // 7, "stop": 3 * i + i // 7 + 3, "step": 1}
+                for i in range(17_000)
+            ]
+            steps = np.concatenate([
+                np.arange(segment["start"], segment["stop"], dtype=np.uint32)
+                for segment in segments
+            ])
+            (root / "plattli.json").write_text(json.dumps({
+                name: {"indices": segments, "dtype": "f32"}
+                for name in ("wall", "loss")
+            }), encoding="utf-8")
+            values = np.arange(len(steps), dtype=np.float32)
+            values.tofile(root / "wall.f32")
+            (values * 2).tofile(root / "loss.f32")
+
+            with plattli.Reader(root) as r:
+                # Assert before table() so a regression fails before quadratic work.
+                self.assertEqual(r._step_chunks_for_spec(
+                    "loss", segments, int(steps[1]), int(steps[-2]), len(steps),
+                ), [(1, len(steps) - 1)])
+                with mock.patch.object(r, "_read_value_slice", wraps=r._read_value_slice) as read:
+                    selected, columns = r.table(["loss"], on="wall", istart=1, istop=-1)
+                np.testing.assert_array_equal(selected, steps[1:-1])
+                np.testing.assert_array_equal(columns["loss"], values[1:-1] * 2)
+                self.assertEqual(read.call_count, 2)  # One slice per metric.
+
     def test_reader_metric_value_range_descending(self):
         with tempfile.TemporaryDirectory() as tmp:
             run_root = Path(tmp) / "run"

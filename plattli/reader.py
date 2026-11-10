@@ -312,7 +312,11 @@ class Reader:
                     left = min(max(left, 0), seg_count)
                     right = min(max(right, 0), seg_count)
                     if left < right:
-                        chunks.append((offset + left, offset + right))
+                        # Gaps in steps do not imply gaps in stored values.
+                        if chunks and chunks[-1][1] == offset + left:
+                            chunks[-1] = (chunks[-1][0], offset + right)
+                        else:
+                            chunks.append((offset + left, offset + right))
                     offset += seg_count
             except (ValueError, RuntimeError) as exc:
                 raise type(exc)(f"{exc} (metric {name}, run {self._run_name})") from exc
