@@ -6,6 +6,8 @@ All notable changes to this project are documented in this file.
 - Added binary `.ranges` index files for metrics with many regular segments.
   `finish(optimize=True)` may now write `"indices": "ranges"`; older readers
   cannot read that representation. Upgrade readers before producing these runs.
+- Added `python -m plattli.optimize_indices PATH` to optimize an offline run
+  directory or archive without changing values, config, or run metadata.
 - Added `CompactingWriter(..., live_indices="auto" | "explicit")`. Automatic live
   range storage requires at least 32 samples per range and falls back to explicit
   indices when recent batches add ranges too frequently. Explicit mode avoids

@@ -351,6 +351,8 @@ steps `[0, 2, 4, 10, 12]`. A final live record may omit `end_row` (8 bytes);
 its length comes from the values. Closing it only appends `end_row`, so
 continuing the same cadence needs no index writes. `finish()` closes open tails.
 
+Convert existing files with `python -m plattli.optimize_indices PATH`.
+
 ### Config (`config.json`)
 Arbitrary JSON object (dict), written when a config is provided.
 
