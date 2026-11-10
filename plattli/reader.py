@@ -676,15 +676,14 @@ class Reader:
             except FileNotFoundError:
                 return False  # A completed compaction may unlink its transient file here.
             for row in entries:
-                rows[int(row["step"])] = row  # On overlap, the active hot file wins.
+                rows.setdefault(int(row["step"]), row)  # Read active first; it wins on overlap.
             return True
 
-        for filename in (HOT_COMPACTING_FILENAME, HOT_FILENAME):
+        # Capture active rows before rotation can move them to the compacting log.
+        # If compaction retires either snapshot, the later column read covers it.
+        for filename in (HOT_FILENAME, HOT_COMPACTING_FILENAME):
             self._hot_has_file |= merge_file(filename)
-        if not self._hot_has_file:
-            # hot.jsonl may have been renamed after the first compacting-log read.
-            self._hot_has_file = merge_file(HOT_COMPACTING_FILENAME)
-        for step, row in rows.items():
+        for step, row in sorted(rows.items()):
             for name, value in row.items():
                 if name == "step":
                     continue

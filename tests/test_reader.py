@@ -12,6 +12,55 @@ from plattli.writer import _zip_path_for_root
 
 
 class TestReader(unittest.TestCase):
+    def test_hot_rotation_between_log_reads(self):
+        for timing in ("before_active", "after_active", "after_compaction"):
+            with self.subTest(timing=timing), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                (root / "plattli.json").write_text(json.dumps({"loss": {"dtype": "f32", "indices": "indices"}}))
+                (root / "loss.indices").write_bytes(b"")
+                (root / "loss.f32").write_bytes(b"")
+                (root / "hot.compacting.jsonl").write_text('{"step":0,"loss":0}\n')
+                (root / "hot.jsonl").write_text('{"step":1,"loss":1}\n')
+                with plattli.Reader(root) as reader:
+                    read = reader._read_live_jsonl
+
+                    def rotate():
+                        np.asarray([0], dtype=np.uint32).tofile(root / "loss.indices")
+                        np.asarray([0], dtype=np.float32).tofile(root / "loss.f32")
+                        (root / "hot.jsonl").replace(root / "hot.compacting.jsonl")
+                        (root / "hot.jsonl").write_text('{"step":2,"loss":2}\n')
+
+                    def interleave(path):
+                        if path.name != "hot.jsonl":
+                            return read(path)
+                        if timing == "before_active":
+                            rotate()
+                        rows = read(path)
+                        if timing != "before_active":
+                            rotate()
+                        if timing == "after_compaction":
+                            np.asarray([0, 1], dtype=np.uint32).tofile(root / "loss.indices")
+                            np.asarray([0, 1], dtype=np.float32).tofile(root / "loss.f32")
+                            (root / "hot.compacting.jsonl").unlink()
+                        return rows
+
+                    with mock.patch.object(reader, "_read_live_jsonl", interleave):
+                        steps, values = reader.metric("loss")
+                    expected = [0, 1, 2] if timing == "before_active" else [0, 1]
+                    self.assertEqual(steps.tolist(), expected)
+                    self.assertEqual(values.tolist(), expected)
+
+    def test_hot_active_rows_win_and_merge_is_sorted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "plattli.json").write_text(json.dumps({"loss": {"dtype": "f32", "indices": []}}))
+            (root / "hot.compacting.jsonl").write_text('{"step":0,"loss":0}\n{"step":1,"loss":10}\n')
+            (root / "hot.jsonl").write_text('{"step":1,"loss":100}\n{"step":2,"loss":200}\n')
+            with plattli.Reader(root) as reader:
+                steps, values = reader.metric("loss")
+                self.assertEqual(steps.tolist(), [0, 1, 2])
+                self.assertEqual(values.tolist(), [0, 100, 200])
+
     def test_reader_accepts_trusted_directory(self):
         with tempfile.TemporaryDirectory() as tmp:
             run_root = Path(tmp) / "run"

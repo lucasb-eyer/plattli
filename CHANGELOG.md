@@ -5,6 +5,7 @@ All notable changes to this project are documented in this file.
 ## Unreleased
 - Fixed resume dropping later segments when a preceding segment's canonical stop
   extends past the next segment's start.
+- Fixed reader gaps during hot-log rotation while preserving active-row precedence.
 
 ## 0.19.0 - 2026-09-22
 - Breaking API change: metric reads now default to signed `int64` for integers,
