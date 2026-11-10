@@ -915,10 +915,8 @@ class TestDirectWriter(unittest.TestCase):
                     self.assertFalse((plattli_root / "loss.indices").exists())
                 else:
                     self.assertEqual(manifest["loss"]["indices"], "indices")
-                    self.assertEqual(
-                        np.fromfile(plattli_root / "loss.indices", dtype=np.uint32).tolist(),
-                        steps,
-                    )
+                    self.assertTrue((plattli_root / "loss.indices").exists())
+                    self.assertFalse((plattli_root / "loss.ranges").exists())
 
                 with plattli.Reader(run_root) as r:
                     self.assertEqual(r.metric_indices("loss").tolist(), steps)
@@ -953,10 +951,8 @@ class TestDirectWriter(unittest.TestCase):
                     self.assertFalse((plattli_root / "loss.indices").exists())
                 else:
                     self.assertEqual(manifest["loss"]["indices"], "indices")
-                    self.assertEqual(
-                        np.fromfile(plattli_root / "loss.indices", dtype=np.uint32).tolist(),
-                        steps,
-                    )
+                    self.assertTrue((plattli_root / "loss.indices").exists())
+                    self.assertFalse((plattli_root / "loss.ranges").exists())
                 w.write(loss=float(w.step))
                 w.end_step()
                 w.finish(optimize=False, zip=False)
@@ -1057,11 +1053,10 @@ class TestDirectWriter(unittest.TestCase):
             w.finish(optimize=True, zip=False)
 
             manifest = json.loads((plattli_root / "plattli.json").read_text(encoding="utf-8"))
-            self.assertEqual(manifest["loss"]["indices"], "indices")
-            self.assertEqual(
-                np.fromfile(plattli_root / "loss.indices", dtype=np.uint32).tolist(),
-                steps,
-            )
+            self.assertEqual(manifest["loss"]["indices"], "ranges")
+            self.assertFalse((plattli_root / "loss.indices").exists())
+            with plattli.Reader(run_root) as r:
+                self.assertEqual(r.metric_indices("loss").tolist(), steps)
 
     def test_optimize_piecewise_indices(self):
         with tempfile.TemporaryDirectory() as tmp:

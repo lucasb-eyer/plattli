@@ -97,12 +97,22 @@ Calling `end_step` from a different thread would lead to silently inconsistent d
   writer temporary files. Finalization also removes orphan value/index pairs.
   Unrelated extra files are preserved.
 
-### CompactingWriter(outdir, step=0, *, hotsize, config="config.json", allow_resume_finalized=False)
+### CompactingWriter(outdir, step=0, *, hotsize, config="config.json", allow_resume_finalized=False, live_indices="auto")
 - Hot mode: writes rows to `hot.jsonl` and compacts them into columnar files in the background.
 - `hotsize` must be > 0 and is the compaction trigger: once the hot log holds `hotsize` completed steps, all completed rows are compacted in one background batch.
 - Backpressure: writes normally never block on compaction; if the filesystem cannot keep up with the write rate, completed rows accumulate in memory (and in the hot log, so nothing is lost on crash) and batches get bigger. Once the backlog reaches 10x `hotsize`, `end_step` blocks until the in-flight batch lands, so memory stays bounded and logging degrades to filesystem speed instead of exhausting RAM.
 - `config` follows the same rules as `DirectWriter`.
 - `allow_resume_finalized` follows the same rules as `DirectWriter`.
+- `live_indices="auto"` keeps small range lists inline. Larger lists use `.ranges`
+  only when they average at least 32 samples per range; otherwise they use explicit
+  `.indices`. Existing range files also fall back to explicit indices when a batch
+  has fewer than 32 samples per new range it adds. A batch continuing the existing
+  cadence adds no range records. Once explicit, a metric stays explicit while live.
+- `live_indices="explicit"` stores compacted steps in `.indices`, including after
+  resume. Use it to avoid per-metric range-file syncs during gap-heavy compaction.
+- `live_indices` controls live storage only. `finish(optimize=True)` may still
+  convert explicit indices to inline ranges or `.ranges` based on size. Use
+  `finish(optimize=False)` to retain explicit indices.
 
 ### BulkWriter(outdir, step=0, config="config.json", overwrite=False)
 - Buffers a complete run in memory and writes the columnar export on `finish()`.
@@ -183,7 +193,7 @@ Calling `end_step` from a different thread would lead to silently inconsistent d
 - Updates `plattli.json`.
 - If `optimize=True`:
   - Tightens numeric dtypes (floats -> keep original float width, ints -> smallest fitting int/uint).
-  - Converts monotonically spaced indices into `{start, stop, step}` and removes the `.indices` file.
+  - Stores regular indices as inline ranges or `.ranges` files, whichever fits; irregular indices stay explicit.
   - Writes `run_rows` (max rows across metrics) into the manifest.
 - If `zip=True`, zips the run folder to `<outdir>/metrics.plattli` (stored, not compressed).
 - When zipping, `outdir/plattli` is removed after the zip is written.
@@ -300,7 +310,7 @@ run_dir/
   plattli/
     config.json
     plattli.json
-    <metric>.indices
+    <metric>.indices  # or <metric>.ranges; omitted for inline ranges
     <metric>.<dtype>   # or <metric>.jsonl
     hot.jsonl           # present during live logging if hotsize is enabled
     hot.compacting.jsonl  # transient: rows being compacted right now; unlinked when done
@@ -320,7 +330,7 @@ JSON object keyed by metric name, plus metadata keys like `run_rows` and `when_e
 ```
 
 Fields:
-- `indices`: `"indices"`, a list of `{start, stop, step}` segments (canonical), or a single `{start, stop, step}` (legacy). During live compacting writes, the final segment may omit `stop`; readers derive it from the value file length.
+- `indices`: `"indices"`, `"ranges"`, a list of `{start, stop, step}` segments, or a single segment (legacy). A final inline segment may omit `stop`; readers derive its length from the values.
 - `dtype`: storage type, one of `f{32,64}`, `{i,u}{8,16,32,64}`, or `jsonl`.
   Integer compaction changes this field without changing standard reader output.
 - `monotonic`: optional `"inc"` or `"dec"` for numeric metrics whose stored values are monotonic; flat-only metrics use `"inc"`.
@@ -328,11 +338,18 @@ Fields:
 - `when_exported`: timestamp updated on manifest writes.
 
 ### Indices (`<metric>.indices`)
-Raw little-endian uint32 array. Each entry is the step value for that metric
-write. If `optimize=True` during `finish()`, the file may be removed and
-replaced by a list of `{start, stop, step}` segments (canonical) or a single
-`{start, stop, step}` (legacy) in the manifest. Live compacted runs may
-omit `stop` from the final segment until `finish()` closes it.
+Raw little-endian uint32 array, one step per measurement. Small range lists
+stay inline (at most 32 segments). With `finish(optimize=True)`, larger lists
+use `.ranges` when smaller than explicit indices. Live `CompactingWriter`
+selection uses the stricter 32-sample rule described above, unless
+`live_indices="explicit"`. `DirectWriter` uses explicit indices while live.
+
+### Ranges (`<metric>.ranges`)
+Little-endian `(start: uint32, step: uint32, end_row: uint64)` records (16 bytes).
+`end_row` is the cumulative sample count: `(0, 2, 3), (10, 2, 5)` represents
+steps `[0, 2, 4, 10, 12]`. A final live record may omit `end_row` (8 bytes);
+its length comes from the values. Closing it only appends `end_row`, so
+continuing the same cadence needs no index writes. `finish()` closes open tails.
 
 ### Config (`config.json`)
 Arbitrary JSON object (dict), written when a config is provided.

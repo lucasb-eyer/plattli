@@ -188,18 +188,6 @@ def _piecewise_segments(indices):
     return segments
 
 
-def _find_piecewise_params(indices):
-    if indices.size < 2:
-        return None
-    segments = _piecewise_segments(indices)
-    if not segments:
-        return None
-    max_segments = min(32, max(4, indices.size // 10))
-    if len(segments) > max_segments:
-        return None
-    return segments
-
-
 def _append_step_to_segments(segments, step, count=None, open_tail=False):
     step = int(step)
     if not segments:

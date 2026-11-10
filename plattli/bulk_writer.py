@@ -8,13 +8,15 @@ from pathlib import Path
 
 import numpy as np
 
-from ._indices import _find_piecewise_params
+from ._indices import _piecewise_segments
+from ._ranges import _ranges_encode
 from .writer import (
     DTYPE_TO_NUMPY,
     JSONL_DTYPE,
     HOT_FILENAME,
     HOT_COMPACTING_FILENAME,
     _archive_member_path,
+    _choose_indices,
     _coerce_step,
     _coerce_stored_value,
     _merge_metrics,
@@ -36,12 +38,12 @@ def _old_artifacts(manifest, names):
     stems = set(metrics)
     for name in names:
         stem, _, suffix = name.rpartition(".")
-        if suffix in suffixes and f"{stem}.indices" in names:
+        if suffix in suffixes and any(f"{stem}.{suffix}" in names for suffix in ("indices", "ranges")):
             stems.add(stem)
     owned = {"plattli.json", "config.json", HOT_FILENAME, HOT_COMPACTING_FILENAME}
     owned.update(name + ".tmp" for name in tuple(owned))
     for stem in stems:
-        for suffix in suffixes | {"indices"}:
+        for suffix in suffixes | {"indices", "ranges"}:
             owned.add(f"{stem}.{suffix}")
             owned.add(f"{stem}.{suffix}.tmp")
     return owned
@@ -301,11 +303,11 @@ class BulkWriter:
                 run_rows = 0
                 for name, column in self._columns.items():
                     indices = np.asarray(column.i, dtype=np.uint32)
-                    segments = _find_piecewise_params(indices) if optimize else None
-                    if segments:
-                        indices_spec = segments
-                    else:
-                        indices_spec = "indices"
+                    segments = _piecewise_segments(indices) if optimize and indices.size >= 2 else None
+                    indices_spec = _choose_indices(segments, indices.size) if segments else "indices"
+                    if indices_spec == "ranges":
+                        write_bytes(f"{name}.ranges", _ranges_encode(segments, total_count=indices.size))
+                    elif indices_spec == "indices":
                         write_bytes(f"{name}.indices", indices.tobytes())
                     run_rows = max(run_rows, indices.size)
 

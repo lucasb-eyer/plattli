@@ -3,9 +3,24 @@
 All notable changes to this project are documented in this file.
 
 ## Unreleased
+- Added binary `.ranges` index files for metrics with many regular segments.
+  `finish(optimize=True)` may now write `"indices": "ranges"`; older readers
+  cannot read that representation. Upgrade readers before producing these runs.
+- Added `CompactingWriter(..., live_indices="auto" | "explicit")`. Automatic live
+  range storage requires at least 32 samples per range and falls back to explicit
+  indices when recent batches add ranges too frequently. Explicit mode avoids
+  range-file publication syncs during live compaction. Finish-time optimization
+  remains size-based, independently of the live setting.
 - Fixed resume dropping later segments when a preceding segment's canonical stop
   extends past the next segment's start.
 - Fixed reader gaps during hot-log rotation while preserving active-row precedence.
+- Resume preserves already open range tails when it discards no rows, allowing short
+  cadence continuations without index rewrites or an unnecessary switch to explicit
+  indices. Rewinds close the tail, and later hot-log recovery passes leave it closed
+  so readers with an older value count cannot extrapolate over replacement rows.
+- Resume skips unchanged range and value writes. Finish-time index optimization
+  shares the offline planner, skips unchanged encodings, and batches manifest
+  publication across metrics.
 
 ## 0.19.0 - 2026-09-22
 - Breaking API change: metric reads now default to signed `int64` for integers,

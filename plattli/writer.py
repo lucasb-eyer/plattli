@@ -14,7 +14,7 @@ import numpy as np
 from ._indices import (
     _append_step_to_indices_spec,
     _append_steps_to_indices_spec,
-    _find_piecewise_params,
+    _piecewise_segments,
     _segments_close_open_tail,
     _segments_count_and_last,
     _segments_from_spec,
@@ -22,6 +22,14 @@ from ._indices import (
     _segments_to_array,
     _segments_too_many,
     _segments_truncate,
+    _segments_with_counts,
+)
+from ._ranges import (
+    _ranges_append,
+    _ranges_encode,
+    _ranges_parse,
+    _ranges_records,
+    _ranges_to_segments,
 )
 
 DTYPE_TO_NUMPY = {
@@ -165,6 +173,79 @@ def _replace_text_checked(path, payload, label):
         raise RuntimeError(f"{label} file is empty after replace: {path}")
 
 
+def _replace_bytes(path, payload):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".tmp")
+    if temporary.is_symlink():
+        temporary.unlink()
+    with temporary.open("wb") as fh:
+        fh.write(payload)
+        fh.flush()
+        os.fsync(fh.fileno())
+    temporary.replace(path)
+    _fsync_dir(path.parent)
+
+
+def _append_range_bytes(path, payload):
+    if payload:
+        with path.open("ab") as fh:
+            fh.write(payload)
+            fh.flush()
+            os.fsync(fh.fileno())
+
+
+def _choose_indices(segments, count, *, live=False):
+    if not _segments_too_many(segments, total_count=count):
+        return segments
+    if live:
+        return "ranges" if count >= 32 * len(segments) else "indices"
+    return "ranges" if 16 * len(segments) < 4 * count else "indices"
+
+
+def _store_indices(root, name, segments, count, *, open_tail=False):
+    selected = _choose_indices(segments, count, live=True)
+    if selected == "ranges":
+        _replace_bytes(root / f"{name}.ranges", _ranges_encode(segments, total_count=count, open_tail=open_tail))
+    elif selected == "indices":
+        _replace_bytes(root / f"{name}.indices", _segments_to_array(segments, total_count=count).tobytes())
+    return selected
+
+
+def _extend_inline_indices(segments, steps, count):
+    # Only the old tail and first two incoming points need incremental inference.
+    # Compress the rest in one pass instead of rescanning growing history per row.
+    segments = _append_steps_to_indices_spec(segments, steps[:2], count=count, open_tail=True)
+    count += min(2, len(steps))
+    if not segments:
+        return segments
+    segments[-1].pop("stop", None)
+    remaining = np.asarray(steps[2:], dtype=np.uint64)
+    if len(remaining):
+        closed, _ = _segments_count_and_last(segments[:-1])
+        tail = segments[-1]
+        expected = tail["start"] + (count - closed + np.arange(len(remaining), dtype=np.uint64)) * tail["step"]
+        mismatch = np.flatnonzero(remaining != expected)
+        if len(mismatch):
+            matched = int(mismatch[0])
+            tail["stop"] = tail["start"] + (count - closed + matched) * tail["step"]
+            segments.extend(_piecewise_segments(remaining[matched:].astype(np.uint32)))
+            segments[-1].pop("stop")
+    return segments
+
+
+def _coalesce_segments(segments):
+    merged = []
+    for segment in segments:
+        start, stop, step = segment["start"], segment["stop"], segment["step"]
+        count = (stop - start + step - 1) // step
+        if merged and merged[-1]["step"] == step and merged[-1]["stop"] == start:
+            merged[-1]["stop"] = start + count * step
+        else:
+            merged.append({"start": start, "stop": start + count * step, "step": step})
+    return merged
+
+
 def _fsync_dir(path):
     if not hasattr(os, "O_DIRECTORY"):
         return
@@ -248,6 +329,16 @@ def _truncate_to_step(root, manifest, step, allow_missing):
             keep = int(np.searchsorted(indices, step, side="left")) if indices.size else 0
             with idx_path.open("r+b") as fh:
                 fh.truncate(keep * 4)
+        elif indices_spec == "ranges":
+            path = root / f"{name}.ranges"
+            if not path.exists():
+                if allow_missing:
+                    continue
+                raise FileNotFoundError(f"missing ranges file for {name} in run {run_name}")
+            original_ranges = path.read_bytes()
+            stored = _stored_values_count(root, name, dtype, allow_missing)
+            segments = _ranges_to_segments(original_ranges, stored)
+            kept, keep = _segments_truncate(segments, step)
         else:
             try:
                 segments = _segments_from_spec(indices_spec)
@@ -269,86 +360,156 @@ def _truncate_to_step(root, manifest, step, allow_missing):
                     if count >= keep:
                         break
                     offset += len(line)
-            with path.open("r+b") as fh:
-                fh.truncate(offset)
+            if path.stat().st_size != offset:
+                with path.open("r+b") as fh:
+                    fh.truncate(offset)
+                    if indices_spec == "ranges":
+                        fh.flush()
+                        os.fsync(fh.fileno())
         else:
             value_path = root / f"{name}.{dtype}"
             if not value_path.exists():
                 if allow_missing:
                     continue
                 raise FileNotFoundError(f"missing values file for {name} in run {run_name}")
-            with value_path.open("r+b") as fh:
-                fh.truncate(keep * np.dtype(DTYPE_TO_NUMPY[dtype]).itemsize)
+            size = keep * np.dtype(DTYPE_TO_NUMPY[dtype]).itemsize
+            if value_path.stat().st_size != size:
+                with value_path.open("r+b") as fh:
+                    fh.truncate(size)
+                    if indices_spec == "ranges":
+                        fh.flush()
+                        os.fsync(fh.fileno())
+        if indices_spec == "ranges":
+            # Preserve an open tail only when no values were cut. Never reopen a
+            # closed tail: hot recovery can truncate twice, and the second pass
+            # must retain the first pass's bound for readers holding an old count.
+            data = _ranges_encode(kept, total_count=keep,
+                                  open_tail=keep == stored and _ranges_parse(original_ranges)[1] is not None)
+            if data != original_ranges:
+                _replace_bytes(root / f"{name}.ranges", data)
     _write_manifest(root / "plattli.json", manifest)
 
 
 def _force_indices_files(root, manifest):
     run_name = _run_name_for_root(root)
     updated = False
+    retired = []
     for name, spec in manifest.items():
         indices_spec = spec.get("indices")
         if indices_spec == "indices":
             continue
         try:
-            segments = _segments_from_spec(indices_spec)
-            total_count = _stored_values_count(root, name, spec["dtype"], allow_missing=False) if _segments_have_open_tail(segments) else None
+            if indices_spec == "ranges":
+                segments = _ranges_to_segments((root / f"{name}.ranges").read_bytes(),
+                                               _stored_values_count(root, name, spec["dtype"], allow_missing=False))
+                total_count = None
+            else:
+                segments = _segments_from_spec(indices_spec)
+                total_count = _stored_values_count(root, name, spec["dtype"], allow_missing=False) if _segments_have_open_tail(segments) else None
             indices = _segments_to_array(segments, total_count=total_count)
         except (ValueError, RuntimeError) as exc:
             raise type(exc)(f"{exc} (metric {name}, run {run_name})") from exc
         idx_path = root / f"{name}.indices"
         idx_path.parent.mkdir(parents=True, exist_ok=True)
-        with idx_path.open("wb") as fh:
-            indices.tofile(fh)
+        _replace_bytes(idx_path, indices.tobytes())
+        if indices_spec == "ranges":
+            retired.append(root / f"{name}.ranges")
         spec["indices"] = "indices"
         updated = True
     if updated:
         _write_manifest(root / "plattli.json", manifest)
+        for path in retired:
+            path.unlink()
+            _fsync_dir(path.parent)
 
 
 def _migrate_oversized_piecewise_indices(root, manifest):
-    run_name = _run_name_for_root(root)
     updated = False
     for name, spec in manifest.items():
-        indices_spec = spec["indices"]
-        if indices_spec == "indices":
+        if spec["indices"] in ("indices", "ranges"):
             continue
-        try:
-            segments = _segments_from_spec(indices_spec)
-            total_count = (
-                _stored_values_count(root, name, spec["dtype"], allow_missing=False)
-                if _segments_have_open_tail(segments)
-                else None
-            )
-            if not _segments_too_many(segments, total_count=total_count):
-                continue
-            indices = _segments_to_array(segments, total_count=total_count)
-        except (ValueError, RuntimeError) as exc:
-            raise type(exc)(f"{exc} (metric {name}, run {run_name})") from exc
-        idx_path = root / f"{name}.indices"
-        idx_path.parent.mkdir(parents=True, exist_ok=True)
-        with idx_path.open("wb") as fh:
-            indices.tofile(fh)
-        spec["indices"] = "indices"
-        updated = True
+        segments = _segments_from_spec(spec["indices"])
+        if not segments:
+            continue
+        count = _stored_values_count(root, name, spec["dtype"], allow_missing=False)
+        if _segments_too_many(segments, total_count=count):
+            spec["indices"] = _store_indices(root, name, segments, count, open_tail=True)
+            updated = True
     return updated
 
 
-def _optimize_indices(root, manifest):
-    for name, spec in manifest.items():
-        if spec["indices"] != "indices":
-            continue  # pragma: no cover
-        idx_path = root / f"{name}.indices"
-        indices = np.fromfile(idx_path, dtype=np.uint32)
-        segments = _find_piecewise_params(indices)
-        if segments:
-            spec["indices"] = segments
+def _plan_indices(manifest, read_bytes, values_count, run_name):
+    replacements = {}
+    retired = set()
+    changed = 0
+    metrics = {name: spec for name, spec in manifest.items() if name not in ("run_rows", "when_exported")}
+    _validate_metric_names(metrics, run_name)
+    for name, spec in metrics.items():
+        original = spec["indices"]
+        try:
+            count = values_count(name, spec)
+        except KeyError as exc:
+            raise FileNotFoundError(f"missing values file for {name} in run {run_name}") from exc
+        data = None
+        if original in ("indices", "ranges"):
             try:
-                _write_manifest(root / "plattli.json", manifest)
-            except BaseException:
-                spec["indices"] = "indices"
-                raise
-            idx_path.unlink()
-            _fsync_dir(idx_path.parent)
+                data = read_bytes(f"{name}.{original}")
+            except KeyError as exc:
+                raise FileNotFoundError(f"missing {original} file for {name} in run {run_name}") from exc
+        if original == "indices":
+            indices = np.frombuffer(data, dtype="<u4", count=len(data) // 4)[:count]
+            segments = _piecewise_segments(indices)
+            if segments is None:
+                raise ValueError(f"indices out of order for {name} in run {run_name}")
+        elif original == "ranges":
+            segments = _ranges_to_segments(data, count)
+        else:
+            segments = []
+            offset = 0
+            for start, size, step, _ in _segments_with_counts(_segments_from_spec(original), total_count=count):
+                size = min(size, max(count - offset, 0))
+                if size:
+                    segments.append({"start": start, "stop": start + size * step, "step": step})
+                    offset += size
+        segments = _coalesce_segments(segments)
+        count, _ = _segments_count_and_last(segments)
+        selected = _choose_indices(segments, count)
+        payload = None
+        if selected == "ranges":
+            payload = _ranges_encode(segments, total_count=count)
+        elif selected == "indices":
+            payload = _segments_to_array(segments).astype("<u4", copy=False).tobytes()
+        if selected == original and (payload is None or payload == data):
+            continue
+        changed += 1
+        spec["indices"] = selected
+        if payload is not None:
+            replacements[f"{name}.{selected}"] = payload
+        if original in ("indices", "ranges") and selected != original:
+            retired.add(f"{name}.{original}")
+    return replacements, retired, changed
+
+
+def _optimize_indices(root, manifest):
+    planned = {name: dict(spec) for name, spec in manifest.items()}
+    replacements, retired, changed = _plan_indices(
+        planned, lambda name: (root / name).read_bytes(),
+        lambda name, spec: _stored_values_count(root, name, spec["dtype"], allow_missing=False),
+        _run_name_for_root(root),
+    )
+    if not changed:
+        return
+    for name, data in replacements.items():
+        _replace_bytes(root / name, data)
+    _write_manifest(root / "plattli.json", planned)
+    manifest.update(planned)
+    directories = set()
+    for name in retired:
+        path = root / name
+        path.unlink()
+        directories.add(path.parent)
+    for directory in directories:
+        _fsync_dir(directory)
 
 
 def _indices_length(root, name, spec):
@@ -364,6 +525,10 @@ def _indices_length(root, name, spec):
     if indices_spec == "indices":
         idx_path = root / f"{name}.indices"
         return idx_path.stat().st_size // 4
+    if indices_spec == "ranges":
+        count = _stored_values_count(root, name, spec["dtype"], allow_missing=False)
+        records = _ranges_records((root / f"{name}.ranges").read_bytes(), count)
+        return min(count, int(records[-1]["end_row"])) if len(records) else 0
     return 0  # pragma: no cover
 
 
@@ -397,6 +562,18 @@ def _close_open_indices(root, manifest):
     changed = False
     for name, spec in manifest.items():
         indices_spec = spec["indices"]
+        if indices_spec == "ranges":
+            path = root / f"{name}.ranges"
+            records, tail = _ranges_parse(path.read_bytes())
+            if tail is not None:
+                count = _stored_values_count(root, name, spec["dtype"], allow_missing=False)
+                closed = int(records[-1]["end_row"]) if len(records) else 0
+                if count <= closed:
+                    _replace_bytes(path, records.tobytes())
+                else:
+                    _append_range_bytes(path, np.asarray([count], dtype="<u8").tobytes())
+                changed = True
+            continue
         if not isinstance(indices_spec, (dict, list)):
             continue
         segments = _segments_from_spec(indices_spec)
@@ -721,10 +898,11 @@ def _cleanup_stored_files(root, manifest, *, include_orphans=False):
     for name, spec in manifest.items():
         value_name = f"{name}.{spec['dtype']}"
         active.add(value_name)
-        if spec["indices"] == "indices":
-            active.add(f"{name}.indices")
-            if not (root / f"{name}.indices").is_file():
-                raise FileNotFoundError(f"missing indices file for {name} in run {_run_name_for_root(root)}")
+        if spec["indices"] in ("indices", "ranges"):
+            suffix = spec["indices"]
+            active.add(f"{name}.{suffix}")
+            if not (root / f"{name}.{suffix}").is_file():
+                raise FileNotFoundError(f"missing {suffix} file for {name} in run {_run_name_for_root(root)}")
         # Never delete an alternate representation to hide a missing active one.
         if not (root / value_name).is_file() and _indices_length(root, name, spec):
             raise FileNotFoundError(f"missing values file for {name} in run {_run_name_for_root(root)}")
@@ -742,7 +920,7 @@ def _cleanup_stored_files(root, manifest, *, include_orphans=False):
     if include_orphans:
         for rel in files:
             stem, _, suffix = rel.rpartition(".")
-            if suffix in value_suffixes and stem not in manifest and f"{stem}.indices" in files:
+            if suffix in value_suffixes and stem not in manifest and any(f"{stem}.{suffix}" in files for suffix in ("indices", "ranges")):
                 orphan_stems.add(stem)
 
     changed_dirs = set()
@@ -752,7 +930,7 @@ def _cleanup_stored_files(root, manifest, *, include_orphans=False):
         base = rel.removesuffix(".tmp")
         stem, _, suffix = base.rpartition(".")
         metadata_tmp = rel in {"plattli.json.tmp", "config.json.tmp", f"{HOT_FILENAME}.tmp", f"{HOT_COMPACTING_FILENAME}.tmp"}
-        metric_artifact = suffix in value_suffixes | {"indices"} and (stem in manifest or stem in orphan_stems)
+        metric_artifact = suffix in value_suffixes | {"indices", "ranges"} and (stem in manifest or stem in orphan_stems)
         if metadata_tmp or metric_artifact:
             path.unlink()
             changed_dirs.add(path.parent)
@@ -1006,7 +1184,10 @@ class DirectWriter:
 
 
 class CompactingWriter:
-    def __init__(self, outdir, step=0, *, hotsize, config="config.json", allow_resume_finalized=False):
+    def __init__(self, outdir, step=0, *, hotsize, config="config.json", allow_resume_finalized=False, live_indices="auto"):
+        if live_indices not in ("auto", "explicit"):
+            raise ValueError(f"invalid live_indices: {live_indices!r}; expected auto or explicit")
+        self.live_indices = live_indices
         self.run_root = Path(outdir)
         if self.run_root.name == "plattli":
             raise ValueError(f"outdir should be a run directory, not the plattli folder: {outdir}")
@@ -1034,6 +1215,7 @@ class CompactingWriter:
         self._hot_lock = threading.Lock()
         self._hot_fh = None
         self._stored_counts = {}
+        self._range_states = {}
         self._manifest_dirty = False
         self._manifest_version = 0
         self._manifest_disk_version = 0
@@ -1050,7 +1232,9 @@ class CompactingWriter:
 
         self._load_hot_rows()
         if self._manifest:
-            if _migrate_oversized_piecewise_indices(self.root, self._manifest):
+            if self.live_indices == "explicit":
+                _force_indices_files(self.root, self._manifest)
+            elif _migrate_oversized_piecewise_indices(self.root, self._manifest):
                 rewrite_manifest = True
             self._monotonic, monotonic_changed = _refresh_monotonic_metadata(self.root, self._manifest, self._hot_rows)
             if monotonic_changed:
@@ -1408,7 +1592,7 @@ class CompactingWriter:
             for name in columns:
                 dtype = self._manifest[name]["dtype"]
                 indices_spec = self._manifest[name]["indices"]
-                if indices_spec != "indices":
+                if indices_spec not in ("indices", "ranges"):
                     # The append helpers mutate segments in place; work on a copy so the
                     # live manifest only ever changes under the lock.
                     indices_spec = [dict(seg) for seg in _segments_from_spec(indices_spec)]
@@ -1425,26 +1609,54 @@ class CompactingWriter:
             if indices_spec == "indices":
                 _append_indices(self.root / f"{name}.indices", col["indices"])
                 continue
+            if indices_spec == "ranges":
+                path = self.root / f"{name}.ranges"
+                current_count = self._stored_counts.get(name)
+                if current_count is None:
+                    current_count = _stored_values_count(self.root, name, dtype, allow_missing=False)
+                if name not in self._range_states:
+                    data = path.read_bytes()
+                    records, tail = _ranges_parse(data)
+                    self._range_states[name] = (
+                        (tail[0], tail[1], int(records[-1]["end_row"]) if len(records) else 0) if tail else None,
+                        len(data),
+                    )
+                tail, size = self._range_states[name]
+                had_tail = tail is not None
+                payload, tail = _ranges_append(tail, current_count, col["indices"])
+                new_count = current_count + len(col["indices"])
+                new_size = size + len(payload)
+                # Keep live ranges only when both history and this batch amortize
+                # range publication over at least 32 samples per new range.
+                added_ranges = (len(payload) + (0 if had_tail else 8)) // 16
+                if new_count < 32 * ((new_size + 8) // 16) or len(col["indices"]) < 32 * added_ranges:
+                    segments = _ranges_to_segments(path.read_bytes(), current_count)
+                    indices = np.concatenate((_segments_to_array(segments), np.asarray(col["indices"], dtype=np.uint32)))
+                    # Freeze the old representation before it can become stale.
+                    _append_range_bytes(path, payload + np.asarray([new_count], dtype="<u8").tobytes())
+                    _replace_bytes(self.root / f"{name}.indices", indices.tobytes())
+                    spec_updates[name] = "indices"
+                    del self._range_states[name]
+                else:
+                    _append_range_bytes(path, payload)
+                    self._range_states[name] = tail, new_size
+                new_counts[name] = new_count
+                continue
             try:
                 old_spec = json.dumps(indices_spec, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
                 current_count = self._stored_counts.get(name)
                 if current_count is None:
                     current_count = _stored_values_count(self.root, name, dtype, allow_missing=True)
-                spec = _append_steps_to_indices_spec(
-                    indices_spec, col["indices"], count=current_count, open_tail=True
-                )
+                spec = _extend_inline_indices(indices_spec, col["indices"], current_count)
                 new_counts[name] = current_count + len(col["indices"])
             except (ValueError, RuntimeError) as exc:
                 raise type(exc)(f"{exc} (metric {name}, run {run_name})") from exc
-            if _segments_too_many(spec, total_count=new_counts[name]):
-                try:
-                    indices = _segments_to_array(spec, total_count=new_counts[name])
-                except (ValueError, RuntimeError) as exc:
-                    raise type(exc)(f"{exc} (metric {name}, run {run_name})") from exc
-                idx_path = self.root / f"{name}.indices"
-                with idx_path.open("wb") as fh:
-                    indices.tofile(fh)
+            if self.live_indices == "explicit":
+                _replace_bytes(self.root / f"{name}.indices", _segments_to_array(spec, total_count=new_counts[name]).tobytes())
                 spec_updates[name] = "indices"
+            elif _segments_too_many(spec, total_count=new_counts[name]):
+                selected = _store_indices(self.root, name, spec, new_counts[name], open_tail=True)
+                spec_updates[name] = selected
             elif json.dumps(spec, ensure_ascii=False, sort_keys=True, separators=(",", ":")) != old_spec:
                 spec_updates[name] = spec
 
@@ -1457,6 +1669,10 @@ class CompactingWriter:
                 pending = self._serialize_manifest_locked()
         if pending:
             self._persist_manifest(*pending)
+        for name, selected in spec_updates.items():
+            if metas[name][1] == "ranges" and selected == "indices":
+                (self.root / f"{name}.ranges").unlink()
+                _fsync_dir((self.root / name).parent)
 
         for name, col in columns.items():
             dtype, _ = metas[name]

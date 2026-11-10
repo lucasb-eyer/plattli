@@ -1,4 +1,5 @@
 import json
+import os
 import zipfile
 from collections.abc import Mapping
 from functools import wraps
@@ -13,6 +14,7 @@ from ._indices import (
     _segments_to_array,
     _segments_with_counts,
 )
+from ._ranges import _ranges_records
 from .writer import (
     DTYPE_TO_NUMPY,
     HOT_COMPACTING_FILENAME,
@@ -37,6 +39,9 @@ def _retry_stale_manifest(read):
         if self._manifest_retry_active:
             return read(self, *args, **kwargs)
         self._manifest_retry_active = True
+        self._range_snapshots = {}
+        self._inline_counts = {}
+        self._inline_manifest = None
         try:
             for attempt in range(3):
                 try:
@@ -49,6 +54,9 @@ def _retry_stale_manifest(read):
                         raise RuntimeError(f"storage metadata kept changing while reading run {self._run_name}; retry the read") from exc
         finally:
             self._manifest_retry_active = False
+            self._range_snapshots = {}
+            self._inline_counts = {}
+            self._inline_manifest = None
     return retry
 
 
@@ -172,6 +180,9 @@ class Reader:
             self._rows_cache = {}
             self._jsonl_cache = {}
             self._manifest_retry_active = False
+            self._range_snapshots = {}
+            self._inline_counts = {}
+            self._inline_manifest = None
         except BaseException:
             self.close()
             raise
@@ -188,6 +199,9 @@ class Reader:
         self._hot_has_file = None
         self._rows_cache = {}
         self._jsonl_cache = {}
+        self._range_snapshots = {}
+        self._inline_counts = {}
+        self._inline_manifest = None
 
     def close(self):
         if self._zip is not None:
@@ -274,6 +288,73 @@ class Reader:
     def _ceil_div(self, value, step):
         return -(-value // step)
 
+    def _range_snapshot(self, name, spec):
+        if name not in self._range_snapshots:
+            # Freeze values first: an older open head must never describe newer
+            # values written after its cadence changed. Reuse this snapshot for
+            # counts, selection, values, and hot-tail alignment throughout the read.
+            count = self._values_count(name, spec)
+            try:
+                records = _ranges_records(self._read_bytes(f"{name}.ranges"), count)
+            except (FileNotFoundError, KeyError):
+                self._check_storage_metadata((name,))
+                raise FileNotFoundError(f"missing ranges file for {name} in run {self._run_name}") from None
+            except ValueError as exc:
+                raise ValueError(f"{exc} (metric {name}, run {self._run_name})") from exc
+            self._range_snapshots[name] = (min(count, int(records[-1]["end_row"])) if len(records) else 0, records)
+        return self._range_snapshots[name]
+
+    def _inline_count(self, name, indices_spec):
+        if name not in self._inline_counts:
+            count = self._values_count(name, self._manifest[name])
+            if self.kind == "dir":
+                # An inline open tail can become a closed prefix or spill to a
+                # sidecar while values grow. Check metadata after capturing count.
+                # Reuse unchanged manifests across columns without reparsing JSON.
+                with (self.root / "plattli.json").open("rb") as fh:
+                    info = os.fstat(fh.fileno())
+                    stamp = (info.st_ino, info.st_mtime_ns, info.st_size)
+                    if self._inline_manifest is None or self._inline_manifest[0] != stamp:
+                        latest = json.load(fh)
+                        self._inline_manifest = stamp, latest
+                latest = self._inline_manifest[1].get(name, {})
+                if latest.get("indices") != indices_spec or latest.get("dtype") != self._manifest[name].get("dtype"):
+                    raise _ManifestStale(name)
+            self._inline_counts[name] = count
+        return self._inline_counts[name]
+
+    def _range_step(self, records, row):
+        idx = int(np.searchsorted(records["end_row"], row, side="right"))
+        first = int(records[idx - 1]["end_row"]) if idx else 0
+        return int(records[idx]["start"]) + (row - first) * int(records[idx]["step"])
+
+    def _range_position(self, records, value, inclusive):
+        idx = max(0, int(np.searchsorted(records["start"], value, side="right")) - 1)
+        first = int(records[idx - 1]["end_row"]) if idx else 0
+        start, step, end = (int(records[idx][field]) for field in ("start", "step", "end_row"))
+        local = int(np.floor((value - start) / step)) + 1 if inclusive else self._ceil_div(int(np.ceil(value - start)), step)
+        return min(end, first + max(0, local))
+
+    def _range_indices_chunks(self, records, chunks):
+        pieces = []
+        for lo, hi in chunks:
+            first = int(np.searchsorted(records["end_row"], lo, side="right"))
+            last = int(np.searchsorted(records["end_row"], hi, side="left")) + 1
+            selected = records[first:last]
+            offsets = np.empty(len(selected) + 1, dtype=np.uint64)
+            offsets[0] = records[first - 1]["end_row"] if first else 0
+            offsets[1:] = selected["end_row"]
+            counts = np.diff(offsets).astype(np.intp)
+            counts[0] -= lo - int(offsets[0])
+            counts[-1] -= int(offsets[-1]) - hi
+            indices = np.repeat(selected["step"], counts)
+            indices *= np.arange(lo, hi, dtype=np.uint32)
+            # Arithmetic modulo 2**32 avoids a uint64 array per output sample;
+            # validation already guarantees every resulting step fits uint32.
+            indices += np.repeat(selected["start"] - offsets[:-1].astype(np.uint32) * selected["step"], counts)
+            pieces.append(indices)
+        return self._concat(pieces, np.uint32)
+
     def _read_indices_file(self, name, count):
         if self.kind == "zip":
             data = self._read_zip_slice(f"{name}.indices", 0, count * 4)
@@ -286,6 +367,7 @@ class Reader:
             with path.open("rb") as fh:
                 data = fh.read(count * 4)
         except FileNotFoundError:
+            self._check_storage_metadata((name,))
             if self._missing_columnar_is_empty():
                 return np.asarray([], dtype=np.uint32)
             raise FileNotFoundError(f"missing indices file for {name} in run {self._run_name}")
@@ -297,6 +379,13 @@ class Reader:
     def _step_chunks_for_spec(self, name, indices_spec, start, stop, count):
         if start is not None and stop is not None and start > stop:
             return []
+        if indices_spec == "ranges":
+            _, records = self._range_snapshot(name, self._manifest[name])
+            if not count:
+                return []
+            left = 0 if start is None else min(count, self._range_position(records, start, False))
+            right = count if stop is None else min(count, self._range_position(records, stop, True))
+            return [(left, right)] if left < right else []
         if isinstance(indices_spec, (list, dict)):
             chunks = []
             offset = 0
@@ -331,6 +420,8 @@ class Reader:
     def _metric_count(self, name, spec):
         if spec is None:
             return 0
+        if spec.get("indices") == "ranges":
+            return self._range_snapshot(name, spec)[0]
         indices_count, _ = self._indices_count_and_last(name, spec.get("indices"))
         if indices_count == 0:
             return 0
@@ -348,6 +439,7 @@ class Reader:
                     fh.seek(offset * 4)
                     data = fh.read(count * 4)
             except FileNotFoundError:
+                self._check_storage_metadata((name,))
                 if self._missing_columnar_is_empty():
                     return np.asarray([], dtype=np.uint32)
                 raise FileNotFoundError(f"missing indices file for {name} in run {self._run_name}")
@@ -417,6 +509,8 @@ class Reader:
         if spec is None:
             return np.asarray([], dtype=np.uint32)
         indices_spec = spec.get("indices")
+        if indices_spec == "ranges":
+            return self._range_indices_chunks(self._range_snapshot(name, spec)[1], chunks)
         if isinstance(indices_spec, (list, dict)):
             return self._indices_chunks_from_segments(indices_spec, chunks)
         if indices_spec == "indices":
@@ -577,10 +671,13 @@ class Reader:
                 raise FileNotFoundError(f"missing values file for {name} in run {self._run_name}")
 
     def _indices_count_and_last(self, name, indices_spec):
+        if indices_spec == "ranges":
+            count, records = self._range_snapshot(name, self._manifest[name])
+            return count, self._range_step(records, count - 1) if count else None
         if isinstance(indices_spec, (list, dict)):
             try:
                 segments = _segments_from_spec(indices_spec)
-                total_count = self._values_count(name, self._manifest[name]) if _segments_have_open_tail(segments) else None
+                total_count = self._inline_count(name, indices_spec) if _segments_have_open_tail(segments) else None
                 return _segments_count_and_last(segments, total_count=total_count)
             except (ValueError, RuntimeError) as exc:
                 raise type(exc)(f"{exc} (metric {name}, run {self._run_name})") from exc
@@ -603,6 +700,7 @@ class Reader:
                     fh.seek(valid - 4)
                     last = int(np.frombuffer(fh.read(4), dtype=np.uint32)[0])
             except FileNotFoundError:
+                self._check_storage_metadata((name,))
                 if self._missing_columnar_is_empty():
                     return 0, None
                 raise FileNotFoundError(f"missing indices file for {name} in run {self._run_name}")
@@ -650,9 +748,12 @@ class Reader:
         for name in names:
             spec = latest.get(name)
             cached = self._manifest.get(name, {})
+            indices = spec.get("indices") if spec is not None else None
+            cached_indices = cached.get("indices")
             if spec is not None and (
                 spec.get("dtype") != cached.get("dtype")
-                or (cached.get("indices") == [] and spec.get("indices") != [])
+                or (indices if isinstance(indices, str) else "inline") != (cached_indices if isinstance(cached_indices, str) else "inline")
+                or (cached_indices == [] and indices != [])
             ):
                 raise _ManifestStale(name)
 
@@ -760,6 +861,7 @@ class Reader:
         try:
             size = path.stat().st_size
         except FileNotFoundError:
+            self._check_storage_metadata((name,))
             if self._missing_columnar_is_empty():
                 return 0
             raise FileNotFoundError(f"missing indices file for {name} in run {self._run_name}")
@@ -807,7 +909,9 @@ class Reader:
                     name,
                     spec,
                 ))
-            elif indices_spec == "indices":
+            elif indices_spec in ("indices", "ranges"):
+                if indices_spec == "ranges" and spec.get("dtype") == JSONL_DTYPE:
+                    continue
                 indices_candidates.append(((0, 0), name, spec))
             else:
                 raise RuntimeError(f"invalid indices spec for {name} in run {self._run_name}: {indices_spec}")
@@ -846,6 +950,11 @@ class Reader:
         if spec is None:
             return 0, None
         indices_spec = spec.get("indices")
+        if indices_spec == "ranges":
+            count, records = self._range_snapshot(name, spec)
+            if values_count is not None:
+                count = min(count, values_count)
+            return count, self._range_step(records, count - 1) if count else None
         indices_count, indices_last = self._indices_count_and_last(name, indices_spec)
         if indices_count == 0:
             return 0, None
@@ -860,7 +969,7 @@ class Reader:
         if isinstance(indices_spec, (list, dict)):
             try:
                 segments = _segments_from_spec(indices_spec)
-                total_count = values_count if _segments_have_open_tail(segments) else None
+                total_count = count if _segments_have_open_tail(segments) else None
                 for start, seg_count, step, _ in _segments_with_counts(segments, total_count=total_count):
                     if idx < seg_count:
                         return count, int(start + idx * step)
@@ -887,6 +996,7 @@ class Reader:
                     fh.seek(offset)
                     last_step = int(np.frombuffer(fh.read(4), dtype=np.uint32)[0])
             except FileNotFoundError:
+                self._check_storage_metadata((name,))
                 if self._missing_columnar_is_empty():
                     return 0, None
                 raise FileNotFoundError(f"missing indices file for {name} in run {self._run_name}")
@@ -897,6 +1007,9 @@ class Reader:
         if spec is None:
             return np.asarray([], dtype=np.uint32)
         indices_spec = spec.get("indices")
+        if indices_spec == "ranges":
+            count, records = self._range_snapshot(name, spec)
+            return self._range_indices_chunks(records, [(0, count)] if count else [])
         indices_count, _ = self._indices_count_and_last(name, indices_spec)
         if indices_count == 0:
             return np.asarray([], dtype=np.uint32)
@@ -907,7 +1020,7 @@ class Reader:
         if isinstance(indices_spec, (list, dict)):
             try:
                 segments = _segments_from_spec(indices_spec)
-                total_count = values_count if _segments_have_open_tail(segments) else None
+                total_count = count if _segments_have_open_tail(segments) else None
                 indices = _segments_to_array(segments, total_count=total_count)
             except (ValueError, RuntimeError) as exc:
                 raise type(exc)(f"{exc} (metric {name}, run {self._run_name})") from exc
@@ -932,6 +1045,7 @@ class Reader:
                     fh.seek(0)
                     data = fh.read(count * 4)
             except FileNotFoundError:
+                self._check_storage_metadata((name,))
                 if self._missing_columnar_is_empty():
                     return np.asarray([], dtype=np.uint32)
                 raise FileNotFoundError(f"missing indices file for {name} in run {self._run_name}")
@@ -944,6 +1058,8 @@ class Reader:
     def _columnar_values(self, name, spec):
         if spec is None:
             return np.asarray([], dtype=object)
+        if spec.get("indices") == "ranges":
+            return self._read_value_slice(name, spec, 0, self._range_snapshot(name, spec)[0])
         dtype = spec.get("dtype")
         if dtype == JSONL_DTYPE:
             indices_count, _ = self._indices_count_and_last(name, spec.get("indices"))
