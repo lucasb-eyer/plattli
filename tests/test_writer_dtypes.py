@@ -24,9 +24,8 @@ def _writer(kind, root, **kwargs):
 
 
 def _stored(root, name):
-    manifest = json.loads((root / 'plattli/plattli.json').read_text())
-    dtype = manifest[name]['dtype']
-    return (dtype, np.fromfile(root / f'plattli/{name}.{dtype}', dtype=writer_module.DTYPE_TO_NUMPY[dtype]))
+    with plattli.Reader(root) as reader:
+        return reader.manifest()[name]['dtype'], reader.metric_values(name, dtype='storage')
 
 
 class TestWriterDtypes(unittest.TestCase):
@@ -302,10 +301,6 @@ print('ok')
                 with tempfile.TemporaryDirectory() as tmp:
                     tmp_path = Path(tmp)
                     writer = _writer(kind, tmp_path)
-                    for value in (2 ** 63, -2 ** 63 - 1):
-                        with self.assertRaises(OverflowError):
-                            writer.write(bad=value)
-                        self.assertNotIn('bad', writer._manifest)
                     writer.write(counter=-1, loss=1.0)
                     writer.end_step()
                     with self.assertRaisesRegex(TypeError, 'cannot mix'):
@@ -322,6 +317,12 @@ print('ok')
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             writer = plattli.CompactingWriter(tmp_path, hotsize=1)
+            for value in (100, 200, 150, 175):
+                writer.write(counter=np.uint8(value))
+                writer.end_step()
+            writer._wait_for_compaction()
+            writer._flush_hot()
+            writer._wait_for_compaction()
             started = threading.Event()
             release = threading.Event()
             append = writer_module._append_numeric
@@ -332,9 +333,9 @@ print('ok')
                     self.assertTrue(release.wait(5))
                 append(path, values, dtype)
             with mock.patch.object(writer_module, '_append_numeric', side_effect=blocked_append):
-                writer.write(counter=np.uint8(100))
+                writer.write(counter=np.uint8(180))
                 writer.end_step()
-                writer.write(counter=np.uint8(200))
+                writer.write(counter=np.uint8(190))
                 writer.end_step()
                 self.assertTrue(started.wait(5))
                 with ThreadPoolExecutor(max_workers=1) as executor:
@@ -343,7 +344,7 @@ print('ok')
                     release.set()
                     pending.result(timeout=5)
             writer.finish(optimize=False, zip=False)
-            self.assertEqual(_stored(tmp_path, 'counter')[1].tolist(), [100, 200, 300])
+            self.assertEqual(_stored(tmp_path, 'counter')[1].tolist(), [100, 200, 150, 175, 180, 190, 300])
 
     def test_promotion_keeps_old_column_when_manifest_publish_fails(self):
         for kind in ['direct', 'cold', 'hot']:
@@ -368,7 +369,7 @@ print('ok')
                 with tempfile.TemporaryDirectory() as tmp:
                     tmp_path = Path(tmp)
                     writer = _writer(kind, tmp_path)
-                    for value in (100, 200):
+                    for value in (100, 200, 150):
                         writer.write(counter=value)
                         writer.end_step()
                     with mock.patch.object(writer_module, '_optimize_indices', side_effect=OSError('interrupted finish')):

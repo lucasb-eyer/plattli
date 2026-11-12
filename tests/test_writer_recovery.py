@@ -239,12 +239,12 @@ class TestWriterRecovery(unittest.TestCase):
                 with self.subTest(kind=kind, window=window), tempfile.TemporaryDirectory() as tmp:
                     root = Path(tmp)
                     writer = _writer(kind, root)
-                    for value in (1.0, 2.0, 3.0):
+                    for value in (1.0, 2.0, 4.0):
                         writer.write(value=value)
                         writer.end_step()
                     writer.finish(optimize=False, zip=False)
                     reader = plattli.Reader(root)
-                    self.assertEqual(reader.metric_values('value').tolist(), [1.0, 2.0, 3.0])
+                    self.assertEqual(reader.metric_values('value').tolist(), [1.0, 2.0, 4.0])
                     writer = _writer(kind, root, step=3)
                     unlink = Path.unlink
 

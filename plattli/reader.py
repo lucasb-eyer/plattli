@@ -15,12 +15,14 @@ from ._indices import (
     _segments_with_counts,
 )
 from ._ranges import _ranges_records
+from ._values import _value_sequence, _sequence_array, _sequence_value
 from .writer import (
     DTYPE_TO_NUMPY,
     HOT_COMPACTING_FILENAME,
     HOT_FILENAME,
     JSONL_DTYPE,
     _validate_metric_names,
+    _value_dtype,
     _validate_metric_name,
 )
 
@@ -40,8 +42,8 @@ def _retry_stale_manifest(read):
             return read(self, *args, **kwargs)
         self._manifest_retry_active = True
         self._range_snapshots = {}
+        self._value_snapshots = {}
         self._inline_counts = {}
-        self._inline_manifest = None
         try:
             for attempt in range(3):
                 try:
@@ -55,8 +57,8 @@ def _retry_stale_manifest(read):
         finally:
             self._manifest_retry_active = False
             self._range_snapshots = {}
+            self._value_snapshots = {}
             self._inline_counts = {}
-            self._inline_manifest = None
     return retry
 
 
@@ -181,6 +183,7 @@ class Reader:
             self._jsonl_cache = {}
             self._manifest_retry_active = False
             self._range_snapshots = {}
+            self._value_snapshots = {}
             self._inline_counts = {}
             self._inline_manifest = None
         except BaseException:
@@ -200,6 +203,7 @@ class Reader:
         self._rows_cache = {}
         self._jsonl_cache = {}
         self._range_snapshots = {}
+        self._value_snapshots = {}
         self._inline_counts = {}
         self._inline_manifest = None
 
@@ -307,21 +311,25 @@ class Reader:
     def _inline_count(self, name, indices_spec):
         if name not in self._inline_counts:
             count = self._values_count(name, self._manifest[name])
-            if self.kind == "dir":
+            if self.kind == "dir" and "values" not in self._manifest[name]:
                 # An inline open tail can become a closed prefix or spill to a
                 # sidecar while values grow. Check metadata after capturing count.
                 # Reuse unchanged manifests across columns without reparsing JSON.
-                with (self.root / "plattli.json").open("rb") as fh:
-                    info = os.fstat(fh.fileno())
-                    stamp = (info.st_ino, info.st_mtime_ns, info.st_size)
-                    if self._inline_manifest is None or self._inline_manifest[0] != stamp:
-                        latest = json.load(fh)
-                        self._inline_manifest = stamp, latest
-                latest = self._inline_manifest[1].get(name, {})
-                if latest.get("indices") != indices_spec or latest.get("dtype") != self._manifest[name].get("dtype"):
+                latest = self._latest_inline_manifest().get(name, {})
+                if (latest.get("indices") != indices_spec
+                        or latest.get("dtype") != self._manifest[name].get("dtype")
+                        or latest.get("values") != self._manifest[name].get("values")):
                     raise _ManifestStale(name)
             self._inline_counts[name] = count
         return self._inline_counts[name]
+
+    def _latest_inline_manifest(self):
+        with (self.root / "plattli.json").open("rb") as fh:
+            info = os.fstat(fh.fileno())
+            stamp = (info.st_ino, info.st_mtime_ns, info.st_size)
+            if self._inline_manifest is None or self._inline_manifest[0] != stamp:
+                self._inline_manifest = stamp, json.load(fh)
+        return self._inline_manifest[1]
 
     def _range_step(self, records, row):
         idx = int(np.searchsorted(records["end_row"], row, side="right"))
@@ -449,19 +457,26 @@ class Reader:
         return np.frombuffer(data, dtype=np.uint32)
 
     def _read_value_slice(self, name, spec, offset, count):
+        if spec.get("values") == "sequence":
+            spec = self._value_snapshot(name, spec)
+        if "values" in spec:
+            if spec["values"].get("on") == "step":
+                indices = self._columnar_indices_chunks(name, spec, [(offset, offset + count)] if count else [])
+                return _sequence_array(spec, offset=offset, count=count, indices=indices)
+            return _sequence_array(spec, offset=offset, count=count)
         dtype = spec.get("dtype")
         if count <= 0:
             if dtype == JSONL_DTYPE:
                 return np.asarray([], dtype=object)
-            if dtype not in DTYPE_TO_NUMPY:
+            if dtype not in DTYPE_TO_NUMPY and dtype != "int":
                 raise ValueError(f"unsupported dtype for {name} in run {self._run_name}: {dtype}")
-            return np.asarray([], dtype=DTYPE_TO_NUMPY[dtype])
+            return np.asarray([], dtype=_value_dtype(dtype))
         if dtype == JSONL_DTYPE:
             # offset+count never exceeds the metric count, so slice the cached list directly.
             return np.asarray(self._read_jsonl_values(name)[offset:offset + count], dtype=object)
-        if dtype not in DTYPE_TO_NUMPY:
+        if dtype not in DTYPE_TO_NUMPY and dtype != "int":
             raise ValueError(f"unsupported dtype for {name} in run {self._run_name}: {dtype}")
-        target = DTYPE_TO_NUMPY[dtype]
+        target = _value_dtype(dtype)
         itemsize = np.dtype(target).itemsize
         if self.kind == "zip":
             data = self._read_zip_slice(f"{name}.{dtype}", offset * itemsize, count * itemsize)
@@ -524,7 +539,7 @@ class Reader:
         dtype = spec.get("dtype")
         return self._concat(
             [self._read_value_slice(name, spec, start, stop - start) for start, stop in chunks],
-            object if dtype == JSONL_DTYPE else DTYPE_TO_NUMPY[dtype],
+            object if dtype == JSONL_DTYPE else _value_dtype(dtype),
         )
 
     def _monotonic_value_chunks(self, name, spec, vstart, vstop, count):
@@ -532,6 +547,30 @@ class Reader:
             return []
         if vstart is not None and vstop is not None and vstart > vstop:
             return []
+        sequence = spec.get("values")
+        if sequence is not None:
+            if sequence.get("on") == "step":
+                direction = "dec" if sequence["step"] < 0 else "inc"
+                if spec.get("indices") == "indices" and self.kind == "dir":
+                    try:
+                        fh = (self.root / f"{name}.indices").open("rb")
+                    except FileNotFoundError:
+                        self._check_storage_metadata((name,))
+                        raise
+                    with fh:
+                        def value_at(pos):
+                            fh.seek(pos * 4)
+                            index = int(np.frombuffer(fh.read(4), dtype=np.uint32)[0])
+                            return sequence["start"] + index * sequence["step"]
+                        return self._monotonic_chunks(value_at, direction, vstart, vstop, count)
+                return self._monotonic_chunks(
+                    lambda pos: _sequence_value(spec, pos, indices=self._columnar_indices_chunks(name, spec, [(pos, pos + 1)])),
+                    direction, vstart, vstop, count,
+                )
+            return self._monotonic_chunks(
+                lambda pos: _sequence_value(spec, pos),
+                "dec" if sequence["step"] < 0 else "inc", vstart, vstop, count,
+            )
         if self.kind != "dir":
             return None
         dtype = spec.get("dtype")
@@ -542,7 +581,7 @@ class Reader:
             return None
 
         path = self.root / f"{name}.{dtype}"
-        target = DTYPE_TO_NUMPY[dtype]
+        target = _value_dtype(dtype)
         itemsize = np.dtype(target).itemsize
         try:
             fh = path.open("rb")
@@ -553,23 +592,25 @@ class Reader:
             def value_at(pos):
                 fh.seek(pos * itemsize)
                 return np.frombuffer(fh.read(itemsize), dtype=target)[0]
+            return self._monotonic_chunks(value_at, direction, vstart, vstop, count)
 
-            def first_true(pred):
-                lo, hi = 0, count
-                while lo < hi:
-                    mid = (lo + hi) // 2
-                    if pred(value_at(mid)):
-                        hi = mid
-                    else:
-                        lo = mid + 1
-                return lo
+    def _monotonic_chunks(self, value_at, direction, vstart, vstop, count):
+        def first_true(pred):
+            lo, hi = 0, count
+            while lo < hi:
+                mid = (lo + hi) // 2
+                if pred(value_at(mid)):
+                    hi = mid
+                else:
+                    lo = mid + 1
+            return lo
 
-            if direction == "inc":
-                left = 0 if vstart is None else first_true(lambda value: value >= vstart)
-                right = count if vstop is None else first_true(lambda value: value > vstop)
-            else:
-                left = 0 if vstop is None else first_true(lambda value: value <= vstop)
-                right = count if vstart is None else first_true(lambda value: value < vstart)
+        if direction == "inc":
+            left = 0 if vstart is None else first_true(lambda value: value >= vstart)
+            right = count if vstop is None else first_true(lambda value: value > vstop)
+        else:
+            left = 0 if vstop is None else first_true(lambda value: value <= vstop)
+            right = count if vstart is None else first_true(lambda value: value < vstart)
         return [(left, right)] if left < right else []
 
     def _metric_select(self, name, start, stop, istart, istop, vstart, vstop, want_indices=True, want_values=True):
@@ -602,7 +643,7 @@ class Reader:
             chunks = self._monotonic_value_chunks(name, spec, vstart, vstop, count)
             if chunks is None:
                 return None
-            hot_arr = np.asarray(hot_values, dtype=DTYPE_TO_NUMPY[spec["dtype"]])
+            hot_arr = np.asarray(hot_values, dtype=_value_dtype(spec["dtype"]))
             hot_keep = np.ones(len(hot_arr), dtype=bool)
             if vstart is not None:
                 hot_keep &= hot_arr >= vstart
@@ -614,7 +655,7 @@ class Reader:
             col = self._columnar_indices_chunks(name, spec, chunks) if spec is not None else np.asarray([], dtype=np.uint32)
             indices = self._concat([col, hot_steps[hot_keep]], np.uint32)
         if want_values:
-            np_dtype = object if spec is None or spec.get("dtype") == JSONL_DTYPE else DTYPE_TO_NUMPY[spec["dtype"]]
+            np_dtype = object if spec is None or spec.get("dtype") == JSONL_DTYPE else _value_dtype(spec["dtype"])
             col = self._columnar_values_chunks(name, spec, chunks) if spec is not None else np.asarray([], dtype=np_dtype)
             if isinstance(hot_keep, slice):
                 hot_sel = hot_values[hot_keep]
@@ -708,12 +749,17 @@ class Reader:
         raise RuntimeError(f"invalid indices spec for {name} in run {self._run_name}: {indices_spec}")
 
     def _values_count(self, name, spec):
+        if spec.get("values") == "sequence":
+            spec = self._value_snapshot(name, spec)
+        sequence = spec.get("values")
+        if sequence is not None:
+            return sequence["count"]
         dtype = spec.get("dtype")
         if dtype == JSONL_DTYPE:
             return len(self._read_jsonl_values(name))
-        if dtype not in DTYPE_TO_NUMPY:
+        if dtype not in DTYPE_TO_NUMPY and dtype != "int":
             raise ValueError(f"unsupported dtype for {name} in run {self._run_name}: {dtype}")
-        itemsize = np.dtype(DTYPE_TO_NUMPY[dtype]).itemsize
+        itemsize = np.dtype(_value_dtype(dtype)).itemsize
         if self.kind == "zip":
             return self._trim_size(self._zip_member_size(f"{name}.{dtype}"), itemsize) // itemsize
         path = self.root / f"{name}.{dtype}"
@@ -734,7 +780,28 @@ class Reader:
         self._run_rows = manifest.pop("run_rows", None)
         self._when_exported = manifest.pop("when_exported", None)
         _validate_metric_names(manifest, self._run_name)
+        for spec in manifest.values():
+            if spec.get("values") != "sequence":
+                _value_sequence(spec)
         self._manifest = manifest
+
+    def _value_snapshot(self, name, spec):
+        if name not in self._value_snapshots:
+            if spec.get("indices") != "indices":
+                raise ValueError(f"live value sequences require explicit indices for {name}")
+            count, _ = self._indices_count_and_last(name, "indices")
+            try:
+                payload = json.loads(self._read_text(f"{name}.values"))
+            except (FileNotFoundError, KeyError):
+                self._check_storage_metadata((name,))
+                raise FileNotFoundError(f"missing value sequence file for {name} in run {self._run_name}") from None
+            if not isinstance(payload, dict) or set(payload) != {"dtype", "values"} or not isinstance(payload["values"], dict):
+                raise ValueError(f"invalid value sequence file for {name} in run {self._run_name}")
+            sequence = payload["values"]
+            resolved = {**spec, **payload, "values": {**sequence, "count": min(count, sequence.get("count", count))}}
+            _value_sequence(resolved)
+            self._value_snapshots[name] = resolved
+        return self._value_snapshots[name]
 
     def _check_storage_metadata(self, names):
         """Only probe after missing numeric storage or loading a fresh hot snapshot.
@@ -752,6 +819,7 @@ class Reader:
             cached_indices = cached.get("indices")
             if spec is not None and (
                 spec.get("dtype") != cached.get("dtype")
+                or spec.get("values") != cached.get("values")
                 or (indices if isinstance(indices, str) else "inline") != (cached_indices if isinstance(cached_indices, str) else "inline")
                 or (cached_indices == [] and indices != [])
             ):
@@ -816,7 +884,8 @@ class Reader:
             # data before retiring its hot log, so this order keeps their union.
             self._ensure_hot()
         if name in self._manifest:
-            return self._manifest[name]
+            spec = self._manifest[name]
+            return self._value_snapshot(name, spec) if spec.get("values") == "sequence" else spec
         if allow_hot:
             if name in self._hot_columns:
                 return None
@@ -902,7 +971,7 @@ class Reader:
                     raise type(exc)(f"{exc} (metric {name}, run {self._run_name})") from exc
                 if spec.get("dtype") == JSONL_DTYPE:
                     continue
-                if spec.get("dtype") not in DTYPE_TO_NUMPY:
+                if spec.get("dtype") not in DTYPE_TO_NUMPY and spec.get("dtype") != "int":
                     raise ValueError(f"unsupported dtype for {name} in run {self._run_name}: {spec.get('dtype')}")
                 cadence_groups.setdefault(int(segments[-1]["step"]), []).append((
                     (-closed_rows, int(segments[0]["start"])),
@@ -1058,6 +1127,8 @@ class Reader:
     def _columnar_values(self, name, spec):
         if spec is None:
             return np.asarray([], dtype=object)
+        if "values" in spec:
+            return self._read_value_slice(name, spec, 0, self._metric_count(name, spec))
         if spec.get("indices") == "ranges":
             return self._read_value_slice(name, spec, 0, self._range_snapshot(name, spec)[0])
         dtype = spec.get("dtype")
@@ -1074,22 +1145,22 @@ class Reader:
             if len(values) > count:
                 values = values[:count]
             return np.asarray(values, dtype=object)
-        if dtype not in DTYPE_TO_NUMPY:
+        if dtype not in DTYPE_TO_NUMPY and dtype != "int":
             raise ValueError(f"unsupported dtype for {name} in run {self._run_name}: {dtype}")
         indices_count, _ = self._indices_count_and_last(name, spec.get("indices"))
         if indices_count == 0:
-            return np.asarray([], dtype=DTYPE_TO_NUMPY[dtype])
+            return np.asarray([], dtype=_value_dtype(dtype))
         values_count = self._values_count(name, spec)
         count = min(indices_count, values_count)
         if count <= 0:
-            return np.asarray([], dtype=DTYPE_TO_NUMPY[dtype])
-        itemsize = np.dtype(DTYPE_TO_NUMPY[dtype]).itemsize
+            return np.asarray([], dtype=_value_dtype(dtype))
+        itemsize = np.dtype(_value_dtype(dtype)).itemsize
         if self.kind == "zip":
             valid = self._trim_size(self._zip_member_size(f"{name}.{dtype}"), itemsize)
             count = min(count, valid // itemsize)
             if count <= 0:
-                return np.asarray([], dtype=DTYPE_TO_NUMPY[dtype])
-            return np.frombuffer(self._read_zip_slice(f"{name}.{dtype}", 0, count * itemsize), dtype=DTYPE_TO_NUMPY[dtype])
+                return np.asarray([], dtype=_value_dtype(dtype))
+            return np.frombuffer(self._read_zip_slice(f"{name}.{dtype}", 0, count * itemsize), dtype=_value_dtype(dtype))
         path = self.root / f"{name}.{dtype}"
         try:
             with path.open("rb") as fh:
@@ -1097,12 +1168,12 @@ class Reader:
         except FileNotFoundError:
             self._check_storage_metadata((name,))
             if self._missing_columnar_is_empty():
-                return np.asarray([], dtype=DTYPE_TO_NUMPY[dtype])
+                return np.asarray([], dtype=_value_dtype(dtype))
             raise FileNotFoundError(f"missing values file for {name} in run {self._run_name}")
         data = data[:self._trim_size(len(data), itemsize)]
         if not data:
-            return np.asarray([], dtype=DTYPE_TO_NUMPY[dtype])
-        return np.frombuffer(data, dtype=DTYPE_TO_NUMPY[dtype])
+            return np.asarray([], dtype=_value_dtype(dtype))
+        return np.frombuffer(data, dtype=_value_dtype(dtype))
 
     def _hot_tail(self, name, spec, columnar_count):
         """Hot rows beyond the captured columnar prefix, as (steps, values list)."""
@@ -1151,7 +1222,7 @@ class Reader:
                 return hot_arr
             return np.concatenate([columnar, hot_arr])
         dtype = spec.get("dtype")
-        hot_arr = np.asarray(hot_values, dtype=DTYPE_TO_NUMPY[dtype])
+        hot_arr = np.asarray(hot_values, dtype=_value_dtype(dtype))
         if columnar.size == 0:
             return hot_arr
         return np.concatenate([columnar, hot_arr])
@@ -1172,7 +1243,7 @@ class Reader:
         hot_values = hot_values[:count]
         dtype = (
             object if spec is None or spec.get("dtype") == JSONL_DTYPE
-            else DTYPE_TO_NUMPY[spec["dtype"]]
+            else _value_dtype(spec["dtype"])
         )
         return (
             self._concat([indices, hot_indices], np.uint32),
@@ -1214,7 +1285,10 @@ class Reader:
         if source == target:
             return values
         if target.kind in "iu" and not np.can_cast(source, target, casting="safe"):
-            if source.kind not in "biuf":
+            if source.kind == "O" and (self._manifest[name].get("dtype") == "int"
+                                        or self._manifest[name].get("values") == "sequence"):
+                values = np.asarray(values, dtype=object)
+            elif source.kind not in "biuf":
                 raise TypeError(f"cannot convert {source} values to {target} for metric {name}")
             if np.size(values):
                 if source.kind == "f":
@@ -1242,7 +1316,8 @@ class Reader:
     def metric_values(self, name, start=None, stop=None, istart=None, istop=None, vstart=None, vstop=None, *, dtype="standard"):
         """Read metric values, converting only the selected rows.
 
-        Standard reads return int64 integers and retain float32/float64 precision.
+        Standard reads return int64 for fixed-width integers, object arrays of
+        Python integers for exact int sequences, and retain float32/float64 precision.
         Use dtype="storage" for the stored type, or a NumPy dtype for an explicit
         conversion. Integer conversions reject overflow and fractional truncation.
         """

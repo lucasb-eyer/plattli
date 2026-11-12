@@ -659,7 +659,9 @@ class TestReader(unittest.TestCase):
                     w._compact_future.result()
             # Some rows are compacted to columnar, the rest still live in the hot log.
             self.assertTrue((plattli_root / "hot.jsonl").exists())
-            self.assertTrue((plattli_root / "loss.f32").exists())
+            manifest = json.loads((plattli_root / "plattli.json").read_text())
+            self.assertNotIn("values", manifest["loss"])
+            self.assertGreater((plattli_root / "loss.f32").stat().st_size, 0)
 
             with plattli.Reader(run_root) as r:
                 with mock.patch.object(r, "_metric_full", side_effect=AssertionError("fell back to full read")):
@@ -972,7 +974,11 @@ class TestReader(unittest.TestCase):
             w.end_step()
             w.finish(optimize=False, zip=False)
 
-            (plattli_root / "loss.f32").unlink()
+            # A raw value column must fail when its file is lost.
+            manifest_path = plattli_root / "plattli.json"
+            manifest = json.loads(manifest_path.read_text())
+            manifest["loss"].pop("values")
+            manifest_path.write_text(json.dumps(manifest))
             (plattli_root / "note.indices").unlink()
 
             with plattli.Reader(run_root) as r:
@@ -1056,7 +1062,7 @@ class TestReader(unittest.TestCase):
             w = plattli.DirectWriter(run_root, write_threads=0)
             for step in range(5):
                 w.step = step
-                w.write(loss=float(step))
+                w.write(loss=float(step * step))
                 w.end_step()
             w.finish(optimize=True, zip=False)
 

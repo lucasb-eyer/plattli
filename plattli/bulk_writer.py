@@ -10,6 +10,8 @@ import numpy as np
 
 from ._indices import _piecewise_segments
 from ._ranges import _ranges_encode
+from ._affine import _find_step_sequence
+from ._values import _extend_value_sequence, _find_value_sequence
 from .writer import (
     DTYPE_TO_NUMPY,
     JSONL_DTYPE,
@@ -25,6 +27,7 @@ from .writer import (
     _resolve_dtype,
     _set_monotonic,
     _tight_dtype,
+    _value_dtype,
     _validate_metric_names,
     _validate_step,
     _zip_path_for_root,
@@ -34,7 +37,7 @@ from .writer import (
 def _old_artifacts(manifest, names):
     metrics = {name: spec for name, spec in manifest.items() if name not in ("when_exported", "run_rows")}
     _validate_metric_names(metrics, "previous output")
-    suffixes = {*DTYPE_TO_NUMPY, JSONL_DTYPE}
+    suffixes = {*DTYPE_TO_NUMPY, JSONL_DTYPE, "values"}
     stems = set(metrics)
     for name in names:
         stem, _, suffix = name.rpartition(".")
@@ -135,7 +138,7 @@ def _publish_output(root, zip_path, staged, backup, zip):
 
 
 class _ColumnBuffer:
-    __slots__ = ("i", "v", "dtype", "_bounds", "_bounds_count")
+    __slots__ = ("i", "v", "dtype", "_bounds", "_bounds_count", "sequence", "sequence_count")
 
     def __init__(self):
         self.i = []
@@ -143,6 +146,14 @@ class _ColumnBuffer:
         self.dtype = None
         self._bounds = None
         self._bounds_count = 0
+        self.sequence = None
+        self.sequence_count = -1
+
+    def value_sequence(self):
+        if self.sequence_count != len(self.v):
+            self.sequence = _find_value_sequence(self.v, self.dtype) or _find_step_sequence(self.i, self.v, self.dtype)
+            self.sequence_count = len(self.v)
+        return self.sequence
 
     def integer_bounds(self):
         # jsonl2plattli can rewind this buffer; discarded extrema must not survive.
@@ -151,7 +162,14 @@ class _ColumnBuffer:
             self._bounds_count = len(self.v)
         return self._bounds
 
-    def append(self, step, value, dtype):
+    def append(self, step, value, dtype, sequence):
+        if dtype == "int":
+            self.sequence = sequence
+            self.sequence_count = len(self.v) + 1
+        else:
+            # Fixed-width values are inspected once at finish, or lazily if a
+            # later arbitrary integer needs to validate the retained history.
+            self.sequence_count = -1
         if self._bounds is not None:
             if self._bounds_count == len(self.v):
                 lo, hi = self._bounds
@@ -212,12 +230,20 @@ class BulkWriter:
                 dtype = _reconcile_dtype(bucket.dtype, value, name, self.run_root.name,
                                          integer_bounds=bucket.integer_bounds)
                 value = _coerce_stored_value(value, dtype, name, self.run_root.name)
-            prepared.append((name, bucket, dtype, value))
-        for name, bucket, dtype, value in prepared:
+            sequence = None
+            if dtype == "int":
+                previous = bucket.value_sequence() if bucket is not None else {"start": 0, "step": 0, "count": 0}
+                sequence = _extend_value_sequence(previous, [value], dtype, indices=[self.step]) if previous is not None else None
+                if sequence is None and bucket is not None:
+                    sequence = _find_step_sequence(bucket.i + [self.step], bucket.v + [value], dtype)
+                if sequence is None:
+                    raise ValueError(f"arbitrary integer value breaks arithmetic sequence for {name} in run {self.run_root.name}")
+            prepared.append((name, bucket, dtype, value, sequence))
+        for name, bucket, dtype, value, sequence in prepared:
             if bucket is None:
                 bucket = _ColumnBuffer()
                 self._columns[name] = bucket
-            bucket.append(self.step, value, dtype)
+            bucket.append(self.step, value, dtype, sequence)
             self._step_metrics.add(name)
 
     def end_step(self):
@@ -317,13 +343,17 @@ class BulkWriter:
                         lines = "\n".join(json.dumps(value, ensure_ascii=False) for value in column.v)
                         write_bytes(f"{name}.jsonl", (lines + "\n" if lines else "").encode("utf-8"))
                         continue
-                    arr = np.asarray(column.v, dtype=DTYPE_TO_NUMPY[dtype])
-                    if optimize and arr.size:
+                    arr = np.asarray(column.v, dtype=_value_dtype(dtype))
+                    if optimize and arr.size and dtype != "int":
                         arr = _tight_dtype(arr)
                         dtype = f"{arr.dtype.kind}{arr.dtype.itemsize * 8}"
                     manifest[name] = {"indices": indices_spec, "dtype": dtype}
                     _set_monotonic(manifest[name], arr)
-                    write_bytes(f"{name}.{dtype}", arr.tobytes())
+                    sequence = _find_value_sequence(arr, dtype) or _find_step_sequence(indices, arr, dtype)
+                    if sequence is not None:
+                        manifest[name]["values"] = sequence
+                    else:
+                        write_bytes(f"{name}.{dtype}", arr.tobytes())
 
                 manifest["when_exported"] = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
                 manifest["run_rows"] = run_rows

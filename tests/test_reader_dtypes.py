@@ -205,8 +205,9 @@ class TestReaderDtypes(unittest.TestCase):
     def test_table_restarts_all_columns_after_promotion_and_preserves_instrumentation(self):
         path = Path(self.tmp.name) / "table-promotion"
         writer = plattli.DirectWriter(path, write_threads=0)
-        writer.write(a=0.5, b=0.5)
-        writer.end_step()
+        for value in (0.5, 0.5, 0.75):
+            writer.write(a=value, b=value)
+            writer.end_step()
 
         class InstrumentedReader(plattli.Reader):
             def metric(self, name, *args, **kwargs):
@@ -223,12 +224,12 @@ class TestReaderDtypes(unittest.TestCase):
             reader.source_bytes = 0
             steps, columns = reader.table((name for name in ("a", "b")))
             self.assertEqual(reader.calls, ["a", "b", "a", "b"])
-            self.assertEqual(reader.source_bytes, 56)
-            self.assertEqual(steps.tolist(), [0, 1])
+            self.assertEqual(reader.source_bytes, 120)
+            self.assertEqual(steps.tolist(), [0, 1, 2, 3])
             self.assertEqual(columns["a"].dtype, np.float64)
             self.assertEqual(columns["b"].dtype, np.float64)
-            self.assertEqual(columns["a"].tolist(), [0.5, 1.123456789])
-            self.assertEqual(columns["b"].tolist(), [0.5, 2.123456789])
+            self.assertEqual(columns["a"].tolist(), [0.5, 0.5, 0.75, 1.123456789])
+            self.assertEqual(columns["b"].tolist(), [0.5, 0.5, 0.75, 2.123456789])
         writer.finish(optimize=False, zip=False)
 
     def test_failed_table_restores_retry_ownership(self):
@@ -339,18 +340,20 @@ class TestReaderDtypes(unittest.TestCase):
                 path = Path(self.tmp.name) / kind
                 writer = (plattli.DirectWriter(path, write_threads=0) if kind == "direct"
                           else plattli.CompactingWriter(path, hotsize=1 if kind == "cold" else 100))
-                for value in (100, 200):
+                for value in (100, 200, 150):
                     writer.write(value=np.uint8(value), precise=float(value))
                     writer.end_step()
                 if kind == "cold":
                     writer._wait_for_compaction()
+                    writer.write(flush=True)
+                    writer._wait_for_compaction()
                 with plattli.Reader(path) as reader:
                     reader.manifest()
                     if kind != "hot":
-                        self.assertEqual(reader.metric_values("value").tolist(), [100, 200])
+                        self.assertEqual(reader.metric_values("value").tolist(), [100, 200, 150])
                     writer.write(value=300, precise=np.float64(1.123456789012345))
                     writer.end_step()
-                    self.assertEqual(reader.metric_values("value").tolist(), [100, 200, 300])
+                    self.assertEqual(reader.metric_values("value").tolist(), [100, 200, 150, 300])
                     self.assertEqual(reader.metric_values("value", dtype="storage").dtype, np.int64)
                     precise = reader.metric_values("precise")
                     self.assertEqual(precise.dtype, np.float64)
@@ -541,6 +544,11 @@ class TestReaderDtypes(unittest.TestCase):
                     for value in (100, 200):
                         writer.write(value=np.uint8(value))
                         writer.end_step()
+                    # Exercise promotion of a raw column, including
+                    # the missing-file retry between count and value reads.
+                    writer._manifest["value"].pop("values")
+                    np.asarray([100, 200], dtype=np.uint8).tofile(path / "plattli/value.u8")
+                    (path / "plattli/plattli.json").write_text(json.dumps(writer._manifest))
                     old_path = path / "plattli/value.u8"
                     original = getattr(Path, operation)
                     promoted = False

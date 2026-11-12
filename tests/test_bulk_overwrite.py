@@ -41,6 +41,18 @@ def _contents(root, zipped):
 
 
 class TestBulkOverwrite(unittest.TestCase):
+    def test_overwrite_retires_live_sequence_heads(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with plattli.DirectWriter(root, write_threads=0) as previous:
+                previous.write(old=7)
+            (root / "plattli/notes.values").write_text("keep")
+            writer = plattli.BulkWriter(root, overwrite=True)
+            writer.write(current=8)
+            writer.finish(zip=False)
+            self.assertFalse((root / "plattli/old.values").exists())
+            self.assertEqual((root / "plattli/notes.values").read_text(), "keep")
+
     def test_format_transition_matrix_preserves_extras_and_retires_old_metrics(self):
         extras = {"notes.txt": b"notes", "notes.jsonl": b"json lines", "notes.u8": b"ancillary bytes",
                   "nested/report.txt": b"nested", "scratch.txt.tmp": b"unfinished note"}
@@ -153,12 +165,12 @@ class TestBulkOverwrite(unittest.TestCase):
                             return replace(path, target)
 
                         def fail_file_write(path, payload):
-                            if path.name == "current.u8":
+                            if path.name == "plattli.json":
                                 raise OSError("injected write failure")
                             return write_bytes(path, payload)
 
                         def fail_zip_write(archive, name, payload, *args, **kwargs):
-                            if name == "current.u8":
+                            if name == "plattli.json":
                                 raise OSError("injected write failure")
                             return writestr(archive, name, payload, *args, **kwargs)
 
@@ -383,7 +395,7 @@ class TestBulkOverwrite(unittest.TestCase):
 
     def test_unsafe_archive_extras_and_path_conflicts_fail_before_publication(self):
         for extra, metric in (("../escape.txt", "current"), ("nested", "nested/current"),
-                              ("current.u8", "current")):
+                              ("current.indices", "current")):
             for zipped in (False, True):
                 with self.subTest(extra=extra, zipped=zipped), tempfile.TemporaryDirectory() as tmp:
                     root = Path(tmp) / "run"

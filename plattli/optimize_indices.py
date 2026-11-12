@@ -32,6 +32,8 @@ def optimize_indices(path):
             raise RuntimeError("finish the run before optimizing indices: hot logs are present")
         reader.manifest()
         manifest = json.loads(reader._read_text("plattli.json"))
+        if any(spec.get("values") == "sequence" for name, spec in manifest.items() if name not in ("run_rows", "when_exported")):
+            raise RuntimeError("finish the run before optimizing indices: live value sequences are present")
         replacements, retired, changed = _plan_indices(manifest, reader._read_bytes, reader._values_count, reader._run_name)
         if not changed:
             return 0

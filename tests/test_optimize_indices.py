@@ -65,6 +65,16 @@ def _contents(root, zipped):
 
 
 class TestOptimizeIndices(unittest.TestCase):
+    def test_live_sequence_heads_require_finish(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with plattli.DirectWriter(tmp, write_threads=0) as writer:
+                writer.write(value=7)
+            before = {path.name: path.read_bytes() for path in (Path(tmp) / "plattli").iterdir() if path.is_file()}
+            with self.assertRaisesRegex(RuntimeError, "live value sequences"):
+                optimize_indices(tmp)
+            after = {path.name: path.read_bytes() for path in (Path(tmp) / "plattli").iterdir() if path.is_file()}
+            self.assertEqual(before, after)
+
     def test_directory_and_archive_preserve_values_and_metadata(self):
         for zipped in (False, True):
             with self.subTest(zipped=zipped), tempfile.TemporaryDirectory() as tmp:

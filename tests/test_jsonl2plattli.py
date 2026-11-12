@@ -10,6 +10,7 @@ from unittest import mock
 
 import numpy as np
 
+from plattli import Reader
 from plattli._indices import _segments_to_array
 from plattli.jsonl2plattli import convert_run, main
 from plattli.writer import DTYPE_TO_NUMPY
@@ -19,6 +20,11 @@ def _read_indices(zf, name, indices_spec):
     if indices_spec == "indices":
         return np.frombuffer(zf.read(f"{name}.indices"), dtype=np.uint32)
     return _segments_to_array(indices_spec)
+
+
+def _read_values(path, name):
+    with Reader(path) as reader:
+        return reader.metric_values(name)
 
 
 def _read_jsonl(zf, name):
@@ -71,7 +77,7 @@ class TestJsonl2Plattli(unittest.TestCase):
                 loss_idx = _read_indices(zf, "loss", manifest["loss"]["indices"])
                 self.assertEqual(loss_idx.tolist(), [2, 5])
                 loss_dtype = manifest["loss"]["dtype"]
-                loss_vals = np.frombuffer(zf.read(f"loss.{loss_dtype}"), dtype=DTYPE_TO_NUMPY[loss_dtype])
+                loss_vals = _read_values(outpath, "loss")
                 self.assertTrue(np.allclose(loss_vals, [1.0, 2.0]))
 
                 note_idx = _read_indices(zf, "note", manifest["note"]["indices"])
@@ -100,7 +106,7 @@ class TestJsonl2Plattli(unittest.TestCase):
                 loss_idx = _read_indices(zf, "loss", manifest["loss"]["indices"])
                 self.assertEqual(loss_idx.tolist(), [1, 2, 3])
                 loss_dtype = manifest["loss"]["dtype"]
-                loss_vals = np.frombuffer(zf.read(f"loss.{loss_dtype}"), dtype=DTYPE_TO_NUMPY[loss_dtype])
+                loss_vals = _read_values(outpath, "loss")
                 self.assertTrue(np.allclose(loss_vals, [1.0, 20.0, 20.0]))
 
     def test_step_rewind_hint(self):
@@ -131,7 +137,7 @@ class TestJsonl2Plattli(unittest.TestCase):
 
                 self.assertEqual(manifest["value"]["dtype"], "f32")
                 with zipfile.ZipFile(outpath) as zf:
-                    self.assertEqual(np.frombuffer(zf.read("value.f32"), dtype=np.float32).tolist(), [2.5])
+                    self.assertEqual(_read_values(outpath, "value").tolist(), [2.5])
                     self.assertEqual(_read_indices(zf, "value", manifest["value"]["indices"]).tolist(), [4])
 
     def test_rewind_removes_fully_discarded_metric(self):
@@ -166,7 +172,7 @@ class TestJsonl2Plattli(unittest.TestCase):
 
                 self.assertEqual(manifest["value"]["dtype"], "f64")
                 with zipfile.ZipFile(outpath) as zf:
-                    values = np.frombuffer(zf.read("value.f64"), dtype=np.float64)
+                    values = _read_values(outpath, "value")
                     self.assertEqual(values.tolist(), [1.5, 2.5] if rewind_step == 2 else [1.5, 2**24 + 1, 2.5])
 
     def test_cli_no_runs(self):

@@ -3,6 +3,21 @@
 All notable changes to this project are documented in this file.
 
 ## Unreleased
+
+- Added inline value sequences: numeric constants and integer arithmetic sequences
+  are stored in the manifest (`values`) instead of a value file, including during
+  live logging. Integer sequences can follow sample positions or logging steps, so
+  logging every N steps and once at the final step still compresses. Fixed-width
+  metrics fall back to raw arrays when the pattern breaks. Older readers cannot
+  read this encoding.
+- Floating values compress only as constants; changing and nonfinite floats use
+  raw arrays. Constant compression preserves the sign of zero.
+- Added the exact `int` dtype for Python integer sequences beyond 64 bits, returned
+  as object arrays of Python integers. Irregular arbitrary-size integer metrics
+  remain unsupported and raise.
+- Live `DirectWriter` sequences use a small `<metric>.values` head whose length
+  comes from the indices file. Closed inline values stay cached in a `Reader`
+  until `refresh()`.
 - Added binary `.ranges` index files for metrics with many regular segments.
   `finish(optimize=True)` may now write `"indices": "ranges"`; older readers
   cannot read that representation. Upgrade readers before producing these runs.

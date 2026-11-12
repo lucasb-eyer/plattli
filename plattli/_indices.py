@@ -1,5 +1,7 @@
 import numpy as np
 
+from ._sequences import _arithmetic_array
+
 
 def _segments_from_spec(indices_spec):
     if isinstance(indices_spec, dict):
@@ -106,7 +108,7 @@ def _segments_to_array(segments, total_count=None):
     arrays = []
     for start, count, step, _ in _segments_with_counts(segments, total_count):
         if count:
-            arrays.append(start + np.arange(count, dtype=np.uint32) * np.uint32(step))
+            arrays.append(_arithmetic_array(start, step, 0, count, np.uint32))
     if not arrays:
         return np.asarray([], dtype=np.uint32)
     if len(arrays) == 1:

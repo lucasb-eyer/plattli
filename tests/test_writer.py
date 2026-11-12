@@ -12,7 +12,17 @@ import numpy as np
 
 import plattli
 import plattli.writer as writer_module
-from plattli.writer import _find_arange_params, _replace_text_checked, _write_manifest, _zip_path_for_root
+from plattli.writer import _find_arange_params, _replace_text_checked, _write_manifest, _zip_path_for_root, _stored_value_sequence
+from plattli._values import _sequence_array
+
+
+def _read_values(path, dtype):
+    if path.suffix == ".indices":
+        return np.fromfile(path, dtype=dtype)
+    root = next(parent for parent in path.parents if parent.name == "plattli")
+    name = path.relative_to(root).with_suffix("").as_posix()
+    with plattli.Reader(root, kind="dir", exclude_hot=True) as reader:
+        return reader.metric_values(name, dtype="storage")
 
 
 def _read_jsonl(path):
@@ -53,7 +63,7 @@ class TestDirectWriter(unittest.TestCase):
                 w.end_step()
                 w.write(loss=2.0)
             self.assertFalse((run_root / "metrics.plattli").exists())  # Not finished.
-            self.assertTrue(np.allclose(np.fromfile(plattli_root / "loss.f32", dtype=np.float32), [1.0, 2.0]))
+            self.assertTrue(np.allclose(_read_values(plattli_root / "loss.f32", dtype=np.float32), [1.0, 2.0]))
 
         with tempfile.TemporaryDirectory() as tmp:
             run_root = Path(tmp) / "run"
@@ -134,8 +144,8 @@ class TestDirectWriter(unittest.TestCase):
                 w.write([("loss", 1.0)])
             w.finish(optimize=False, zip=False)
 
-            self.assertTrue(np.allclose(np.fromfile(plattli_root / "detail/thing0.f32", dtype=np.float32), [1.0]))
-            self.assertTrue(np.allclose(np.fromfile(plattli_root / "loss.f32", dtype=np.float32), [2.0]))
+            self.assertTrue(np.allclose(_read_values(plattli_root / "detail/thing0.f32", dtype=np.float32), [1.0]))
+            self.assertTrue(np.allclose(_read_values(plattli_root / "loss.f32", dtype=np.float32), [2.0]))
 
     def test_metrics_is_a_valid_keyword_metric(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -200,8 +210,11 @@ class TestDirectWriter(unittest.TestCase):
             np.asarray([99], dtype=np.uint32).tofile(plattli_root / "loss.indices")
 
             def check_first_row_exists(path, manifest, run_rows=None):
-                self.assertTrue(np.allclose(np.fromfile(plattli_root / "loss.f32", dtype=np.float32), [1.0]))
-                self.assertEqual(np.fromfile(plattli_root / "loss.indices", dtype=np.uint32).tolist(), [3])
+                spec = manifest["loss"]
+                self.assertEqual(spec["values"], "sequence")
+                self.assertEqual(_sequence_array({**spec, "values": _stored_value_sequence(plattli_root, "loss", spec)}).tolist(), [1.0])
+                self.assertFalse((plattli_root / "loss.f32").exists())
+                self.assertEqual(_read_values(plattli_root / "loss.indices", dtype=np.uint32).tolist(), [3])
                 return _write_manifest(path, manifest, run_rows)
 
             w.step = 3
@@ -219,7 +232,7 @@ class TestDirectWriter(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             run_root = Path(tmp) / "run"
             w = plattli.DirectWriter(run_root)
-            w.write(loss=1.0)
+            w.write(loss=float("nan"))  # Nonfinite values use a raw column.
             w.end_step()
             values_path = run_root / "plattli" / "loss.f32"
             values_path.unlink()
@@ -238,7 +251,7 @@ class TestDirectWriter(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             run_root = Path(tmp) / "run"
             w = plattli.CompactingWriter(run_root, hotsize=1)
-            w.write(loss=1.0)
+            w.write(loss=float("nan"))  # Nonfinite values use a raw column.
             w.end_step()
             (run_root / "plattli" / "loss.f32").mkdir()  # Make compaction fail.
             w.write(loss=2.0)
@@ -406,10 +419,10 @@ class TestDirectWriter(unittest.TestCase):
             w.end_step()
             w.finish(optimize=False, zip=False)
 
-            loss_vals = np.fromfile(plattli_root / "loss.f32", dtype=np.float32)
-            loss_idx = np.fromfile(plattli_root / "loss.indices", dtype=np.uint32)
+            loss_vals = _read_values(plattli_root / "loss.f32", dtype=np.float32)
+            loss_idx = _read_values(plattli_root / "loss.indices", dtype=np.uint32)
             note_vals = _read_jsonl(plattli_root / "note.jsonl")
-            note_idx = np.fromfile(plattli_root / "note.indices", dtype=np.uint32)
+            note_idx = _read_values(plattli_root / "note.indices", dtype=np.uint32)
             manifest = json.loads((plattli_root / "plattli.json").read_text(encoding="utf-8"))
 
             self.assertTrue(np.allclose(loss_vals, [1.2, 1.3]))
@@ -431,9 +444,10 @@ class TestDirectWriter(unittest.TestCase):
             w.write(loss=np.float64(1.5))
             w.finish(optimize=False, zip=False)
 
-            loss_vals = np.fromfile(plattli_root / "loss.f64", dtype=np.float64)
+            loss_vals = _read_values(plattli_root / "loss.f64", dtype=np.float64)
             self.assertEqual(loss_vals.tolist(), [1.5])
-            self.assertEqual((plattli_root / "loss.f64").stat().st_size, 8)
+            self.assertEqual(loss_vals.dtype, np.float64)
+            self.assertFalse((plattli_root / "loss.f64").exists())
 
     def test_dtype_tighten_preserves_float64(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -447,9 +461,10 @@ class TestDirectWriter(unittest.TestCase):
             w.finish(optimize=True, zip=False)
 
             manifest = json.loads((plattli_root / "plattli.json").read_text(encoding="utf-8"))
-            loss_vals = np.fromfile(plattli_root / "loss.f64", dtype=np.float64)
+            loss_vals = _read_values(plattli_root / "loss.f64", dtype=np.float64)
             self.assertEqual(manifest["loss"]["dtype"], "f64")
-            self.assertEqual((plattli_root / "loss.f64").stat().st_size, 16)
+            self.assertEqual(loss_vals.dtype, np.float64)
+            self.assertTrue((plattli_root / "loss.f64").exists())
             self.assertEqual(loss_vals.tolist(), [1.5, 2.5])
 
     def test_dtype_promotes_existing_metric(self):
@@ -462,9 +477,10 @@ class TestDirectWriter(unittest.TestCase):
             w.write(loss=np.float64(1.5))
             w.finish(optimize=False, zip=False)
 
-            loss_vals = np.fromfile(plattli_root / "loss.f64", dtype=np.float64)
+            loss_vals = _read_values(plattli_root / "loss.f64", dtype=np.float64)
             self.assertTrue(np.allclose(loss_vals, [1.0, 1.5]))
-            self.assertEqual((plattli_root / "loss.f64").stat().st_size, 16)
+            self.assertEqual(loss_vals.dtype, np.float64)
+            self.assertTrue((plattli_root / "loss.f64").exists())
 
     def test_duplicate_metric_same_step(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -478,8 +494,8 @@ class TestDirectWriter(unittest.TestCase):
             w.write(loss=3.0)
             w.finish(optimize=False, zip=False)
 
-            loss_vals = np.fromfile(plattli_root / "loss.f32", dtype=np.float32)
-            loss_idx = np.fromfile(plattli_root / "loss.indices", dtype=np.uint32)
+            loss_vals = _read_values(plattli_root / "loss.f32", dtype=np.float32)
+            loss_idx = _read_values(plattli_root / "loss.indices", dtype=np.uint32)
             self.assertTrue(np.allclose(loss_vals, [1.0, 3.0]))
             self.assertEqual(loss_idx.tolist(), [0, 1])
 
@@ -575,10 +591,10 @@ class TestDirectWriter(unittest.TestCase):
             w.finish(optimize=False, zip=False)
 
             w = plattli.DirectWriter(run_root, step=1, write_threads=0)
-            loss_vals = np.fromfile(plattli_root / "loss.f32", dtype=np.float32)
-            loss_idx = np.fromfile(plattli_root / "loss.indices", dtype=np.uint32)
+            loss_vals = _read_values(plattli_root / "loss.f32", dtype=np.float32)
+            loss_idx = _read_values(plattli_root / "loss.indices", dtype=np.uint32)
             note_vals = _read_jsonl(plattli_root / "note.jsonl")
-            note_idx = np.fromfile(plattli_root / "note.indices", dtype=np.uint32)
+            note_idx = _read_values(plattli_root / "note.indices", dtype=np.uint32)
             self.assertTrue(np.allclose(loss_vals, [1.0]))
             self.assertEqual(loss_idx.tolist(), [0])
             self.assertEqual(note_vals, ["a"])
@@ -587,8 +603,8 @@ class TestDirectWriter(unittest.TestCase):
             w.write(loss=9.0)
             w.end_step()
             w.finish(optimize=False, zip=False)
-            loss_vals = np.fromfile(plattli_root / "loss.f32", dtype=np.float32)
-            loss_idx = np.fromfile(plattli_root / "loss.indices", dtype=np.uint32)
+            loss_vals = _read_values(plattli_root / "loss.f32", dtype=np.float32)
+            loss_idx = _read_values(plattli_root / "loss.indices", dtype=np.uint32)
             self.assertTrue(np.allclose(loss_vals, [1.0, 9.0]))
             self.assertEqual(loss_idx.tolist(), [0, 1])
 
@@ -632,7 +648,7 @@ class TestDirectWriter(unittest.TestCase):
             w.end_step()
             w.finish(optimize=False, zip=False)
 
-            loss_vals = np.fromfile(plattli_root / "loss.f32", dtype=np.float32)
+            loss_vals = _read_values(plattli_root / "loss.f32", dtype=np.float32)
             self.assertTrue(np.allclose(loss_vals, [1.0, 2.0, 3.0]))
             manifest = json.loads((plattli_root / "plattli.json").read_text(encoding="utf-8"))
             self.assertEqual(manifest["loss"]["indices"], [{"start": 0, "stop": 3, "step": 1}])
@@ -657,7 +673,7 @@ class TestDirectWriter(unittest.TestCase):
             w.end_step()
             w.finish(optimize=False, zip=False)
 
-            loss_vals = np.fromfile(plattli_root / "loss.f32", dtype=np.float32)
+            loss_vals = _read_values(plattli_root / "loss.f32", dtype=np.float32)
             self.assertTrue(np.allclose(loss_vals, [1.0, 2.0, 3.0]))
             self.assertFalse((plattli_root / "hot.jsonl").exists())
 
@@ -678,7 +694,7 @@ class TestDirectWriter(unittest.TestCase):
             w.end_step()
             w.finish(optimize=False, zip=False)
 
-            loss_vals = np.fromfile(plattli_root / "loss.f32", dtype=np.float32)
+            loss_vals = _read_values(plattli_root / "loss.f32", dtype=np.float32)
             self.assertTrue(np.allclose(loss_vals, [2.0]))
 
     def test_compacting_resume_finalized(self):
@@ -707,7 +723,7 @@ class TestDirectWriter(unittest.TestCase):
             w.finish(optimize=False, zip=False)
 
             self.assertTrue(
-                np.allclose(np.fromfile(plattli_root / "loss.f32", dtype=np.float32), [1.0, 2.0, 3.0])
+                np.allclose(_read_values(plattli_root / "loss.f32", dtype=np.float32), [1.0, 2.0, 3.0])
             )
 
     def test_hot_compacts_all_at_threshold(self):
@@ -724,7 +740,7 @@ class TestDirectWriter(unittest.TestCase):
 
             hot_rows = _read_jsonl(plattli_root / "hot.jsonl")
             self.assertEqual([row["step"] for row in hot_rows], [3])
-            loss_vals = np.fromfile(plattli_root / "loss.f32", dtype=np.float32)
+            loss_vals = _read_values(plattli_root / "loss.f32", dtype=np.float32)
             self.assertTrue(np.allclose(loss_vals, [0.0, 1.0, 2.0]))
             manifest = json.loads((plattli_root / "plattli.json").read_text(encoding="utf-8"))
             self.assertEqual(manifest["loss"]["indices"], [{"start": 0, "step": 1}])
@@ -743,7 +759,7 @@ class TestDirectWriter(unittest.TestCase):
             if w._compact_future:
                 w._compact_future.result()
             w.write(flush=True)
-            first_manifest = (plattli_root / "plattli.json").read_text(encoding="utf-8")
+            first_manifest = json.loads((plattli_root / "plattli.json").read_text(encoding="utf-8"))
 
             for step in range(3, 5):
                 w.write(loss=float(step))
@@ -752,7 +768,10 @@ class TestDirectWriter(unittest.TestCase):
                 w._compact_future.result()
             w.write(flush=True)
 
-            self.assertEqual((plattli_root / "plattli.json").read_text(encoding="utf-8"), first_manifest)
+            manifest = json.loads((plattli_root / "plattli.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["loss"]["indices"], first_manifest["loss"]["indices"])
+            self.assertNotIn("values", manifest["loss"])
+            self.assertEqual(manifest, first_manifest)
             with plattli.Reader(run_root) as r:
                 self.assertEqual(r.metric_indices("loss").tolist(), [0, 1, 2, 3, 4])
                 self.assertTrue(np.allclose(r.metric_values("loss"), [0, 1, 2, 3, 4]))
@@ -767,7 +786,7 @@ class TestDirectWriter(unittest.TestCase):
             w = plattli.CompactingWriter(run_root, hotsize=3)
             for step in [0, 1, 2]:
                 w.step = step
-                w.write(loss=float(step))
+                w.write(loss=float(step**2))  # Irregular values force raw storage.
                 w.end_step()
             w.write({}, flush=True)
             w._compact_future.result()
@@ -785,7 +804,7 @@ class TestDirectWriter(unittest.TestCase):
             with mock.patch("plattli.writer._append_numeric", pause_before_append):
                 for step in [4, 5, 7]:
                     w.step = step
-                    w.write(loss=float(step))
+                    w.write(loss=float(step**2))
                     w.end_step()
                 w.write({}, flush=True)
                 try:
@@ -797,18 +816,18 @@ class TestDirectWriter(unittest.TestCase):
                         {"start": 7, "step": 1},
                     ])
                     self.assertTrue(np.allclose(
-                        np.fromfile(run_root / "plattli/loss.f32", dtype=np.float32),
-                        [0, 1, 2],
+                        _read_values(run_root / "plattli/loss.f32", dtype=np.float32),
+                        [0, 1, 4],
                     ))
                     with plattli.Reader(run_root) as r:
                         indices, values = r.metric("loss")
                         self.assertEqual(indices.tolist(), [0, 1, 2, 4, 5, 7])
-                        self.assertTrue(np.allclose(values, indices))
+                        self.assertTrue(np.allclose(values, indices**2))
                         self.assertEqual(r.rows("loss"), 6)
                         self.assertEqual(r.approx_max_rows(), 3)
                         indices, values = r.metric("loss", start=1, stop=5)
                         self.assertEqual(indices.tolist(), [1, 2, 4, 5])
-                        self.assertTrue(np.allclose(values, indices))
+                        self.assertTrue(np.allclose(values, indices**2))
                 finally:
                     append_allowed.set()
                     w._compact_future.result(timeout=5)
@@ -892,7 +911,7 @@ class TestDirectWriter(unittest.TestCase):
 
             manifest = json.loads((plattli_root / "plattli.json").read_text(encoding="utf-8"))
             self.assertEqual(manifest["loss"]["indices"], "indices")
-            idx = np.fromfile(plattli_root / "loss.indices", dtype=np.uint32)
+            idx = _read_values(plattli_root / "loss.indices", dtype=np.uint32)
             self.assertEqual(idx.tolist(), steps)
 
     def test_compacting_piecewise_segment_cap(self):
@@ -989,6 +1008,8 @@ class TestDirectWriter(unittest.TestCase):
             w.write(loss=1)
             w.end_step()
             w.write(loss=2)
+            w.end_step()
+            w.write(loss=4)  # Force raw storage so this exercises file retirement.
             w.end_step()
 
             def interrupt_manifest_write(path, manifest, run_rows=None):
@@ -1108,9 +1129,11 @@ class TestDirectWriter(unittest.TestCase):
                 self.assertEqual(manifest["loss"]["dtype"], "u8")
                 self.assertEqual(manifest["delta"]["dtype"], "i8")
                 self.assertEqual(manifest["note"]["dtype"], "jsonl")
-                self.assertIn("loss.u8", zf.namelist())
+                self.assertEqual(manifest["loss"]["values"], {"start": 1, "step": 1, "count": 2})
+                self.assertNotIn("loss.u8", zf.namelist())
                 self.assertNotIn("loss.i64", zf.namelist())
-                self.assertIn("delta.i8", zf.namelist())
+                self.assertEqual(manifest["delta"]["values"], {"start": -1, "step": -1, "count": 2})
+                self.assertNotIn("delta.i8", zf.namelist())
                 self.assertNotIn("delta.i64", zf.namelist())
                 self.assertIn("note.jsonl", zf.namelist())
                 self.assertEqual(manifest["run_rows"], 2)
@@ -1143,13 +1166,13 @@ class TestDirectWriter(unittest.TestCase):
             w = plattli.DirectWriter(run_root, step=2, write_threads=0, allow_resume_finalized=True)
             self.assertTrue(plattli_root.exists())
             self.assertFalse(zip_path.exists())
-            self.assertTrue(np.allclose(np.fromfile(plattli_root / "loss.f32", dtype=np.float32), [1.0, 2.0]))
+            self.assertTrue(np.allclose(_read_values(plattli_root / "loss.f32", dtype=np.float32), [1.0, 2.0]))
 
             w.write(loss=3.0)
             w.end_step()
             w.finish(optimize=False, zip=False)
             self.assertTrue(
-                np.allclose(np.fromfile(plattli_root / "loss.f32", dtype=np.float32), [1.0, 2.0, 3.0])
+                np.allclose(_read_values(plattli_root / "loss.f32", dtype=np.float32), [1.0, 2.0, 3.0])
             )
 
     def test_config_symlink_and_zip(self):
@@ -1241,7 +1264,7 @@ class TestDirectWriter(unittest.TestCase):
 
             w = plattli.DirectWriter(run_root, step=2, write_threads=0)
             self.assertTrue((plattli_root / "loss.indices").exists())
-            loss_vals = np.fromfile(plattli_root / "loss.f32", dtype=np.float32)
+            loss_vals = _read_values(plattli_root / "loss.f32", dtype=np.float32)
             manifest = json.loads((plattli_root / "plattli.json").read_text(encoding="utf-8"))
 
             self.assertTrue(np.allclose(loss_vals, [1.0, 2.0]))
@@ -1315,6 +1338,58 @@ class TestDirectWriter(unittest.TestCase):
     def test_find_arange_params_none(self):
         self.assertIsNone(_find_arange_params(np.array([0], dtype=np.uint32)))
         self.assertIsNone(_find_arange_params(np.array([0, 1, 3], dtype=np.uint32)))
+
+    def test_compacting_reader_tracks_sequence_growth_and_raw_fallback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            w = plattli.CompactingWriter(tmp, hotsize=2)
+            for value in (1, 2):
+                w.write(value=value)
+                w.end_step()
+            w.write(flush=True)
+            w._wait_for_compaction()
+            with plattli.Reader(tmp) as reader:
+                self.assertEqual(reader.metric_values("value").tolist(), [1, 2])
+                for batch, expected in (((3, 4), [1, 2, 3, 4]), ((5, 9), [1, 2, 3, 4, 5, 9])):
+                    for value in batch:
+                        w.write(value=value)
+                        w.end_step()
+                    w.write(flush=True)
+                    w._wait_for_compaction()
+                    reader.refresh()
+                    self.assertEqual(reader.metric_values("value").tolist(), expected)
+            self.assertNotIn("values", w._manifest["value"])
+            w.finish(zip=False)
+
+    def test_compacting_bigint_recovery_deduplicates_rotated_hot_overlap(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            w = plattli.CompactingWriter(tmp, hotsize=100)
+            for row in range(3):
+                w.write(value=10**30 + row * 17)
+                w.end_step()
+            w.finish(zip=False)
+            root = Path(tmp) / "plattli"
+            for filename, rows in (("hot.compacting.jsonl", (2, 3)), ("hot.jsonl", (3, 4))):
+                payload = "".join(json.dumps({"step": row, "value": 10**30 + row * 17}) + "\n" for row in rows)
+                (root / filename).write_text(payload)
+            with (root / "hot.jsonl").open("a") as fh:
+                fh.write('{"step":5,"value":')
+            resumed = plattli.CompactingWriter(tmp, step=5, hotsize=2)
+            resumed.write(value=10**30 + 5 * 17)
+            resumed.finish(zip=False)
+            with plattli.Reader(tmp) as reader:
+                self.assertEqual(reader.metric_indices("value").tolist(), list(range(6)))
+                self.assertEqual(reader.metric_values("value").tolist(), [10**30 + row * 17 for row in range(6)])
+
+    def test_compacting_rejects_corrupt_bigint_hot_sequence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with plattli.CompactingWriter(tmp, hotsize=100) as w:
+                for value in (10**30, 10**30 + 3):
+                    w.write(value=value)
+                    w.end_step()
+            with (Path(tmp) / "plattli/hot.jsonl").open("a") as fh:
+                fh.write(json.dumps({"step": 2, "value": 10**30 + 7}) + "\n")
+            with self.assertRaisesRegex(ValueError, "arithmetic sequence"):
+                plattli.CompactingWriter(tmp, step=3, hotsize=100)
 
 
 if __name__ == "__main__":  # pragma: no cover

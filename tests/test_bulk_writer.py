@@ -3,10 +3,12 @@ import tempfile
 import unittest
 import zipfile
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 
 import plattli
+import plattli.bulk_writer as bulk_module
 from plattli.writer import _zip_path_for_root
 
 
@@ -15,6 +17,59 @@ def _read_jsonl(path):
 
 
 class TestBulkWriter(unittest.TestCase):
+    def test_fixed_width_appends_defer_sequence_detection(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            writer = plattli.BulkWriter(tmp)
+            with mock.patch.object(bulk_module, "_extend_value_sequence", side_effect=AssertionError("per-value sequence check")), \
+                    mock.patch.object(bulk_module, "_find_step_sequence", side_effect=AssertionError("per-value affine inference")), \
+                    mock.patch.object(bulk_module, "_find_value_sequence", side_effect=AssertionError("per-value sequence inference")):
+                for row in range(20):
+                    writer.write(constant=7, floating=0.5, unsigned=np.uint64(2**63 + 5),
+                                 arithmetic=row * 3, irregular=row * row)
+                    writer.end_step()
+            writer.finish(zip=False)
+            with plattli.Reader(tmp) as reader:
+                for name in ("constant", "floating", "unsigned", "arithmetic"):
+                    self.assertIn("values", reader.manifest()[name])
+                self.assertNotIn("values", reader.manifest()["irregular"])
+                self.assertEqual(reader.metric_values("irregular").tolist(), [row * row for row in range(20)])
+
+    def test_big_integer_promotion_infers_history_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            writer = plattli.BulkWriter(tmp)
+            writer.write(counter=7)
+            writer.end_step()
+            with mock.patch.object(bulk_module, "_find_value_sequence", wraps=bulk_module._find_value_sequence) as infer, \
+                    mock.patch.object(bulk_module, "_extend_value_sequence", wraps=bulk_module._extend_value_sequence) as extend:
+                for row in range(1, 5):
+                    writer.write(counter=7 + row * 10**20)
+                    writer.end_step()
+                self.assertEqual(infer.call_count, 1)
+                self.assertEqual(extend.call_count, 4)
+            writer.finish(zip=False)
+            with plattli.Reader(tmp) as reader:
+                self.assertEqual(reader.metric_values("counter").tolist(), [7 + row * 10**20 for row in range(5)])
+
+    def test_irregular_unsigned_columns_accept_large_python_integers(self):
+        for kind in ("bulk", "direct", "cold", "hot"):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as tmp:
+                writer = plattli.BulkWriter(tmp) if kind == "bulk" else \
+                    plattli.DirectWriter(tmp, write_threads=0) if kind == "direct" else \
+                    plattli.CompactingWriter(tmp, hotsize=2 if kind == "cold" else 100)
+                expected = [2**63 + offset for offset in (100, 104, 110, 123)] + [2**64 - 1]
+                for row, value in enumerate(expected):
+                    writer.write(counter=np.uint64(value) if row < 3 else value)
+                    writer.end_step()
+                with self.assertRaises((ValueError, OverflowError)):
+                    writer.write(counter=2**64)
+                with self.assertRaises(OverflowError):
+                    writer.write(counter=-1)
+                writer.finish(optimize=False, zip=False)
+                with plattli.Reader(tmp) as reader:
+                    self.assertEqual(reader.manifest()["counter"]["dtype"], "u64")
+                    self.assertNotIn("values", reader.manifest()["counter"])
+                    self.assertEqual(reader.metric_values("counter", dtype="storage").tolist(), expected)
+
     def test_numeric_dtypes_match_streaming_writers(self):
         for optimize in (False, True):
             for zipped in (False, True):
@@ -124,7 +179,8 @@ class TestBulkWriter(unittest.TestCase):
             w.end_step()
             w.finish(zip=False)
 
-            loss_vals = np.fromfile(plattli_root / "loss.f32", dtype=np.float32)
+            with plattli.Reader(run_root) as reader:
+                loss_vals = reader.metric_values("loss")
             note_vals = _read_jsonl(plattli_root / "note.jsonl")
             meta_vals = _read_jsonl(plattli_root / "meta.jsonl")
             note_idx = np.fromfile(plattli_root / "note.indices", dtype=np.uint32)
@@ -153,7 +209,8 @@ class TestBulkWriter(unittest.TestCase):
             w.end_step()
             w.finish(optimize=False, zip=False)
 
-            loss_vals = np.fromfile(plattli_root / "loss.f32", dtype=np.float32)
+            with plattli.Reader(run_root) as reader:
+                loss_vals = reader.metric_values("loss")
             loss_idx = np.fromfile(plattli_root / "loss.indices", dtype=np.uint32)
             manifest = json.loads((plattli_root / "plattli.json").read_text(encoding="utf-8"))
             self.assertTrue(np.allclose(loss_vals, [1.0, 3.0]))
@@ -179,7 +236,8 @@ class TestBulkWriter(unittest.TestCase):
                 self.assertEqual(manifest["note"]["dtype"], "jsonl")
                 self.assertEqual(manifest["loss"]["indices"], [{"start": 0, "stop": 2, "step": 1}])
                 self.assertEqual(manifest["run_rows"], 2)
-                self.assertIn("loss.u8", zf.namelist())
+                self.assertNotIn("loss.u8", zf.namelist())
+                self.assertEqual(manifest["loss"]["values"], {"start": 1, "step": 1, "count": 2})
                 self.assertNotIn("loss.indices", zf.namelist())
                 self.assertIn("note.indices", zf.namelist())
                 self.assertIn("note.jsonl", zf.namelist())
@@ -198,8 +256,8 @@ class TestBulkWriter(unittest.TestCase):
             w.write(loss=2.0)
             w.end_step()
             w.finish(optimize=False, zip=True)
-            with zipfile.ZipFile(_zip_path_for_root(run_root)) as zf:
-                self.assertTrue(np.allclose(np.frombuffer(zf.read("loss.f32"), dtype=np.float32), [2.0]))
+            with plattli.Reader(run_root) as reader:
+                self.assertEqual(reader.metric_values("loss").tolist(), [2.0])
 
         with tempfile.TemporaryDirectory() as tmp:
             run_root = Path(tmp) / "run"
