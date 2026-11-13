@@ -12,7 +12,7 @@ import plattli
 
 
 class TestValueReader(unittest.TestCase):
-    def make_run(self, root, *, zipped=False, indices="inline", dtype="int", start=10**20, step=10**6, count=6):
+    def make_run(self, root, *, zipped=False, indices="inline", dtype="i128", start=10**20, step=10**6, count=6):
         root.mkdir()
         if indices == "inline":
             index_spec = [{"start": 0, "stop": count * 2, "step": 2}] if count else []
@@ -67,7 +67,7 @@ class TestValueReader(unittest.TestCase):
 
     def test_constant_and_descending_values_and_conversions(self):
         for zipped in (False, True):
-            for dtype, start, step in (("f32", -0.0, 0.0), ("i16", 100, -3), ("int", 10**20, -(10**20))):
+            for dtype, start, step in (("f32", -0.0, 0.0), ("i16", 100, -3), ("i128", 10**20, -(10**20))):
                 with self.subTest(zipped=zipped, dtype=dtype), tempfile.TemporaryDirectory() as tmp:
                     path = self.make_run(Path(tmp) / "run", zipped=zipped, dtype=dtype, start=start, step=step, count=3)
                     with plattli.Reader(path) as reader:
@@ -92,7 +92,7 @@ class TestValueReader(unittest.TestCase):
             root = Path(tmp) / "run"
             root.mkdir()
             (root / "plattli.json").write_text(json.dumps({
-                "value": {"dtype": "int", "indices": [{"start": 0, "step": 1}],
+                "value": {"dtype": "i128", "indices": [{"start": 0, "step": 1}],
                           "values": {"start": 10**20, "step": 1, "count": 10**9}},
             }))
             with plattli.Reader(root) as reader:
@@ -204,7 +204,7 @@ class TestValueReader(unittest.TestCase):
                         self.assertEqual(reader.metric_values(name).tolist(), [7] * 10)
 
     def test_live_sequence_sidecar_reads_growth_without_manifest_updates(self):
-        for dtype, start, step in (("f32", 0.25, 0.0), ("int", 10**20, 10**6)):
+        for dtype, start, step in (("f32", 0.25, 0.0), ("i128", 10**20, 10**6)):
             with self.subTest(dtype=dtype), tempfile.TemporaryDirectory() as tmp:
                 root = self.make_run(Path(tmp) / "run", indices="indices", dtype=dtype, start=start, step=step, count=3)
                 path = root / "plattli.json"
@@ -289,7 +289,7 @@ class TestValueReader(unittest.TestCase):
             manifest = json.loads(path.read_text())
             manifest["value"]["values"] = "sequence"
             path.write_text(json.dumps(manifest))
-            (root / "value.values").write_text(json.dumps({"dtype": "int", "values": {"start": 7, "step": 10**20}}))
+            (root / "value.values").write_text(json.dumps({"dtype": "i128", "values": {"start": 7, "step": 10**20}}))
             with plattli.Reader(root, exclude_hot=True) as reader:
                 self.assertEqual(reader.table(["value"], istop=1, dtype=np.int64)[1]["value"].tolist(), [7])
                 with self.assertRaises(OverflowError):

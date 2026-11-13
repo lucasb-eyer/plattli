@@ -110,7 +110,7 @@ Calling `end_step` from a different thread would lead to silently inconsistent d
   - array-like scalars -> use their dtype if supported
   - bool -> `jsonl`
   - float -> `f32`
-  - int -> `i64`; Python ints outside the signed 64-bit range -> exact `int`, with restrictions (see [Big integers](#big-integers))
+  - int -> `i64`; Python ints outside the signed 64-bit range -> exact `i128` (see [Big integers](#big-integers))
   - explicit numpy types (eg `np.float64`) are taken as-is.
   - everything else -> `jsonl`
 - Select an initial storage dtype by casting the value (for example: `write(dim=np.float32(128))`).
@@ -178,7 +178,8 @@ with Reader("/experiments/123456") as r:
 - List all available metric names with `metrics()`.
 - Read a metric with one of `metric(name, idx=None) -> (indices, values)`, `metric_indices(name)`, `metric_values(name)`, which return numpy arrays.
 - An integer `idx` (like `idx=-1` for the latest value) reads just that one row, without loading the whole column.
-- Values default to `dtype="standard"`: integers are returned as `int64`, floats keep
+- Values default to `dtype="standard"`: integers that fit are returned as `int64`, wider `u64` and `i128` as Python
+  integers in object arrays, floats keep
   their width, JSON values are object arrays. Steps are always `uint32`.
 - Pass keyword-only `dtype="storage"` to get the stored dtype, or a NumPy dtype such
   as `dtype=np.float64` to convert. This applies to `metric`, `metric_values`, and `table`.
@@ -253,8 +254,8 @@ Writing:
   width, or after promotion to `f64`; otherwise it raises. Float values cannot join
   an integer metric.
 - Integer writes are checked before casting; overflow never silently wraps.
-  Signed/unsigned mixtures remain exact integers. A negative value cannot coexist
-  with values above the `i64` maximum in a fixed-width integer column.
+  Signed/unsigned mixtures remain exact integers. A negative value alongside
+  values above the `i64` maximum promotes the column to `i128`.
 - Finite float values that would overflow to infinity raise. Explicit NaN and
   infinity are accepted. Promotion to `f64` cannot recover precision already lost
   when earlier values were stored as `f32`.
@@ -266,28 +267,38 @@ Writing:
   written on resume widens it back to `i64`.
 
 Reading:
-- `dtype="standard"` returns integers as checked `int64`, while `f32` and `f64`
+- `dtype="standard"` returns integers as `int64` when they fit, and wider `u64`
+  values and `i128` as object arrays of Python integers, while `f32` and `f64`
   retain their width. `manifest()[name]["dtype"]` describes storage, not the
   default return type. `metric_indices` always returns `uint32`.
 - Conversions happen after selection and alignment, including empty and single-row
-  reads. Scalar reads return the matching NumPy scalar. Integer conversions reject
+  reads. Scalar reads return a matching NumPy scalar or Python integer. Integer conversions reject
   overflow and fractional truncation; explicit float narrowing uses NumPy rounding.
-- Stored `u64` values above the `int64` maximum raise on standard reads. Select
-  `dtype=np.uint64`, `dtype=object`, or `dtype="storage"` explicitly for these values.
+- Stored `u64` values above the `int64` maximum return exact Python integers on
+  standard reads. Use `dtype=np.uint64` or `dtype="storage"` to retain unsigned
+  NumPy arrays. Explicit `dtype=np.int64` still rejects overflow.
+
+For numeric transport, `r.metric_value_bytes(name)` returns `(storage_dtype, bytes)`
+without decoding raw column files. It includes complete indexed rows and the hot
+tail, and expands sequences when necessary. `plattli.encode_numeric(values, dtype)`
+encodes numeric arrays in the same format; `plattli.DTYPE_TO_NUMPY` and
+`plattli.DTYPE_ITEMSIZE` describe the in-memory dtype and stored byte width.
 
 ### Big integers
-- Python integers outside the signed 64-bit range are stored exactly with the `int`
-  dtype. Use `10**20` for an exact Python integer; `1e20` is a float.
-- `int` metrics must be constant or grow by a fixed amount, either per measurement
-  or per logging step (`base + step * increment`). For example, logging
-  `10**20 + step * 10**6` every N steps plus once at the final step works.
-- An off-pattern value raises `ValueError` before the write is applied.
-  Irregular big integers are not yet supported.
-- An existing integer metric can promote to `int` only when its retained values and
-  the new value together form such a sequence.
+- Plain Python integers outside the signed 64-bit range automatically use `i128`.
+  Use `10**23 + 2` for an exact integer; `1e23` is already a rounded float.
+- Both regular and irregular values work. Constants and arithmetic sequences remain
+  compact; a value that breaks the pattern switches the column to a raw `.i128` file.
+- The supported range is `-2**127` through `2**127 - 1` (about ±1.7 × 10³⁸).
+  Out-of-range integer writes raise `OverflowError` before applying the batch.
+  There is no `u128` dtype.
+- Existing integer columns promote to `i128` without rounding, including irregular
+  retained history and pending hot rows.
 - Reads return object arrays of Python integers with both `dtype="standard"` and
-  `dtype="storage"`. Explicit fixed-width integer casts check bounds after selection.
-  Explicit float casts may lose precision.
+  `dtype="storage"`. Explicit fixed-width integer casts check bounds after selection;
+  explicit float casts may lose precision. No native NumPy 128-bit dtype is required.
+- Optimization may narrow `i128` when values fit smaller integers, including
+  `u64`; standard reads remain exact.
 
 ### Write validation
 - All three writers validate every metric in a `write()` call before changing
@@ -371,7 +382,7 @@ JSON object keyed by metric name, plus metadata keys like `run_rows` and `when_e
 
 Fields:
 - `indices`: `"indices"`, `"ranges"`, a list of `{start, stop, step}` segments, or a single segment (legacy). A final inline segment may omit `stop`; readers derive its length from the values.
-- `dtype`: storage type, one of `f{32,64}`, `{i,u}{8,16,32,64}`, `int`, or `jsonl`.
+- `dtype`: storage type, one of `f{32,64}`, `{i,u}{8,16,32,64}`, `i128`, or `jsonl`.
   Integer compaction changes this field without changing standard reader output.
 - `values`: optional inline values replacing the value file, see
   [Inline values](#inline-values-values-in-the-manifest).
@@ -408,6 +419,7 @@ Convert existing files with `python -m plattli.optimize_indices PATH`.
 
 ### Values (`<metric>.<dtype>`)
 Raw little-endian typed array. One scalar is appended per write call.
+`i128` uses 16-byte signed two's-complement integers, low bytes first.
 Omitted when the manifest contains `values`.
 
 ### Inline values (`values` in the manifest)
@@ -419,8 +431,9 @@ A `{start, step, count}` arithmetic sequence that replaces the value file:
 - Floats require a zero step and repeat the stored `start` exactly, including its
   zero sign.
 - The explicit `count` also bounds live open index ranges.
-- The `int` dtype exists only in this form and uses arbitrary-size JSON integer
-  components; read the manifest with a parser that preserves integer precision.
+- Integer coefficients are exact JSON integers. They may exceed the value dtype
+  bounds as long as the resulting values fit. Read the manifest with a parser that
+  preserves integer precision.
 
 For example:
 
@@ -428,7 +441,7 @@ For example:
 {
   "capacity": {
     "indices": [{"start": 0, "stop": 1000, "step": 10}],
-    "dtype": "int",
+    "dtype": "i128",
     "values": {"start": 100000000000000000000, "step": 1000000, "count": 100}
   }
 }
@@ -441,8 +454,8 @@ When writers use it:
 - Streaming numeric metrics start inline and stay inline while the pattern holds,
   also with `finish(optimize=False)`. Integer metrics detect both the row-based and
   the step-based form.
-- When the pattern breaks, fixed-width metrics switch to a raw array (`int` metrics
-  raise instead). For floats this is the first value with different stored bits,
+- When the pattern breaks, numeric metrics switch to a raw array, including `i128`.
+  For floats this is the first value with different stored bits,
   including a change between positive and negative zero. Nonfinite floats always
   use raw arrays.
 - `finish(optimize=True)` converts raw constants and integer sequences to inline values.
@@ -451,7 +464,7 @@ When writers use it:
 ### Live value sequences (`<metric>.values`)
 During live `DirectWriter` logging the manifest holds `"values": "sequence"`, which
 points to a small JSON head such as
-`{"dtype": "int", "values": {"start": 100000000000000000000, "step": 1000000}}`.
+`{"dtype": "i128", "values": {"start": 100000000000000000000, "step": 1000000}}`.
 The head omits `count`; its length comes from the metric's explicit `.indices`
 file. Readers capture the index count before reading the head, and read both fresh
 on every call. Continuing the

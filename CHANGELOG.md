@@ -2,7 +2,19 @@
 
 All notable changes to this project are documented in this file.
 
-## Unreleased
+## 0.22.0
+
+- Added signed `i128` for Python integers beyond 64 bits, returned as object arrays
+  of Python integers. Regular values use inline sequences; irregular values use
+  16-byte little-endian signed integers. Promotion, resume, and range reads preserve
+  exact values. Integer storage rejects values outside `[-2**127, 2**127 - 1]`
+  before applying a write.
+- Standard reads now return Python integers for `u64` values above signed int64,
+  matching `i128` reads instead of raising. Explicit int64 casts still check bounds.
+- Added `Reader.metric_value_bytes()` for numeric byte transport without decoding
+  raw columns, plus public `encode_numeric`, `DTYPE_TO_NUMPY`, and `DTYPE_ITEMSIZE`.
+
+## 0.21.1
 
 - Added inline value sequences: numeric constants and integer arithmetic sequences
   are stored in the manifest (`values`) instead of a value file, including during
@@ -12,9 +24,6 @@ All notable changes to this project are documented in this file.
   read this encoding.
 - Floating values compress only as constants; changing and nonfinite floats use
   raw arrays. Constant compression preserves the sign of zero.
-- Added the exact `int` dtype for Python integer sequences beyond 64 bits, returned
-  as object arrays of Python integers. Irregular arbitrary-size integer metrics
-  remain unsupported and raise.
 - Live `DirectWriter` sequences use a small `<metric>.values` head whose length
   comes from the indices file. Closed inline values stay cached in a `Reader`
   until `refresh()`.

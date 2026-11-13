@@ -8,7 +8,7 @@ from plattli._affine import _extend_step_sequence, _find_step_sequence, _step_se
 class TestStepSequences(unittest.TestCase):
     def test_irregular_cadence_preserves_exact_integer_values(self):
         indices = [0, 100, 200, 251]
-        for dtype, start, stride in (('int', 10**20, 10**6), ('int', -(10**80), -7), ('i64', 10, 3), ('u64', 2**64 - 1, -100)):
+        for dtype, start, stride in (('i128', 10**20, 10**6), ('i128', -(10**37), -7), ('i64', 10, 3), ('u64', 2**64 - 1, -100)):
             with self.subTest(dtype=dtype, start=start, stride=stride):
                 values = [start + index * stride for index in indices]
                 sequence = _find_step_sequence(indices, values, dtype)
@@ -19,9 +19,9 @@ class TestStepSequences(unittest.TestCase):
                 self.assertIsNone(_extend_step_sequence(sequence, [300], [start + 300 * stride + 1], dtype))
 
     def test_nonintegral_slope_and_invalid_inputs_do_not_encode(self):
-        for indices, values, dtype in (([0, 100], [0, 1], 'int'), ([0, 0], [1, 1], 'int'),
-                                      ([0, -1], [0, 1], 'int'), ([0, 1], [0, 256], 'u8'),
-                                      ([0, 1], [True, 2], 'int'), ([0, 1], [0.0, 1.0], 'f64')):
+        for indices, values, dtype in (([0, 100], [0, 1], 'i128'), ([0, 0], [1, 1], 'i128'),
+                                      ([0, -1], [0, 1], 'i128'), ([0, 1], [0, 256], 'u8'),
+                                      ([0, 1], [True, 2], 'i128'), ([0, 1], [0.0, 1.0], 'f64')):
             with self.subTest(indices=indices, values=values, dtype=dtype):
                 self.assertIsNone(_find_step_sequence(indices, values, dtype))
 
@@ -91,7 +91,7 @@ class TestStepAffineWriters(unittest.TestCase):
                         self.assertEqual(reader.metric_indices('counter').tolist(), expected_steps)
                         self.assertEqual(reader.metric_values('counter').tolist(), expected)
 
-    def test_off_pattern_integer_write_leaves_batch_unapplied(self):
+    def test_overflow_integer_write_leaves_batch_unapplied(self):
         import copy
         import tempfile
         import plattli
@@ -106,8 +106,8 @@ class TestStepAffineWriters(unittest.TestCase):
                 if hasattr(writer, '_wait_for_compaction'):
                     writer._wait_for_compaction()
                 before = copy.deepcopy(getattr(writer, '_manifest', None))
-                with self.assertRaises(ValueError):
-                    writer.write(other=12, counter=10**20 + 300 * 10**6 + 1)
+                with self.assertRaises(OverflowError):
+                    writer.write(other=12, counter=2**127)
                 self.assertEqual(getattr(writer, '_manifest', None), before)
                 writer.write(counter=10**20 + 300 * 10**6)
                 writer.finish(optimize=False, zip=False)
@@ -157,5 +157,5 @@ class TestStepAffineWriters(unittest.TestCase):
                     writer.end_step()
                 writer.finish(optimize=False, zip=False)
                 with plattli.Reader(tmp) as reader:
-                    self.assertEqual(reader.manifest()['counter']['dtype'], 'int')
+                    self.assertEqual(reader.manifest()['counter']['dtype'], 'i128')
                     self.assertEqual(reader.metric_values('counter').tolist(), [2**63 - 5 + step for step in (0, 1, 3, 5)])

@@ -9,6 +9,7 @@ import numpy as np
 
 import plattli
 from plattli.writer import DTYPE_TO_NUMPY
+from plattli._numeric import _encode_numeric
 
 
 class TestReaderDtypes(unittest.TestCase):
@@ -28,7 +29,7 @@ class TestReaderDtypes(unittest.TestCase):
             if dtype == "jsonl":
                 (root / f"{name}.jsonl").write_text("".join(json.dumps(v) + "\n" for v in values))
             else:
-                np.asarray(values, dtype=DTYPE_TO_NUMPY[dtype]).tofile(root / f"{name}.{dtype}")
+                (root / f"{name}.{dtype}").write_bytes(_encode_numeric(values, dtype))
         (root / "plattli.json").write_text(json.dumps(manifest))
         if hot is not None:
             (root / "hot.jsonl").write_text("".join(json.dumps(row) + "\n" for row in hot))
@@ -39,6 +40,22 @@ class TestReaderDtypes(unittest.TestCase):
                     zf.write(path, path.name)
             return archive
         return root
+
+    def test_table_float_conversion_follows_selection_and_alignment(self):
+        path = self.make_run({
+            "value": ("jsonl", list(range(5)), [None, "warmup", 1.5, 2.5, 3.5]),
+            "sparse": ("f32", [2, 3, 4], [10, 20, 30]),
+        })
+        with plattli.Reader(path) as reader:
+            for dtype in (np.float64, {"value": np.float64}):
+                for on in ("step", "value"):
+                    steps, columns = reader.table(["value"], on=on, istart=2, dtype=dtype)
+                    self.assertEqual(steps.tolist(), [2, 3, 4])
+                    self.assertEqual(columns["value"].tolist(), [1.5, 2.5, 3.5])
+                    self.assertEqual(columns["value"].dtype, np.float64)
+                steps, columns = reader.table(["value", "sparse"], dtype=dtype)
+                self.assertEqual(steps.tolist(), [2, 3, 4])
+                self.assertEqual(columns["value"].tolist(), [1.5, 2.5, 3.5])
 
     def test_standard_and_storage_across_all_numeric_storage_types(self):
         for zipped in (False, True):
@@ -95,7 +112,7 @@ class TestReaderDtypes(unittest.TestCase):
                                 self.assertEqual(columns["value"].tolist(), expected)
                                 self.assertEqual(columns["value"].dtype, expected_dtype)
 
-    def test_uint64_overflow_checks_happen_after_all_selection(self):
+    def test_uint64_standard_dtype_follows_selected_values(self):
         for zipped in (False, True):
             for direction in (None, "inc"):
                 path = self.make_run({
@@ -103,10 +120,11 @@ class TestReaderDtypes(unittest.TestCase):
                     "sparse": ("u8", [0, 1], [10, 20]),
                 }, zipped=zipped, monotonic={"value": direction} if direction else None)
                 with plattli.Reader(path) as r:
-                    for read in (lambda: r.metric_values("value"), lambda: r.metric("value"),
-                                 lambda: r.metric("value", idx=-1), lambda: r.table(["value"])):
-                        with self.assertRaisesRegex(OverflowError, "do not fit int64.*value"):
-                            read()
+                    for values in (r.metric_values("value"), r.metric("value")[1], r.table(["value"])[1]["value"]):
+                        self.assertEqual(values.dtype, object)
+                        self.assertEqual(values.tolist(), [1, 2**63 - 1, 2**63])
+                    self.assertIsInstance(r.metric("value", idx=-1)[1], int)
+                    self.assertEqual(r.metric("value", idx=-1)[1], 2**63)
                     for selector in ({"stop": 1}, {"istop": 2}, {"vstop": 2**63 - 1}):
                         self.assertEqual(r.metric_values("value", **selector).tolist(), [1, 2**63 - 1])
                         self.assertEqual(r.metric("value", **selector)[1].tolist(), [1, 2**63 - 1])

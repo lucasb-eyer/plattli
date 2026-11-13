@@ -285,14 +285,14 @@ print('ok')
                     writer.end_step()
                     writer.write(large=1, small=-1)
                     writer.end_step()
-                    with self.assertRaisesRegex(OverflowError, 'cannot share'):
-                        writer.write(large=-1)
+                    writer.write(large=-1)
+                    writer.end_step()
                     writer.write(large=np.uint64(2 ** 63 + 1))
                     writer.end_step()
                     writer.finish(zip=False)
                     dtype, values = _stored(tmp_path, 'large')
-                    self.assertEqual(dtype, 'u64')
-                    self.assertEqual(values.tolist(), [maximum, 1, 2 ** 63 + 1])
+                    self.assertEqual(dtype, 'i128')
+                    self.assertEqual(values.tolist(), [maximum, 1, -1, 2 ** 63 + 1])
                     self.assertEqual(_stored(tmp_path, 'small')[1].tolist(), [10, -1])
 
     def test_incompatible_numeric_values_fail_before_writing(self):
@@ -307,8 +307,8 @@ print('ok')
                         writer.write(counter=1.5)
                     with self.assertRaisesRegex(TypeError, 'cannot mix'):
                         writer.write(loss='not numeric')
-                    with self.assertRaisesRegex(OverflowError, 'cannot share'):
-                        writer.write(counter=np.uint64(2 ** 63))
+                    with self.assertRaisesRegex(OverflowError, 'out of range for i128'):
+                        writer.write(counter=2 ** 127)
                     writer.write(counter=2, loss=2.0)
                     writer.finish(optimize=False, zip=False)
                     self.assertEqual(_stored(tmp_path, 'counter')[1].tolist(), [-1, 2])
@@ -395,11 +395,10 @@ print('ok')
                             writer.write(counter=value)
                             writer.end_step()
                         self.assertEqual(bounds.call_count, 1)
-                        with self.assertRaises(OverflowError):
-                            writer.write(counter=-1)
+                        writer.write(counter=-1)
                         self.assertEqual(bounds.call_count, 1)
                     writer.finish(optimize=False, zip=False)
-                    self.assertEqual(_stored(tmp_path, 'counter')[1].tolist(), [2 ** 64 - 1, *range(10)])
+                    self.assertEqual(_stored(tmp_path, 'counter')[1].tolist(), [2 ** 64 - 1, *range(10), -1])
 
     def test_integer_compaction_preserves_boundaries(self):
         for value in [2 ** 63 - 1, 2 ** 63, 2 ** 64 - 1]:

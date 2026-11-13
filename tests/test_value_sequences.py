@@ -11,7 +11,7 @@ from plattli._values import _extend_value_sequence, _find_value_sequence, _seque
 class TestValueSequences(unittest.TestCase):
     def test_integer_limits_and_steps_wider_than_the_storage_dtype(self):
         for dtype, values in (("i8", [-128, 127]), ("i64", [-(2**63), 2**63 - 1]),
-                              ("u64", [2**64 - 1, 0]), ("int", [10**100, 0, -(10**100)]), ("int", [-1, 2**63 + 1])):
+                              ("u64", [2**64 - 1, 0]), ("i128", [10**38, 0, -(10**38)]), ("i128", [-1, 2**63 + 1])):
             with self.subTest(dtype=dtype):
                 sequence = _find_value_sequence(values, dtype)
                 self.assertIsNotNone(sequence)
@@ -20,7 +20,7 @@ class TestValueSequences(unittest.TestCase):
                 self.assertEqual(_extend_value_sequence(prefix, values[1:], dtype), sequence)
 
     def test_empty_sequences_and_batch_extension(self):
-        for dtype in ("int", "i8", "u64", "f32", "f64"):
+        for dtype in ("i128", "i8", "u64", "f32", "f64"):
             with self.subTest(dtype=dtype):
                 empty = {"start": 0, "step": 0, "count": 0}
                 self.assertEqual(_find_value_sequence([], dtype), empty)
@@ -63,7 +63,7 @@ class TestValueSequences(unittest.TestCase):
 
     def test_invalid_input_never_wraps_or_rounds_into_a_sequence(self):
         for dtype, values in (("i8", [128]), ("u64", [-1]), ("i64", [2**63]),
-                              ("int", [1.5]), ("int", [True]), ("int", [[1]]),
+                              ("i128", [1.5]), ("i128", [True]), ("i128", [[1]]),
                               ("f32", [float("nan")]), ("f64", [float("inf")]),
                               ("f32", [10**1000]), ("f64", ["1"])):
             with self.subTest(dtype=dtype, values=values):
@@ -79,7 +79,7 @@ class TestValueSequences(unittest.TestCase):
         self.assertIsNone(_extend_value_sequence(valid["values"], [2**32], "u32"))
         for count in (-1, True, 1.5, 2**32 + 1):
             with self.subTest(count=count), self.assertRaises(ValueError):
-                _value_sequence({"dtype": "int", "values": {"start": 0, "step": 0, "count": count}})
+                _value_sequence({"dtype": "i128", "values": {"start": 0, "step": 0, "count": count}})
         for offset, count in ((1.5, 1), (False, 1), (0, True)):
             with self.subTest(offset=offset, count=count), self.assertRaises(TypeError):
                 _sequence_array(valid, offset, count)
@@ -88,6 +88,6 @@ class TestValueSequences(unittest.TestCase):
                 _sequence_array(valid, offset, count)
         for dtype, start, step in (("i8", 127, 1), ("f32", 1e100, 0),
                                    ("f64", 1e308, 1e308), ("f64", 10**1000, 0),
-                                   ("int", True, 1), ("int", 1, 0.5)):
+                                   ("i128", True, 1), ("i128", 1, 0.5)):
             with self.subTest(dtype=dtype, start=start, step=step), self.assertRaises(ValueError):
                 _value_sequence({"dtype": dtype, "values": {"start": start, "step": step, "count": 2}})

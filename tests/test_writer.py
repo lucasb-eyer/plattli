@@ -1380,15 +1380,15 @@ class TestDirectWriter(unittest.TestCase):
                 self.assertEqual(reader.metric_indices("value").tolist(), list(range(6)))
                 self.assertEqual(reader.metric_values("value").tolist(), [10**30 + row * 17 for row in range(6)])
 
-    def test_compacting_rejects_corrupt_bigint_hot_sequence(self):
+    def test_compacting_rejects_overflowing_i128_hot_value(self):
         with tempfile.TemporaryDirectory() as tmp:
             with plattli.CompactingWriter(tmp, hotsize=100) as w:
                 for value in (10**30, 10**30 + 3):
                     w.write(value=value)
                     w.end_step()
             with (Path(tmp) / "plattli/hot.jsonl").open("a") as fh:
-                fh.write(json.dumps({"step": 2, "value": 10**30 + 7}) + "\n")
-            with self.assertRaisesRegex(ValueError, "arithmetic sequence"):
+                fh.write(json.dumps({"step": 2, "value": 2**127}) + "\n")
+            with self.assertRaisesRegex(OverflowError, "out of range for i128"):
                 plattli.CompactingWriter(tmp, step=3, hotsize=100)
 
 

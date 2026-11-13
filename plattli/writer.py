@@ -35,27 +35,16 @@ from ._ranges import (
     _ranges_to_segments,
 )
 
-DTYPE_TO_NUMPY = {
-    "f32": np.float32,
-    "f64": np.float64,
-    "i8": np.int8,
-    "i16": np.int16,
-    "i32": np.int32,
-    "i64": np.int64,
-    "u8": np.uint8,
-    "u16": np.uint16,
-    "u32": np.uint32,
-    "u64": np.uint64,
-}
-_INT_LIMITS = {
-    tag: (int(np.iinfo(dtype).min), int(np.iinfo(dtype).max))
-    for tag, dtype in DTYPE_TO_NUMPY.items() if tag[0] in "iu"
-}
+from ._numeric import (
+    DTYPE_TO_NUMPY, DTYPE_ITEMSIZE, INT_LIMITS as _INT_LIMITS,
+    _encode_numeric, _read_numeric, _numeric_dtype,
+)
+
 _F32_MAX = float(np.finfo(np.float32).max)
 
 
 def _value_dtype(dtype):
-    return object if dtype == "int" else DTYPE_TO_NUMPY[dtype]
+    return DTYPE_TO_NUMPY[dtype]
 
 JSONL_DTYPE = "jsonl"
 HOT_FILENAME = "hot.jsonl"
@@ -385,7 +374,7 @@ def _truncate_to_step(root, manifest, step, allow_missing):
                 if allow_missing:
                     continue
                 raise FileNotFoundError(f"missing values file for {name} in run {run_name}")
-            size = keep * np.dtype(DTYPE_TO_NUMPY[dtype]).itemsize
+            size = keep * DTYPE_ITEMSIZE[dtype]
             if value_path.stat().st_size != size:
                 with value_path.open("r+b") as fh:
                     fh.truncate(size)
@@ -574,7 +563,7 @@ def _stored_values_count(root, name, spec, allow_missing):
         if allow_missing:
             return 0
         raise FileNotFoundError(f"missing values file for {name} in run {_run_name_for_root(root)}")
-    return path.stat().st_size // np.dtype(DTYPE_TO_NUMPY[dtype]).itemsize
+    return path.stat().st_size // DTYPE_ITEMSIZE[dtype]
 
 
 def _close_open_indices(root, manifest):
@@ -632,10 +621,6 @@ def _coerce_stored_value(value, dtype, name, run_name):
         payload = json.dumps(value, ensure_ascii=False)
         payload.encode("utf-8")
         return value if value is None or type(value) in (str, int, float, bool) else json.loads(payload)
-    if dtype == "int":
-        if type(value) is not int:
-            raise TypeError(f"expected an integer for {name} in run {run_name}")
-        return value
     if dtype in _INT_LIMITS:
         if not isinstance(value, (int, float)) or (isinstance(value, float) and not np.isfinite(value)):
             raise ValueError(f"expected an integer for {name} in run {run_name}")
@@ -658,7 +643,7 @@ def _coerce_stored_value(value, dtype, name, run_name):
     return DTYPE_TO_NUMPY[dtype](value).item()
 
 
-def _prepare_metrics(metrics, manifest, step_metrics, step, run_name, integer_bounds, sequence_state=None):
+def _prepare_metrics(metrics, manifest, step_metrics, step, run_name, integer_bounds):
     """Validate and snapshot the whole batch before publishing any changes."""
     prepared = {}
     for name, value in metrics.items():
@@ -670,10 +655,6 @@ def _prepare_metrics(metrics, manifest, step_metrics, step, run_name, integer_bo
             dtype = _reconcile_dtype(manifest[name]["dtype"], value, name, run_name,
                                      lambda name=name: integer_bounds(name))
         value = _coerce_stored_value(value, dtype, name, run_name)
-        if dtype == "int":
-            sequence = sequence_state(name, step, value, dtype) if name in manifest else {"start": 0, "step": 0, "count": 0}
-            if sequence is None or _extend_value_sequence(sequence, [value], dtype, indices=[step]) is None:
-                raise ValueError(f"arbitrary integer value breaks arithmetic sequence for {name} in run {run_name}")
         prepared[name] = dtype, value
     return prepared
 
@@ -683,12 +664,10 @@ def _reconcile_dtype(dtype, value, name, run_name, integer_bounds):
     if dtype == JSONL_DTYPE:
         return dtype
     incoming = _resolve_dtype(value, name=name, run_name=run_name)
-    if dtype == "u64" and incoming == "int" and 0 <= value <= _INT_LIMITS["u64"][1]:
+    if dtype == "u64" and incoming == "i128" and 0 <= value <= _INT_LIMITS["u64"][1]:
         return "u64"
-    if (dtype == "int" or incoming == "int") and dtype[0] != "f":
-        if dtype == "int" and incoming[0] in "iu" or incoming == "int" and dtype[0] in "iu":
-            return "int"
-        raise TypeError(f"cannot mix {dtype} and {incoming} values for {name} in run {run_name}")
+    if "i128" in (dtype, incoming) and dtype[0] in "iu" and incoming[0] in "iu":
+        return "i128"
     if incoming == dtype:
         return dtype
     if incoming == JSONL_DTYPE and isinstance(value, (list, tuple)):
@@ -727,7 +706,7 @@ def _reconcile_dtype(dtype, value, name, run_name, integer_bounds):
         return "i64"
     if lo >= 0:
         return "u64"
-    raise OverflowError(f"negative and uint64 values cannot share an integer dtype for {name} in run {run_name}")
+    return "i128"
 
 
 def _stored_value_sequence(root, name, spec):
@@ -745,9 +724,7 @@ def _stored_value_sequence(root, name, spec):
         return dict(_value_sequence({**spec, "values": sequence}))
     if "values" in spec:
         return dict(_value_sequence(spec))
-    path = root / f"{name}.{spec['dtype']}"
-    values = np.fromfile(path, dtype=_value_dtype(spec["dtype"])) if path.exists() else []
-    return _find_value_sequence(values, spec["dtype"]) or _find_step_sequence(_stored_indices(root, name, spec, len(values)), values, spec["dtype"])
+    raise ValueError(f"missing value sequence for {name}")
 
 
 def _stored_indices(root, name, spec, count):
@@ -793,12 +770,10 @@ def _append_stored_values(root, name, spec, values, indices=None):
     if extended is not None:
         spec["values"] = extended
     else:
-        if spec["dtype"] == "int":
-            raise ValueError(f"arbitrary integer value breaks arithmetic sequence for {name}")
         if sequence.get("on") == "step" and previous_indices is None:
             previous_indices = _stored_indices(root, name, spec, sequence["count"])
         array = np.concatenate((_sequence_array(spec, indices=previous_indices), np.asarray(values, dtype=_value_dtype(spec["dtype"]))))
-        _replace_bytes(root / f"{name}.{spec['dtype']}", array.tobytes())
+        _replace_bytes(root / f"{name}.{spec['dtype']}", _encode_numeric(array, spec["dtype"]))
         spec.pop("values")
 
 
@@ -808,7 +783,7 @@ def _optimize_values(root, manifest):
         if "values" in spec or spec["dtype"] == JSONL_DTYPE:
             continue
         path = root / f"{name}.{spec['dtype']}"
-        values = np.fromfile(path, dtype=_value_dtype(spec["dtype"]))
+        values = _read_numeric(path, spec["dtype"])
         sequence = _find_value_sequence(values, spec["dtype"])
         if sequence is None and spec["dtype"][0] in "iu":
             sequence = _find_step_sequence(_stored_indices(root, name, spec, len(values)), values, spec["dtype"])
@@ -838,7 +813,7 @@ def _integer_bounds(root, name, spec, hot_rows=()):
     path = root / f"{name}.{dtype}"
     lo = hi = 0
     if path.exists() and path.stat().st_size:
-        values = np.fromfile(path, dtype=DTYPE_TO_NUMPY[dtype])
+        values = _read_numeric(path, dtype)
         lo, hi = int(values.min()), int(values.max())
     for row in hot_rows:
         if name in row:
@@ -856,7 +831,7 @@ def _publish_stored_dtype(root, manifest, name, dtype, values, publish):
         new_path = root / f"{name}.{dtype}"
         tmp_path = new_path.with_name(new_path.name + ".tmp")
         with tmp_path.open("wb") as fh:
-            values.tofile(fh)
+            fh.write(_encode_numeric(values, dtype))
             fh.flush()
             os.fsync(fh.fileno())
         tmp_path.replace(new_path)
@@ -874,22 +849,17 @@ def _publish_stored_dtype(root, manifest, name, dtype, values, publish):
 
 def _rewrite_stored_dtype(root, manifest, name, dtype, publish):
     spec = manifest[name]
-    if "values" in spec or dtype == "int":
+    if "values" in spec:
         original = dict(spec)
-        if dtype == "int":
-            sequence = _stored_value_sequence(root, name, spec)
-            if sequence is None:
-                raise ValueError(f"retained values do not form an arithmetic sequence for {name}")
-        else:
-            sequence = dict(_value_sequence(spec))
-            if spec["dtype"][0] in "iu" and dtype[0] in "iu":
-                lo, hi = _INT_LIMITS[dtype]
-                endpoints = _sequence_endpoints(root, name, spec)
-                if min(endpoints) < lo or max(endpoints) > hi:
-                    raise OverflowError(f"stored values are out of range for {dtype} for {name} in run {_run_name_for_root(root)}")
-            if sequence.get("on") != "step":
-                sequence["start"] = _value_dtype(dtype)(sequence["start"]).item()
-            _value_sequence({"dtype": dtype, "values": sequence})
+        sequence = dict(_value_sequence(spec))
+        if spec["dtype"][0] in "iu" and dtype[0] in "iu":
+            lo, hi = _INT_LIMITS[dtype]
+            endpoints = _sequence_endpoints(root, name, spec)
+            if min(endpoints) < lo or max(endpoints) > hi:
+                raise OverflowError(f"stored values are out of range for {dtype} for {name} in run {_run_name_for_root(root)}")
+        if sequence.get("on") != "step" and dtype != "i128":
+            sequence["start"] = _value_dtype(dtype)(sequence["start"]).item()
+        _value_sequence({"dtype": dtype, "values": sequence})
         spec["dtype"] = dtype
         spec["values"] = sequence
         try:
@@ -898,16 +868,13 @@ def _rewrite_stored_dtype(root, manifest, name, dtype, publish):
             spec.clear()
             spec.update(original)
             raise
-        if "values" not in original:
-            (root / f"{name}.{original['dtype']}").unlink(missing_ok=True)
-            _fsync_dir((root / name).parent)
         return
     old_path = root / f"{name}.{manifest[name]['dtype']}"
     values = None
     if old_path.exists():
-        values = np.fromfile(old_path, dtype=DTYPE_TO_NUMPY[manifest[name]["dtype"]])
+        values = _read_numeric(old_path, manifest[name]["dtype"])
         target = np.dtype(DTYPE_TO_NUMPY[dtype])
-        if values.dtype.kind in "iu" and target.kind in "iu":
+        if spec["dtype"][0] in "iu" and dtype[0] in "iu":
             if values.size and not np.can_cast(values.dtype, target, casting="safe"):
                 lo, hi = _INT_LIMITS[dtype]
                 if int(values.min()) < lo or int(values.max()) > hi:
@@ -922,7 +889,7 @@ class _Monotonic:
     def __init__(self, dtype):
         self.last = None
         self.direction = None
-        self.broken = dtype not in DTYPE_TO_NUMPY and dtype != "int"
+        self.broken = dtype not in DTYPE_TO_NUMPY
         self.seen = False
 
     def add(self, value):
@@ -1010,7 +977,7 @@ def _refresh_monotonic_metadata(root, manifest, hot_rows=()):
         elif dtype in DTYPE_TO_NUMPY:
             path = root / f"{name}.{dtype}"
             if path.exists():
-                state.add_array(np.fromfile(path, dtype=DTYPE_TO_NUMPY[dtype]))
+                state.add_array(_read_numeric(path, dtype))
             for row in sorted_hot_rows:
                 if name in row:
                     state.add(_coerce_stored_value(row[name], dtype, name, run_name))
@@ -1035,21 +1002,21 @@ def _tighten_dtypes(root, manifest):
         if dtype == JSONL_DTYPE:
             continue
         if "values" in spec:
-            if dtype == "int" or dtype[0] == "f" or not spec["values"]["count"]:
+            if dtype[0] == "f" or not spec["values"]["count"]:
                 continue
             sequence = _value_sequence(spec)
             endpoints = np.asarray(_sequence_endpoints(root, name, spec), dtype=_value_dtype(dtype))
             tightened = _tight_dtype(endpoints)
-            spec["dtype"] = f"{tightened.dtype.kind}{tightened.dtype.itemsize * 8}"
+            spec["dtype"] = _numeric_dtype(tightened)
             continue
         path = root / f"{name}.{dtype}"
-        arr = np.fromfile(path, dtype=DTYPE_TO_NUMPY[dtype])
+        arr = _read_numeric(path, dtype)
         if arr.size == 0:
             continue  # pragma: no cover
         tightened = _tight_dtype(arr)
         if tightened is None:
             continue  # pragma: no cover - unreachable
-        new_dtype = f"{tightened.dtype.kind}{tightened.dtype.itemsize * 8}"
+        new_dtype = _numeric_dtype(tightened)
         if new_dtype == dtype:
             continue
         _publish_stored_dtype(root, manifest, name, new_dtype, tightened,
@@ -1212,8 +1179,7 @@ class DirectWriter:
         self.step = _validate_step(self.step, self.run_root.name)
 
         prepared = _prepare_metrics(metrics, self._manifest, self._step_metrics,
-                                    self.step, self.run_root.name, self._integer_bounds,
-                                    sequence_state=self._sequence_state)
+                                    self.step, self.run_root.name, self._integer_bounds)
 
         new_metric = False
         for name, (dtype, value) in prepared.items():
@@ -1394,20 +1360,6 @@ class DirectWriter:
             if "values" not in self._manifest[name]:
                 (self.root / f"{name}.values").unlink(missing_ok=True)
 
-    def _sequence_state(self, name, step=None, value=None, dtype=None):
-        wait(self._futures)
-        self._drain_errors()
-        spec = self._manifest[name]
-        sequence = _stored_value_sequence(self.root, name, spec)
-        if step is None or (sequence is not None and _extend_value_sequence(sequence, [value], dtype, indices=[step]) is not None):
-            return sequence
-        count = _stored_values_count(self.root, name, spec, allow_missing=False)
-        indices = _stored_indices(self.root, name, spec, count)
-        values = _sequence_array(spec, indices=indices) if "values" in spec else np.fromfile(self.root / f"{name}.{spec['dtype']}", dtype=_value_dtype(spec["dtype"]))
-        values = list(values) + [value]
-        candidate = _find_value_sequence(values, dtype) or _find_step_sequence(np.append(indices, step).astype(np.uint32), values, dtype)
-        return {**candidate, "count": count} if candidate is not None else None
-
     def _flush_step_indices(self):
         if not self._step_metrics:
             return
@@ -1465,7 +1417,6 @@ class CompactingWriter:
         self._step_metrics = set()
         self._monotonic = {}
         self._integer_bounds_cache = {}
-        self._value_sequences = {}
         self._broken = None
         self._finished = False
 
@@ -1491,10 +1442,6 @@ class CompactingWriter:
                 _truncate_to_step(self.root, self._manifest, self.step, allow_missing=True)
 
         self._load_hot_rows()
-        for name, spec in self._manifest.items():
-            if spec["dtype"] == "int":
-                if self._sequence_state(name) is None:
-                    raise ValueError(f"integer values do not follow an arithmetic sequence for {name} in run {self.run_root.name}")
         if self._manifest:
             if self.live_indices == "explicit":
                 _force_indices_files(self.root, self._manifest)
@@ -1544,8 +1491,7 @@ class CompactingWriter:
         # Never wait for a worker while holding its manifest lock. Most writes keep
         # their dtype and don't wait; widening drains the old representation first.
         prepared = _prepare_metrics(metrics, self._manifest, self._step_metrics,
-                                    self.step, self.run_root.name, self._integer_bounds,
-                                    sequence_state=self._sequence_state)
+                                    self.step, self.run_root.name, self._integer_bounds)
 
         for name, (dtype, value) in prepared.items():
             if name in self._manifest and dtype != self._manifest[name]["dtype"]:
@@ -1570,9 +1516,6 @@ class CompactingWriter:
                         if sequence is not None:
                             self._manifest[name]["values"] = {**sequence, "count": 0}
                     new_metric = True
-                if dtype == "int" or name in self._value_sequences:
-                    sequence = self._value_sequences.get(name, self._manifest[name].get("values"))
-                    self._value_sequences[name] = _extend_value_sequence(sequence, [value], dtype, indices=[self.step]) if sequence is not None else None
                 if _track_monotonic_value(self._manifest, self._monotonic, name, value):
                     # Safe to defer: flags are persisted by the next compaction before any
                     # values land in columnar files, and recomputed from data on resume.
@@ -1666,50 +1609,6 @@ class CompactingWriter:
         bounds = _integer_bounds(self.root, name, self._manifest[name], self._hot_rows)
         self._integer_bounds_cache[name] = bounds
         return bounds
-
-    def _sequence_state(self, name, step=None, value=None, dtype=None):
-        if name not in self._value_sequences:
-            self._wait_for_compaction()
-            spec = self._manifest[name]
-            sequence = _stored_value_sequence(self.root, name, spec)
-            rows = {int(row["step"]): row for row in self._hot_rows}
-            if name in self._current_row:
-                rows[self.step] = self._current_row
-            pending = [(index, row[name]) for index, row in sorted(rows.items()) if name in row]
-            if sequence is not None:
-                sequence = _extend_value_sequence(sequence, [value for _, value in pending], spec["dtype"],
-                                                  indices=[index for index, _ in pending])
-            if sequence is None and spec["dtype"] == "int":
-                indices, values = self._sequence_history(name)
-                sequence = _find_value_sequence(values, spec["dtype"]) or _find_step_sequence(indices, values, spec["dtype"])
-            self._value_sequences[name] = sequence
-        sequence = self._value_sequences[name]
-        if step is None or sequence is not None and _extend_value_sequence(sequence, [value], dtype, indices=[step]) is not None:
-            return sequence
-        indices, values = self._sequence_history(name)
-        converted = _find_value_sequence(values + [value], dtype) or _find_step_sequence(indices + [step], values + [value], dtype)
-        if converted is not None:
-            sequence = {**converted, "count": converted["count"] - 1}
-            self._value_sequences[name] = sequence
-        return sequence
-
-    def _sequence_history(self, name):
-        self._wait_for_compaction()
-        spec = self._manifest[name]
-        count = _stored_values_count(self.root, name, spec, allow_missing=True)
-        indices = _stored_indices(self.root, name, spec, count)
-        if "values" in spec:
-            values = _sequence_array(spec, count=count, indices=indices)
-        else:
-            path = self.root / f"{name}.{spec['dtype']}"
-            values = np.fromfile(path, dtype=_value_dtype(spec["dtype"]))[:count] if path.exists() else []
-        history = {int(index): value for index, value in zip(indices, values)}
-        for row in self._hot_rows:
-            if name in row:
-                history[int(row["step"])] = row[name]
-        if name in self._current_row:
-            history[self.step] = self._current_row[name]
-        return sorted(history), [history[index] for index in sorted(history)]
 
     def _load_hot_rows(self):
         hot_path = self.root / HOT_FILENAME
@@ -2039,17 +1938,16 @@ def _find_arange_params(array):
 
 
 def _tightest_int(array):
-    if not np.issubdtype(array.dtype, np.integer):
+    if array.dtype.kind not in "iuO":
         return array  # pragma: no cover - unreachable
 
     # Python comparisons stay exact at the int64/uint64 boundary.
     amin, amax = int(array.min()), int(array.max())
-
     if amin >= 0:
         for dt in (np.uint8, np.uint16, np.uint32, np.uint64):
             if amax <= np.iinfo(dt).max:
                 return array.astype(dt, copy=False)
-        return array.astype(np.uint64, copy=False)  # pragma: no cover - unreachable
+        return array
 
     for dt in (np.int8, np.int16, np.int32, np.int64):
         info = np.iinfo(dt)
@@ -2063,7 +1961,7 @@ def _tight_dtype(array):
     array = np.asarray(array)
     if array.dtype.kind == "f":
         return array
-    if array.dtype.kind in "iu":
+    if array.dtype.kind in "iuO":
         return _tightest_int(array)
     return None  # pragma: no cover - unreachable
 
@@ -2073,7 +1971,7 @@ def _append_numeric(path, values, dtype):
     if arr.ndim != 1:
         raise ValueError(f"expected 1d values for {path} (shape {arr.shape})")
     with path.open("ab") as fh:
-        arr.tofile(fh)
+        fh.write(_encode_numeric(arr, dtype))
 
 
 def _append_indices(path, indices):
@@ -2099,7 +1997,7 @@ def _append_jsonl(path, values):
 
 def _resolve_dtype(value, name=None, run_name=None):
     if type(value) is int:
-        return "i64" if -(2**63) <= value < 2**63 else "int"
+        return "i64" if -(2**63) <= value < 2**63 else "i128"
     if type(value) is float:
         return "f32"
     if not isinstance(value, (np.ndarray, np.generic)) and hasattr(value, "__array__"):

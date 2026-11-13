@@ -20,12 +20,11 @@ class TestBulkWriter(unittest.TestCase):
     def test_fixed_width_appends_defer_sequence_detection(self):
         with tempfile.TemporaryDirectory() as tmp:
             writer = plattli.BulkWriter(tmp)
-            with mock.patch.object(bulk_module, "_extend_value_sequence", side_effect=AssertionError("per-value sequence check")), \
-                    mock.patch.object(bulk_module, "_find_step_sequence", side_effect=AssertionError("per-value affine inference")), \
+            with mock.patch.object(bulk_module, "_find_step_sequence", side_effect=AssertionError("per-value affine inference")), \
                     mock.patch.object(bulk_module, "_find_value_sequence", side_effect=AssertionError("per-value sequence inference")):
                 for row in range(20):
                     writer.write(constant=7, floating=0.5, unsigned=np.uint64(2**63 + 5),
-                                 arithmetic=row * 3, irregular=row * row)
+                                 arithmetic=row * 3, irregular=row * row, huge=10**23 + row * row)
                     writer.end_step()
             writer.finish(zip=False)
             with plattli.Reader(tmp) as reader:
@@ -34,18 +33,16 @@ class TestBulkWriter(unittest.TestCase):
                 self.assertNotIn("values", reader.manifest()["irregular"])
                 self.assertEqual(reader.metric_values("irregular").tolist(), [row * row for row in range(20)])
 
-    def test_big_integer_promotion_infers_history_once(self):
+    def test_big_integer_promotion_defers_sequence_detection(self):
         with tempfile.TemporaryDirectory() as tmp:
             writer = plattli.BulkWriter(tmp)
             writer.write(counter=7)
             writer.end_step()
-            with mock.patch.object(bulk_module, "_find_value_sequence", wraps=bulk_module._find_value_sequence) as infer, \
-                    mock.patch.object(bulk_module, "_extend_value_sequence", wraps=bulk_module._extend_value_sequence) as extend:
+            with mock.patch.object(bulk_module, "_find_value_sequence", wraps=bulk_module._find_value_sequence) as infer:
                 for row in range(1, 5):
                     writer.write(counter=7 + row * 10**20)
                     writer.end_step()
-                self.assertEqual(infer.call_count, 1)
-                self.assertEqual(extend.call_count, 4)
+                self.assertEqual(infer.call_count, 0)
             writer.finish(zip=False)
             with plattli.Reader(tmp) as reader:
                 self.assertEqual(reader.metric_values("counter").tolist(), [7 + row * 10**20 for row in range(5)])
@@ -60,13 +57,13 @@ class TestBulkWriter(unittest.TestCase):
                 for row, value in enumerate(expected):
                     writer.write(counter=np.uint64(value) if row < 3 else value)
                     writer.end_step()
-                with self.assertRaises((ValueError, OverflowError)):
-                    writer.write(counter=2**64)
-                with self.assertRaises(OverflowError):
-                    writer.write(counter=-1)
+                for value in (2**64, -1):
+                    writer.write(counter=value)
+                    writer.end_step()
+                    expected.append(value)
                 writer.finish(optimize=False, zip=False)
                 with plattli.Reader(tmp) as reader:
-                    self.assertEqual(reader.manifest()["counter"]["dtype"], "u64")
+                    self.assertEqual(reader.manifest()["counter"]["dtype"], "i128")
                     self.assertNotIn("values", reader.manifest()["counter"])
                     self.assertEqual(reader.metric_values("counter", dtype="storage").tolist(), expected)
 
@@ -106,11 +103,10 @@ class TestBulkWriter(unittest.TestCase):
                 w.end_step()
                 w.write(counter=7)
                 w.end_step()
-                with self.assertRaises((ValueError, OverflowError)):
-                    w.write(counter=-1)
+                w.write(counter=-1)
                 w.finish(optimize=optimize, zip=False)
                 with plattli.Reader(tmp) as r:
-                    self.assertEqual(r.metric_values("counter", dtype="storage").tolist(), [2**64 - 1, 7])
+                    self.assertEqual(r.metric_values("counter", dtype="storage").tolist(), [2**64 - 1, 7, -1])
 
     def test_mixed_numeric_families_raise_before_mutating(self):
         for first, invalid in ((1, 1.5), (1.0, "not numeric")):
@@ -130,8 +126,7 @@ class TestBulkWriter(unittest.TestCase):
             for value in (np.uint64(1), np.uint64(2**64 - 1), 2, 3):
                 w.write(counter=value)
                 w.end_step()
-            with self.assertRaises(OverflowError):
-                w.write(counter=-1)
+            self.assertEqual(w._columns["counter"].integer_bounds(), (1, 2**64 - 1))
             # The converter rewinds buffers in-place before continuing a run.
             column = w._columns["counter"]
             del column.i[1:]

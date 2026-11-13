@@ -14,6 +14,7 @@ from ._indices import (
     _segments_to_array,
     _segments_with_counts,
 )
+from ._numeric import DTYPE_ITEMSIZE, _decode_numeric, _encode_numeric
 from ._ranges import _ranges_records
 from ._values import _value_sequence, _sequence_array, _sequence_value
 from .writer import (
@@ -468,16 +469,20 @@ class Reader:
         if count <= 0:
             if dtype == JSONL_DTYPE:
                 return np.asarray([], dtype=object)
-            if dtype not in DTYPE_TO_NUMPY and dtype != "int":
+            if dtype not in DTYPE_TO_NUMPY:
                 raise ValueError(f"unsupported dtype for {name} in run {self._run_name}: {dtype}")
             return np.asarray([], dtype=_value_dtype(dtype))
         if dtype == JSONL_DTYPE:
             # offset+count never exceeds the metric count, so slice the cached list directly.
             return np.asarray(self._read_jsonl_values(name)[offset:offset + count], dtype=object)
-        if dtype not in DTYPE_TO_NUMPY and dtype != "int":
+        if dtype not in DTYPE_TO_NUMPY:
             raise ValueError(f"unsupported dtype for {name} in run {self._run_name}: {dtype}")
-        target = _value_dtype(dtype)
-        itemsize = np.dtype(target).itemsize
+        return _decode_numeric(self._read_numeric_bytes(name, dtype, offset, count), dtype)
+
+    def _read_numeric_bytes(self, name, dtype, offset, count):
+        if count <= 0:
+            return b""
+        itemsize = DTYPE_ITEMSIZE[dtype]
         if self.kind == "zip":
             data = self._read_zip_slice(f"{name}.{dtype}", offset * itemsize, count * itemsize)
         else:
@@ -489,12 +494,9 @@ class Reader:
             except FileNotFoundError:
                 self._check_storage_metadata((name,))
                 if self._missing_columnar_is_empty():
-                    return np.asarray([], dtype=target)
+                    return b""
                 raise FileNotFoundError(f"missing values file for {name} in run {self._run_name}")
-        data = data[:self._trim_size(len(data), itemsize)]
-        if not data:
-            return np.asarray([], dtype=target)
-        return np.frombuffer(data, dtype=target)
+        return data[:self._trim_size(len(data), itemsize)]
 
     def _concat(self, pieces, dtype):
         pieces = [piece for piece in pieces if len(piece)]
@@ -581,8 +583,7 @@ class Reader:
             return None
 
         path = self.root / f"{name}.{dtype}"
-        target = _value_dtype(dtype)
-        itemsize = np.dtype(target).itemsize
+        itemsize = DTYPE_ITEMSIZE[dtype]
         try:
             fh = path.open("rb")
         except FileNotFoundError:
@@ -591,7 +592,7 @@ class Reader:
         with fh:
             def value_at(pos):
                 fh.seek(pos * itemsize)
-                return np.frombuffer(fh.read(itemsize), dtype=target)[0]
+                return _decode_numeric(fh.read(itemsize), dtype)[0]
             return self._monotonic_chunks(value_at, direction, vstart, vstop, count)
 
     def _monotonic_chunks(self, value_at, direction, vstart, vstop, count):
@@ -757,9 +758,9 @@ class Reader:
         dtype = spec.get("dtype")
         if dtype == JSONL_DTYPE:
             return len(self._read_jsonl_values(name))
-        if dtype not in DTYPE_TO_NUMPY and dtype != "int":
+        if dtype not in DTYPE_TO_NUMPY:
             raise ValueError(f"unsupported dtype for {name} in run {self._run_name}: {dtype}")
-        itemsize = np.dtype(_value_dtype(dtype)).itemsize
+        itemsize = DTYPE_ITEMSIZE[dtype]
         if self.kind == "zip":
             return self._trim_size(self._zip_member_size(f"{name}.{dtype}"), itemsize) // itemsize
         path = self.root / f"{name}.{dtype}"
@@ -971,7 +972,7 @@ class Reader:
                     raise type(exc)(f"{exc} (metric {name}, run {self._run_name})") from exc
                 if spec.get("dtype") == JSONL_DTYPE:
                     continue
-                if spec.get("dtype") not in DTYPE_TO_NUMPY and spec.get("dtype") != "int":
+                if spec.get("dtype") not in DTYPE_TO_NUMPY:
                     raise ValueError(f"unsupported dtype for {name} in run {self._run_name}: {spec.get('dtype')}")
                 cadence_groups.setdefault(int(segments[-1]["step"]), []).append((
                     (-closed_rows, int(segments[0]["start"])),
@@ -1145,7 +1146,7 @@ class Reader:
             if len(values) > count:
                 values = values[:count]
             return np.asarray(values, dtype=object)
-        if dtype not in DTYPE_TO_NUMPY and dtype != "int":
+        if dtype not in DTYPE_TO_NUMPY:
             raise ValueError(f"unsupported dtype for {name} in run {self._run_name}: {dtype}")
         indices_count, _ = self._indices_count_and_last(name, spec.get("indices"))
         if indices_count == 0:
@@ -1154,26 +1155,7 @@ class Reader:
         count = min(indices_count, values_count)
         if count <= 0:
             return np.asarray([], dtype=_value_dtype(dtype))
-        itemsize = np.dtype(_value_dtype(dtype)).itemsize
-        if self.kind == "zip":
-            valid = self._trim_size(self._zip_member_size(f"{name}.{dtype}"), itemsize)
-            count = min(count, valid // itemsize)
-            if count <= 0:
-                return np.asarray([], dtype=_value_dtype(dtype))
-            return np.frombuffer(self._read_zip_slice(f"{name}.{dtype}", 0, count * itemsize), dtype=_value_dtype(dtype))
-        path = self.root / f"{name}.{dtype}"
-        try:
-            with path.open("rb") as fh:
-                data = fh.read(count * itemsize)
-        except FileNotFoundError:
-            self._check_storage_metadata((name,))
-            if self._missing_columnar_is_empty():
-                return np.asarray([], dtype=_value_dtype(dtype))
-            raise FileNotFoundError(f"missing values file for {name} in run {self._run_name}")
-        data = data[:self._trim_size(len(data), itemsize)]
-        if not data:
-            return np.asarray([], dtype=_value_dtype(dtype))
-        return np.frombuffer(data, dtype=_value_dtype(dtype))
+        return _decode_numeric(self._read_numeric_bytes(name, dtype, 0, count), dtype)
 
     def _hot_tail(self, name, spec, columnar_count):
         """Hot rows beyond the captured columnar prefix, as (steps, values list)."""
@@ -1242,8 +1224,7 @@ class Reader:
         hot_indices = hot_indices[:count]
         hot_values = hot_values[:count]
         dtype = (
-            object if spec is None or spec.get("dtype") == JSONL_DTYPE
-            else _value_dtype(spec["dtype"])
+            object if spec is None or spec.get("dtype") == JSONL_DTYPE else _value_dtype(spec["dtype"])
         )
         return (
             self._concat([indices, hot_indices], np.uint32),
@@ -1268,7 +1249,7 @@ class Reader:
             if source.kind in "iu":
                 if source.kind == "u" and source.itemsize == 8:
                     if values.size and int(values.max()) > 0x7FFFFFFFFFFFFFFF:
-                        raise OverflowError(f"values do not fit int64 for metric {name}; request a wider dtype or dtype='storage'")
+                        return values.astype(object)
                     if source.isnative:
                         return values.view(np.int64)
                 elif source.itemsize == 8 and source.isnative:
@@ -1285,7 +1266,7 @@ class Reader:
         if source == target:
             return values
         if target.kind in "iu" and not np.can_cast(source, target, casting="safe"):
-            if source.kind == "O" and (self._manifest[name].get("dtype") == "int"
+            if source.kind == "O" and (self._manifest[name].get("dtype") == "i128"
                                         or self._manifest[name].get("values") == "sequence"):
                 values = np.asarray(values, dtype=object)
             elif source.kind not in "biuf":
@@ -1313,11 +1294,30 @@ class Reader:
         return values.astype(target, copy=False)
 
     @_retry_stale_manifest
+    def metric_value_bytes(self, name):
+        """Read a numeric metric as (storage dtype name, encoded bytes).
+
+        Raw columns pass through without decoding. Sequences and any hot tail
+        are encoded in the same dtype. Only complete, indexed rows are returned.
+        """
+        spec = self._metric_spec(name, allow_hot=True)
+        dtype = spec.get("dtype") if spec is not None else None
+        if dtype not in DTYPE_TO_NUMPY:
+            raise ValueError(f"numeric storage dtype required for {name} in run {self._run_name}")
+        count = self._metric_count(name, spec)
+        if "values" in spec:
+            data = _encode_numeric(self._read_value_slice(name, spec, 0, count), dtype)
+        else:
+            data = self._read_numeric_bytes(name, dtype, 0, count)
+        _, hot_values = self._hot_tail(name, spec, len(data) // DTYPE_ITEMSIZE[dtype])
+        return dtype, data + (_encode_numeric(hot_values, dtype) if hot_values else b"")
+
+    @_retry_stale_manifest
     def metric_values(self, name, start=None, stop=None, istart=None, istop=None, vstart=None, vstop=None, *, dtype="standard"):
         """Read metric values, converting only the selected rows.
 
-        Standard reads return int64 for fixed-width integers, object arrays of
-        Python integers for exact int sequences, and retain float32/float64 precision.
+        Standard reads return int64 when integers fit, object arrays of Python
+        integers for i128 and larger u64 values, and retain float32/float64 precision.
         Use dtype="storage" for the stored type, or a NumPy dtype for an explicit
         conversion. Integer conversions reject overflow and fractional truncation.
         """
@@ -1413,7 +1413,7 @@ class Reader:
     def metric(self, name, idx=None, start=None, stop=None, istart=None, istop=None, vstart=None, vstop=None, *, dtype="standard"):
         """Read (uint32 steps, values), with the same dtype policy as metric_values.
 
-        idx selects from the filtered rows; scalar reads return NumPy numeric scalars
+        idx selects from the filtered rows; scalar reads return numeric scalars
         of the requested dtype. Conversion happens after all selection.
         """
         if self._selector_kind(start, stop, istart, istop, vstart, vstop) is None:

@@ -154,7 +154,7 @@ writer.write(value={'u8': 7, 'f32': np.float64(-0.0), 'i64': 10**20}[sys.argv[2]
 
     def test_huge_integer_sequences_are_exact(self):
         for kind in ("direct", "cold", "hot", "bulk"):
-            for start, stride in ((10**20, 10**6), (-10**30, -10**8), (10**100, 0)):
+            for start, stride in ((10**20, 10**6), (-10**30, -10**8), (10**38, 0)):
                 with self.subTest(kind=kind, start=start, stride=stride), tempfile.TemporaryDirectory() as tmp:
                     writer = _writer(kind, tmp)
                     expected = [start + row * stride for row in range(6)]
@@ -163,7 +163,7 @@ writer.write(value={'u8': 7, 'f32': np.float64(-0.0), 'i64': 10**20}[sys.argv[2]
                         writer.end_step()
                     writer.finish(optimize=False, zip=False)
                     with plattli.Reader(tmp) as reader:
-                        self.assertEqual(reader.manifest()["counter"]["dtype"], "int")
+                        self.assertEqual(reader.manifest()["counter"]["dtype"], "i128")
                         self.assertEqual(reader.manifest()["counter"]["values"],
                                          {"start": start, "step": stride, "count": 6})
                         for dtype in ("standard", "storage", object):
@@ -172,7 +172,7 @@ writer.write(value={'u8': 7, 'f32': np.float64(-0.0), 'i64': 10**20}[sys.argv[2]
                             self.assertEqual(values.tolist(), expected)
                             self.assertTrue(all(type(value) is int for value in values))
                         self.assertEqual(reader.metric("counter", idx=-1)[1], expected[-1])
-                    self.assertFalse((Path(tmp) / "plattli/counter.int").exists())
+                    self.assertFalse((Path(tmp) / "plattli/counter.i128").exists())
 
     def test_streaming_sequences_are_readable_before_finish(self):
         for kind in ("direct", "cold", "hot"):
@@ -201,7 +201,7 @@ writer.write(value={'u8': 7, 'f32': np.float64(-0.0), 'i64': 10**20}[sys.argv[2]
                     dtype = reader.manifest()["value"]["dtype"]
                 self.assertTrue((Path(tmp) / "plattli" / f"value.{dtype}").exists())
 
-    def test_off_sequence_huge_integer_rejects_whole_batch(self):
+    def test_i128_overflow_rejects_whole_batch(self):
         for kind in ("direct", "cold", "hot", "bulk"):
             with self.subTest(kind=kind), tempfile.TemporaryDirectory() as tmp:
                 writer = _writer(kind, tmp)
@@ -224,7 +224,7 @@ writer.write(value={'u8': 7, 'f32': np.float64(-0.0), 'i64': 10**20}[sys.argv[2]
 
                 before = snapshot()
                 with self.assertRaises((ValueError, OverflowError)):
-                    writer.write(other=99, counter=10**20 + 3 * 10**6 + 1, new=5)
+                    writer.write(other=99, counter=2**127, new=5)
                 self.assertEqual(snapshot(), before)
                 writer.write(counter=10**20 + 3 * 10**6, other=3)
                 writer.finish(optimize=False, zip=False)
@@ -243,21 +243,20 @@ writer.write(value={'u8': 7, 'f32': np.float64(-0.0), 'i64': 10**20}[sys.argv[2]
                         writer.end_step()
                     writer.finish(optimize=False, zip=False)
                     with plattli.Reader(tmp) as reader:
-                        self.assertEqual(reader.manifest()["counter"]["dtype"], "int")
+                        self.assertEqual(reader.manifest()["counter"]["dtype"], "i128")
                         self.assertEqual(reader.metric_values("counter").tolist(), expected)
 
-    def test_huge_integer_cannot_promote_irregular_history(self):
+    def test_huge_integer_promotes_irregular_history(self):
         for kind in ("direct", "cold", "hot", "bulk"):
             with self.subTest(kind=kind), tempfile.TemporaryDirectory() as tmp:
                 writer = _writer(kind, tmp)
                 for value in (0, 1, 3):
                     writer.write(counter=value)
                     writer.end_step()
-                with self.assertRaises((ValueError, OverflowError)):
-                    writer.write(counter=10**20)
+                writer.write(counter=10**20 + 2)
                 writer.finish(optimize=False, zip=False)
                 with plattli.Reader(tmp) as reader:
-                    self.assertEqual(reader.metric_values("counter").tolist(), [0, 1, 3])
+                    self.assertEqual(reader.metric_values("counter").tolist(), [0, 1, 3, 10**20 + 2])
 
     def test_resume_sequences_and_rewind_to_zero(self):
         for kind in ("direct", "cold", "hot"):

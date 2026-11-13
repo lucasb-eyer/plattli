@@ -4,22 +4,19 @@ import operator
 
 import numpy as np
 
+from ._numeric import DTYPE_TO_NUMPY, INT_LIMITS
 from ._sequences import _arithmetic_array
 from ._affine import _extend_step_sequence, _step_sequence_array
 
 
 def _sequence_dtype(dtype):
-    if dtype == 'int':
-        return np.dtype(object)
-    if dtype not in ('i8', 'i16', 'i32', 'i64', 'u8', 'u16', 'u32', 'u64', 'f32', 'f64'):
+    if dtype not in DTYPE_TO_NUMPY:
         raise ValueError(f'invalid value sequence dtype: {dtype}')
-    return np.dtype(f'{dtype[0]}{int(dtype[1:]) // 8}')
+    return np.dtype(DTYPE_TO_NUMPY[dtype])
 
 
 def _value_sequence(spec):
     if 'values' not in spec:
-        if spec['dtype'] == 'int':
-            raise ValueError('arbitrary integers require an inline value sequence')
         return None
     sequence = spec['values']
     if not isinstance(sequence, dict) or set(sequence) not in ({'start', 'step', 'count'}, {'start', 'step', 'count', 'on'}):
@@ -33,10 +30,10 @@ def _value_sequence(spec):
     if dtype.kind in 'iuO':
         if type(start) is not int or type(step) is not int:
             raise ValueError('integer value sequences require integer start and step')
-        if dtype.kind != 'O' and sequence.get('on') != 'step':
-            bounds = np.iinfo(dtype)
+        if sequence.get('on') != 'step':
+            lower, upper = INT_LIMITS[spec['dtype']]
             last = start + max(0, count - 1) * step
-            if min(start, last) < bounds.min or max(start, last) > bounds.max:
+            if min(start, last) < lower or max(start, last) > upper:
                 raise ValueError(f'value sequence exceeds {spec["dtype"]}')
     else:
         if 'on' in sequence:
@@ -95,9 +92,9 @@ def _sequence_values(values, dtype):
             if source.dtype.kind == 'O' and any(not isinstance(value, (int, np.integer))
                                                or isinstance(value, (bool, np.bool_)) for value in source):
                 return None
-            if target.kind != 'O' and source.size:
-                bounds = np.iinfo(target)
-                if int(source.min()) < bounds.min or int(source.max()) > bounds.max:
+            if source.size:
+                lower, upper = INT_LIMITS[dtype]
+                if int(source.min()) < lower or int(source.max()) > upper:
                     return None
         else:
             if source.dtype.kind == 'O' and any(not isinstance(value, (int, float, np.integer, np.floating))
